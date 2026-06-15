@@ -15,28 +15,26 @@ using System.Runtime.CompilerServices;
 using Org.BouncyCastle.Utilities;
 using Org.BouncyCastle.Crypto.Engines;
 using Org.BouncyCastle.Crypto.Parameters;
-using DungeonRunners.Managers;
+using DungeonRunners.Gameplay;
 using DungeonRunners.Database;
 using DungeonRunners.Engine.Playables;
 using System.Security.Cryptography;
 using DungeonRunners.Combat;
-using DungeonRunners.Networking.Sync;
+using DungeonRunners.Networking.EntitySynchInfo;
 
-//using UnityEditor.Experimental.GraphView;
-//using UnityEditor.SceneManagement;
 
 namespace DungeonRunners.Networking
 {
-    public enum SyncContext
+    public enum EntitySynchInfoContext
     {
         Unknown,
         WorldInterval,
-        BootstrapReplay,
+        BaselineReplay,
         RecoveryReplay,
-        RepeatResync,
+        RepeatReplay,
         InventoryReplay,
         EquipmentReplay,
-        LateArmorSync,
+        LateArmorReplay,
         ControlGrant,
         ControlAck,
         MoverAck,
@@ -56,45 +54,45 @@ namespace DungeonRunners.Networking
         private bool _allowFlush = false;
         private UdpClient _udpListener;
         private bool _isRunning;
-        private int _udpPort = 2603; // Overridden by ServerSettings in Start()
+        private int _udpPort = 2603;
         private IPEndPoint _clientUDPEndpoint;
-        private Dictionary<string, System.Net.IPEndPoint> _dllEndpoints = new Dictionary<string, System.Net.IPEndPoint>();
         private string GetEndpointKey(IPEndPoint ep) => $"{ep.Address}:{ep.Port}";
-        private Dictionary<string, float> _useTargetApproachLogTimes = new Dictionary<string, float>();
         private int _nextConnId = 1;
         private Dictionary<int, string> _users = new Dictionary<int, string>();
         private Dictionary<int, uint> _peerId24 = new Dictionary<int, uint>();
         private Dictionary<string, List<GCObject>> _persistentCharacters = new Dictionary<string, List<GCObject>>();
         private Dictionary<int, bool> _charListSent = new Dictionary<int, bool>();
-        private Dictionary<string, GCObject> _selectedCharacter = new Dictionary<string, GCObject>();  // first Increment yields 0xC000
+        private Dictionary<string, GCObject> _selectedCharacter = new Dictionary<string, GCObject>();
+        private readonly Dictionary<string, SavedCharacter> _activeCharacter = new Dictionary<string, SavedCharacter>(StringComparer.OrdinalIgnoreCase);
         private const ushort LOOT_ID_MIN = 0xC000;
         private const ushort LOOT_ID_MAX = 0xFDFF;
         private HashSet<string> _freePlayerModifierSent = new HashSet<string>();
-        private ModifierTracker _modifierTracker = new ModifierTracker();
+        private ActiveModifiers _activeModifiers = new ActiveModifiers();
 
         private Dictionary<string, bool> _playerIsFree = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, bool> _playerIsAdmin = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-        // ═══ MULTIPLAYER: Per-viewer remote behavior ID tracking ═══
         private Dictionary<string, Dictionary<string, ushort>> _remoteBehaviorIds = new Dictionary<string, Dictionary<string, ushort>>();
         private Dictionary<string, Dictionary<string, ushort>> _remoteAvatarIds = new Dictionary<string, Dictionary<string, ushort>>();
+        private Dictionary<string, Dictionary<string, ushort>> _remotePlayerIds = new Dictionary<string, Dictionary<string, ushort>>();
         private Dictionary<ushort, ChestSpawnData> _chestEntities = new Dictionary<ushort, ChestSpawnData>();
 
-        private AdminCommandHandler _adminHandler;
-        private const float NATIVE_CONTACT_RANGE_EPSILON = 1f / 16f;
-        private const float NATIVE_ACTION_TIMING_EPSILON = 0.15f;
-        private const int NativeStatPointsPerLevel = 5;
+        private AdminCommands _adminCommands;
+        private const float CLIENT_CONTACT_RANGE_EPSILON = 1f / 16f;
+        private const float CLIENT_ACTION_TIMING_EPSILON = 0.15f;
+        private const int StatPointsPerLevel = 5;
         private const float MONSTER_MOVE_SEND_INTERVAL = 0.15f;
+        private const float MONSTER_MOVE_TARGET_THRESHOLD = 2.0f;
         private Dictionary<uint, uint> _monsterBehaviorIds = new Dictionary<uint, uint>();
         private Dictionary<uint, float> _lastMonsterMoveSentAt = new Dictionary<uint, float>();
+        private Dictionary<uint, (float X, float Y)> _lastMonsterMoveTarget = new Dictionary<uint, (float, float)>();
         private Dictionary<uint, PendingMonsterBehaviorUpdate> _pendingMonsterBehaviorUpdates = new Dictionary<uint, PendingMonsterBehaviorUpdate>();
-        private InventoryHandler _inventoryHandler;
-        private EquipmentHandler _equipmentHandler;
+        private UnitContainer _unitContainer;
+        private Equipment _equipment;
         private Dictionary<string, PlayerState> _playerStates = new Dictionary<string, PlayerState>();
-        // Track equipped items per player - EXACT Go pattern (Equipment.Children)
         private Dictionary<string, Dictionary<uint, GCObject>> _playerEquippedItems = new Dictionary<string, Dictionary<uint, GCObject>>();
         private Dictionary<string, ushort> _playerManipulatorsIds = new Dictionary<string, ushort>();
         private Dictionary<string, float> _useTargetResponseTimes = new Dictionary<string, float>();
-        private const float DROPPED_ITEM_CLEANUP_INTERVAL = 60f; // check every 60 seconds
+        private const float DROPPED_ITEM_CLEANUP_INTERVAL = 60f;
         private const int DROPPED_ITEM_EXPIRE_MINUTES = 30;
         private Dictionary<string, Dictionary<uint, (GCObject item, byte x, byte y)>> _playerInventoryItems = new Dictionary<string, Dictionary<uint, (GCObject, byte, byte)>>();
         private Dictionary<string, HashSet<int>> _occupiedInventorySlots = new Dictionary<string, HashSet<int>>();
@@ -105,6 +103,8 @@ namespace DungeonRunners.Networking
         private float _merchantRefreshTimer = 0f;
         private const float MERCHANT_REFRESH_INTERVAL = 0.10f;
         private const float MERCHANT_ACTIVATION_DISTANCE_SQ = 900f;
+        private float _groupHealthBroadcastTimer = 0f;
+        private const float GROUP_HEALTH_BROADCAST_INTERVAL = 1.0f;
 
         private static bool IsBankContainer(byte containerId)
             => containerId == 0x0C || (containerId >= 0x0E && containerId <= 0x13);
@@ -135,7 +135,7 @@ namespace DungeonRunners.Networking
                     }
                 }
             }
-            return (-1, -1);  // Inventory full
+            return (-1, -1);
         }
 
 
@@ -170,7 +170,7 @@ namespace DungeonRunners.Networking
         {
             if (!_inventorySlotCounters.ContainsKey(playerId))
             {
-                _inventorySlotCounters[playerId] = 100; // Start at 100 to avoid equipment slot conflicts
+                _inventorySlotCounters[playerId] = 100;
             }
 
             uint slot = _inventorySlotCounters[playerId];
@@ -194,16 +194,14 @@ namespace DungeonRunners.Networking
                 var data = _playerInventoryItems[key][index];
                 _playerInventoryItems[key].Remove(index);
 
-                // Get item dimensions from database
                 ItemData itemData = DatabaseLoader.FindItem(data.item.GCClass);
                 int width = itemData?.inventoryWidth ?? 1;
                 int height = itemData?.inventoryHeight ?? 1;
 
-                // Free ALL slots this item occupied
                 FreeInventorySlots(connId, data.x, data.y, width, height, containerId);
                 return data;
             }
-            Debug.LogError($"[INV-TRACK] ❌ No item at index {index} in container 0x{containerId:X2}!");
+            Debug.LogError($"[INV-TRACK]  No item at index {index} in container 0x{containerId:X2}!");
             return null;
         }
 
@@ -214,15 +212,13 @@ namespace DungeonRunners.Networking
         public bool IsInventorySlotOccupied(string connId, byte x, byte y, int width, int height, byte containerId = 0x0B)
         {
             int invHeight = ContainerHeight(containerId);
-            // Bounds check
             if (x + width > CONTAINER_WIDTH || y + height > invHeight)
-                return true;  // treat out-of-bounds as occupied
+                return true;
 
             string key = InvKey(connId, containerId);
             if (!_occupiedInventorySlots.ContainsKey(key))
                 return false;
 
-            // Check ALL cells the item would occupy
             for (int dx = 0; dx < width; dx++)
             {
                 for (int dy = 0; dy < height; dy++)
@@ -230,7 +226,7 @@ namespace DungeonRunners.Networking
                     int slotIndex = (y + dy) * CONTAINER_WIDTH + (x + dx);
                     if (_occupiedInventorySlots[key].Contains(slotIndex))
                     {
-                        Debug.LogError($"[INV-TRACK] ❌ Cell ({x + dx}, {y + dy}) in container 0x{containerId:X2} is already occupied!");
+                        Debug.LogError($"[INV-TRACK]  Cell ({x + dx}, {y + dy}) in container 0x{containerId:X2} is already occupied!");
                         return true;
                     }
                 }
@@ -252,7 +248,7 @@ namespace DungeonRunners.Networking
                     _occupiedInventorySlots[key].Add(slotIndex);
                 }
             }
-            Debug.LogError($"[INV-TRACK] ✅ Occupied {width}x{height} slots starting at ({x}, {y}) in container 0x{containerId:X2}");
+            Debug.LogError($"[INV-TRACK]  Occupied {width}x{height} slots starting at ({x}, {y}) in container 0x{containerId:X2}");
         }
 
         public void FreeInventorySlots(string connId, byte x, byte y, int width, int height, byte containerId = 0x0B)
@@ -269,7 +265,7 @@ namespace DungeonRunners.Networking
                     _occupiedInventorySlots[key].Remove(slotIndex);
                 }
             }
-            Debug.LogError($"[INV-TRACK] ✅ Freed {width}x{height} slots starting at ({x}, {y}) in container 0x{containerId:X2}");
+            Debug.LogError($"[INV-TRACK]  Freed {width}x{height} slots starting at ({x}, {y}) in container 0x{containerId:X2}");
         }
 
         public (uint slot, GCObject item, byte x, byte y)? FindInventoryItemByGCClass(string connId, string gcClass, byte containerId = 0x0B)
@@ -277,10 +273,10 @@ namespace DungeonRunners.Networking
             string key = InvKey(connId, containerId);
             if (!_playerInventoryItems.ContainsKey(key)) return null;
             string gcLower = gcClass.ToLower();
-            foreach (var kvp in _playerInventoryItems[key])
+            foreach (var inventoryEntry in _playerInventoryItems[key])
             {
-                if (kvp.Value.Item1.GCClass.ToLower() == gcLower)
-                    return (kvp.Key, kvp.Value.Item1, kvp.Value.Item2, kvp.Value.Item3);
+                if (inventoryEntry.Value.Item1.GCClass.ToLower() == gcLower)
+                    return (inventoryEntry.Key, inventoryEntry.Value.Item1, inventoryEntry.Value.Item2, inventoryEntry.Value.Item3);
             }
             return null;
         }
@@ -293,78 +289,73 @@ namespace DungeonRunners.Networking
             if (savedChar == null) return;
             savedChar.inventory.Clear();
 
-            // Iterate every container: main inv (0x0B) and the 7 bank pages.
-            // Items are tagged with containerId so LoadInventory restores them to the right container.
             byte[] saveContainers = { 0x0B, 0x0C, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13 };
-            foreach (byte cid in saveContainers)
+            foreach (byte containerId in saveContainers)
             {
-                string dictKey = InvKey(connId, cid);
+                string dictKey = InvKey(connId, containerId);
                 if (!_playerInventoryItems.ContainsKey(dictKey)) continue;
-                foreach (var kvp in _playerInventoryItems[dictKey])
+                foreach (var inventoryEntry in _playerInventoryItems[dictKey])
                 {
-                    int count = GetStackCount(connId, kvp.Key, cid);
-                    // Position conflicts only apply within the same container.
+                    int count = GetStackCount(connId, inventoryEntry.Key, containerId);
                     var posConflict = savedChar.inventory.Find(i =>
-                        i.containerId == cid &&
-                        i.x == kvp.Value.Item2 &&
-                        i.y == kvp.Value.Item3);
+                        i.containerId == containerId &&
+                        i.x == inventoryEntry.Value.Item2 &&
+                        i.y == inventoryEntry.Value.Item3);
                     if (posConflict != null)
                     {
                         if (count > posConflict.count)
                         {
-                            posConflict.gcClass = kvp.Value.Item1.GCClass;
+                            posConflict.gcClass = inventoryEntry.Value.Item1.GCClass;
                             posConflict.count = count;
                         }
-                        uint bpConflict = DungeonRunners.Managers.MerchantManager.GetBuyPrice(connId, kvp.Value.Item1.GCClass);
-                        if (bpConflict > 0) posConflict.buyPrice = bpConflict;
+                        uint buyPriceConflict = DungeonRunners.Gameplay.MerchantRuntime.GetBuyPrice(connId, inventoryEntry.Value.Item1.GCClass);
+                        if (buyPriceConflict > 0) posConflict.buyPrice = buyPriceConflict;
                     }
                     else
                     {
-                        string bpGcClass = kvp.Value.Item1.GCClass;
-                        uint bp = DungeonRunners.Managers.MerchantManager.GetBuyPrice(connId, bpGcClass);
+                        string buyPriceGcClass = inventoryEntry.Value.Item1.GCClass;
+                        uint itemBuyPrice = DungeonRunners.Gameplay.MerchantRuntime.GetBuyPrice(connId, buyPriceGcClass);
                         savedChar.inventory.Add(new SavedInventoryItem
                         {
-                            gcClass = bpGcClass,
-                            x = kvp.Value.Item2,
-                            y = kvp.Value.Item3,
+                            gcClass = buyPriceGcClass,
+                            x = inventoryEntry.Value.Item2,
+                            y = inventoryEntry.Value.Item3,
                             count = count,
-                            buyPrice = bp,
-                            rarity = kvp.Value.Item1.GetEffectiveRarity(),
-                            storedLevel = kvp.Value.Item1.StoredLevel,
-                            containerId = cid
+                            buyPrice = itemBuyPrice,
+                            rarity = inventoryEntry.Value.Item1.GetEffectiveRarity(),
+                            storedLevel = inventoryEntry.Value.Item1.StoredLevel,
+                            containerId = containerId
                         });
                     }
                 }
             }
 
-            // Save active item (on cursor) back to inventory so it's not lost
-            PlayerState ps = GetPlayerState(connId);
-            if (ps?.ActiveItem != null)
+            PlayerState playerState = GetPlayerState(connId);
+            if (playerState?.ActiveItem != null)
             {
-                byte ax = 0, ay = 0;
+                byte activeSlotX = 0, activeSlotY = 0;
                 bool foundActive = false;
-                int aw = 1, ah = 1;
-                for (byte ry = 0; ry < 8 && !foundActive; ry++)
-                    for (byte cx = 0; cx < 10 && !foundActive; cx++)
-                        if (!IsInventorySlotOccupied(connId, cx, ry, aw, ah))
-                        { ax = cx; ay = ry; foundActive = true; }
+                int activeWidth = 1, activeHeight = 1;
+                for (byte rowY = 0; rowY < 8 && !foundActive; rowY++)
+                    for (byte columnX = 0; columnX < 10 && !foundActive; columnX++)
+                        if (!IsInventorySlotOccupied(connId, columnX, rowY, activeWidth, activeHeight))
+                        { activeSlotX = columnX; activeSlotY = rowY; foundActive = true; }
                 if (foundActive)
                 {
                     savedChar.inventory.Add(new SavedInventoryItem
                     {
-                        gcClass = ps.ActiveItem.GCClass,
-                        x = ax,
-                        y = ay,
+                        gcClass = playerState.ActiveItem.GCClass,
+                        x = activeSlotX,
+                        y = activeSlotY,
                         count = 1,
-                        rarity = ps.ActiveItem.GetEffectiveRarity(),
-                        storedLevel = ps.ActiveItem.StoredLevel
+                        rarity = playerState.ActiveItem.GetEffectiveRarity(),
+                        storedLevel = playerState.ActiveItem.StoredLevel
                     });
-                    Debug.LogError($"[SAVE] Saved cursor item {ps.ActiveItem.GCClass} to inventory at ({ax},{ay})");
+                    Debug.LogError($"[SAVE] Saved cursor item {playerState.ActiveItem.GCClass} to inventory at ({activeSlotX},{activeSlotY})");
                 }
-                ps.ActiveItem = null;
+                playerState.ActiveItem = null;
             }
 
-            // Sync equipment from tracking to savedChar
             if (_playerEquippedItems.ContainsKey(connId))
             {
                 var eq = _playerEquippedItems[connId];
@@ -378,7 +369,6 @@ namespace DungeonRunners.Networking
                 savedChar.equipment.ring1 = eq.ContainsKey(3) ? eq[3].GCClass : "";
                 savedChar.equipment.ring2 = eq.ContainsKey(4) ? eq[4].GCClass : "";
                 savedChar.equipment.amulet = eq.ContainsKey(1) ? eq[1].GCClass : "";
-                // Sync rarity from tracked GCObjects
                 if (eq.ContainsKey(10)) savedChar.equipment.slotRarity["weapon"] = eq[10].GetEffectiveRarity();
                 if (eq.ContainsKey(6)) savedChar.equipment.slotRarity["armor"] = eq[6].GetEffectiveRarity();
                 if (eq.ContainsKey(5)) savedChar.equipment.slotRarity["helmet"] = eq[5].GetEffectiveRarity();
@@ -389,7 +379,6 @@ namespace DungeonRunners.Networking
                 if (eq.ContainsKey(3)) savedChar.equipment.slotRarity["ring1"] = eq[3].GetEffectiveRarity();
                 if (eq.ContainsKey(4)) savedChar.equipment.slotRarity["ring2"] = eq[4].GetEffectiveRarity();
                 if (eq.ContainsKey(1)) savedChar.equipment.slotRarity["amulet"] = eq[1].GetEffectiveRarity();
-                // Sync stored level from tracked GCObjects
                 if (eq.ContainsKey(10)) savedChar.equipment.slotLevel["weapon"] = eq[10].StoredLevel;
                 if (eq.ContainsKey(6)) savedChar.equipment.slotLevel["armor"] = eq[6].StoredLevel;
                 if (eq.ContainsKey(5)) savedChar.equipment.slotLevel["helmet"] = eq[5].StoredLevel;
@@ -400,7 +389,7 @@ namespace DungeonRunners.Networking
                 if (eq.ContainsKey(3)) savedChar.equipment.slotLevel["ring1"] = eq[3].StoredLevel;
                 if (eq.ContainsKey(4)) savedChar.equipment.slotLevel["ring2"] = eq[4].StoredLevel;
                 if (eq.ContainsKey(1)) savedChar.equipment.slotLevel["amulet"] = eq[1].StoredLevel;
-                Debug.LogError($"[SAVE] Equipment synced: weapon={savedChar.equipment.weapon}, armor={savedChar.equipment.armor}");
+                Debug.LogError($"[SAVE] Equipment saved: weapon={savedChar.equipment.weapon}, armor={savedChar.equipment.armor}");
             }
 
             savedChar.currentZoneName = conn.CurrentZoneName ?? "tutorial";
@@ -421,18 +410,6 @@ namespace DungeonRunners.Networking
             SavePlayerLevel(conn);
         }
 
-        /// <summary>
-        /// Removes quest item objectives from inventory on turn-in.
-        /// Stackable handling: decrements stack by obj.Required via 0x22 UpdateQuantity
-        /// when the remaining count is > 0, falls back to 0x1F full-row remove when the
-        /// stack hits zero (or for non-stackables). Crosses multiple stacks if the
-        /// requirement exceeds any one stack's count. Call BEFORE HandleTurnInConfirmed
-        /// (which drops the quest from the active list).
-        ///
-        /// Previously this used `GetAndRemoveInventoryItem` against the first matching
-        /// slot, which nuked a 50-stack of QuestItemPAL.Token when the wishing-well
-        /// objective only asked for 1 — see CHANGELOG_WISHING_WELL_2026-05-19.md.
-        /// </summary>
         private void RemoveQuestItemsFromInventory(RRConnection conn, ActiveQuest completingQuest)
         {
             if (completingQuest == null) return;
@@ -446,7 +423,7 @@ namespace DungeonRunners.Networking
                     continue;
 
                 int remainingToRemove = Math.Max(1, obj.Required);
-                Debug.LogError($"[QUEST-ITEM-REMOVE] Looking for: {obj.Target} ({obj.Label}) ×{remainingToRemove}");
+                Debug.LogError($"[QUEST-ITEM-REMOVE] Looking for: {obj.Target} ({obj.Label}) x{remainingToRemove}");
 
                 if (!_playerInventoryItems.ContainsKey(connId))
                 {
@@ -454,23 +431,22 @@ namespace DungeonRunners.Networking
                     continue;
                 }
 
-                // Snapshot slot ids first so we can mutate _playerInventoryItems during iteration.
                 var matchingSlots = new List<uint>();
-                foreach (var kvp in _playerInventoryItems[connId])
+                foreach (var inventoryEntry in _playerInventoryItems[connId])
                 {
-                    if (kvp.Value.item != null &&
-                        kvp.Value.item.GCClass != null &&
-                        kvp.Value.item.GCClass.Equals(obj.Target, StringComparison.OrdinalIgnoreCase))
+                    if (inventoryEntry.Value.item != null &&
+                        inventoryEntry.Value.item.GCClass != null &&
+                        inventoryEntry.Value.item.GCClass.Equals(obj.Target, StringComparison.OrdinalIgnoreCase))
                     {
-                        matchingSlots.Add(kvp.Key);
+                        matchingSlots.Add(inventoryEntry.Key);
                     }
                 }
 
                 if (matchingSlots.Count == 0)
                 {
                     Debug.LogError($"[QUEST-ITEM-REMOVE] NOT FOUND in inventory! Dumping all slots:");
-                    foreach (var kvp in _playerInventoryItems[connId])
-                        Debug.LogError($"  slot {kvp.Key}: {kvp.Value.item?.GCClass ?? "NULL"}");
+                    foreach (var inventoryEntry in _playerInventoryItems[connId])
+                        Debug.LogError($"  slot {inventoryEntry.Key}: {inventoryEntry.Value.item?.GCClass ?? "NULL"}");
                     continue;
                 }
 
@@ -483,7 +459,6 @@ namespace DungeonRunners.Networking
 
                     if (stack > remainingToRemove)
                     {
-                        // Stack survives — decrement count, send 0x22 UpdateQuantity.
                         int newCount = stack - remainingToRemove;
                         SetStackCount(connId, slotId, newCount);
                         remainingToRemove = 0;
@@ -501,11 +476,10 @@ namespace DungeonRunners.Networking
                             qWriter.WriteByte(0x06);
                             SendCompressedA(conn, 0x01, 0x0F, qWriter.ToArray());
                         }
-                        Debug.LogError($"[QUEST-ITEM-REMOVE] decremented slot {slotId}: {stack} → {newCount}");
+                        Debug.LogError($"[QUEST-ITEM-REMOVE] decremented slot {slotId}: {stack} -> {newCount}");
                     }
                     else
                     {
-                        // Stack consumed entirely — full-row remove via 0x1F.
                         remainingToRemove -= stack;
                         GetAndRemoveInventoryItem(connId, slotId);
 
@@ -517,7 +491,7 @@ namespace DungeonRunners.Networking
                             writer.WriteUInt16(conn.UnitContainerId);
                             writer.WriteByte(0x1F);
                             writer.WriteUInt32(slotId);
-                            if (!TryWriteEntitySynchForComponent(conn, writer, conn.UnitContainerId, 0x1F, SyncContext.PlayerActionResponse, "QUEST-ITEM-REMOVE", true))
+                            if (!TryWriteEntitySynchForComponent(conn, writer, conn.UnitContainerId, 0x1F, EntitySynchInfoContext.PlayerActionResponse, "QUEST-ITEM-REMOVE", true))
                                 continue;
                             writer.WriteByte(0x06);
                             SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
@@ -528,15 +502,14 @@ namespace DungeonRunners.Networking
 
                 if (remainingToRemove > 0)
                 {
-                    Debug.LogError($"[QUEST-ITEM-REMOVE] ⚠️ underflowed: {remainingToRemove}× {obj.Target} still needed but inventory exhausted");
+                    Debug.LogError($"[QUEST-ITEM-REMOVE]  underflowed: {remainingToRemove}x {obj.Target} still needed but inventory exhausted");
                 }
                 SavePlayerInventory(conn);
-                Debug.LogError($"[QUEST-ITEM-REMOVE] ✅ done for {obj.Target}");
+                Debug.LogError($"[QUEST-ITEM-REMOVE]  done for {obj.Target}");
             }
         }
 
 
-        // Throttle map for goto proximity checks: connId -> next allowed check time
         private Dictionary<int, float> _gotoNextCheckTime = new Dictionary<int, float>();
         private int _udpPacketCount = 0;
         private static readonly byte[] NULL_PRIVKEY = System.Text.Encoding.ASCII.GetBytes("PRIVKEY!");
@@ -550,29 +523,28 @@ namespace DungeonRunners.Networking
                 generator[0] = 0x02;
 
                 byte[] prime = new byte[128];
-                for (int i = 0; i < prime.Length; i++) prime[i] = 0xFF;
+                for (int byteIndex = 0; byteIndex < prime.Length; byteIndex++) prime[byteIndex] = 0xFF;
 
-                var ms = new System.IO.MemoryStream();
-                var bw = new System.IO.BinaryWriter(ms);
+                var synAckPayload = new System.IO.MemoryStream();
+                var synAckWriter = new System.IO.BinaryWriter(synAckPayload);
 
-                bw.Write((byte)0x03);
-                bw.Write(clientSyn.Length > 1 ? clientSyn[1] : (byte)0x01);
-                bw.Write((ushort)0);
-                bw.Write((uint)1);
+                synAckWriter.Write((byte)0x03);
+                synAckWriter.Write(clientSyn.Length > 1 ? clientSyn[1] : (byte)0x01);
+                synAckWriter.Write((ushort)0);
+                synAckWriter.Write((uint)1);
 
-                bw.Write((ushort)generator.Length);
-                bw.Write(generator);
+                synAckWriter.Write((ushort)generator.Length);
+                synAckWriter.Write(generator);
 
-                bw.Write((ushort)prime.Length);
-                bw.Write(prime);
+                synAckWriter.Write((ushort)prime.Length);
+                synAckWriter.Write(prime);
 
-                bw.Write((ushort)NULL_PUBKEY.Length);
-                bw.Write(NULL_PUBKEY);
+                synAckWriter.Write((ushort)NULL_PUBKEY.Length);
+                synAckWriter.Write(NULL_PUBKEY);
 
-                byte[] packet = ms.ToArray();
+                byte[] packet = synAckPayload.ToArray();
                 _udpListener.Send(packet, packet.Length, clientEndpoint);
 
-                // Create UDP session with Blowfish
                 string epKey = GetEndpointKey(clientEndpoint);
                 var session = new UDPSession { Endpoint = clientEndpoint, IsEstablished = false };
 
@@ -589,7 +561,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[UDP] SendUDPSynAck error: {ex.Message}");
+                Debug.LogError($"[UDP] sendUDPSynAck state=failed message='{ex.Message}'");
             }
         }
 
@@ -621,7 +593,7 @@ namespace DungeonRunners.Networking
         {
             _isRunning = false;
             _listener?.Stop();
-            _udpListener?.Close();  // 🔥 ADD THIS LINE
+            _udpListener?.Close();
             foreach (var conn in _connections.Values)
 
             {
@@ -631,125 +603,115 @@ namespace DungeonRunners.Networking
             Debug.Log("Game Server stopped");
         }
 
-        // ═══════════════════════════════════════════════════════════
-        // ADMIN PANEL: PENDING ITEM GRANTS
-        // ═══════════════════════════════════════════════════════════
         private IEnumerator PollPendingItemGrants()
         {
             yield return new WaitForSeconds(5f);
             while (_isRunning)
             {
                 try { ProcessPendingGrants(); }
-                catch (Exception ex) { Debug.LogError($"[GRANTS] Error: {ex.Message}"); }
+                catch (Exception ex) { Debug.LogError($"[GRANTS] state=failed message='{ex.Message}'"); }
                 try { ProcessPendingAdminActions(); }
-                catch (Exception ex) { Debug.LogError($"[ADMIN-ACT] Error: {ex.Message}"); }
+                catch (Exception ex) { Debug.LogError($"[ADMIN-ACT] state=failed message='{ex.Message}'"); }
                 yield return new WaitForSeconds(5f);
             }
         }
 
         private void ProcessPendingAdminActions()
         {
-            using (var conn = GameDatabase.GetConnection())
+            using (var connection = GameDatabase.GetConnection())
             {
-                // Check if table exists
-                object tbl = GameDatabase.ExecuteScalar(conn, "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_admin_actions'");
+                object tbl = GameDatabase.ExecuteScalar(connection, "SELECT name FROM sqlite_master WHERE type='table' AND name='pending_admin_actions'");
                 if (tbl == null) return;
 
                 var actions = new List<(int id, int charId, string actionType, int value)>();
-                using (var cmd = conn.CreateCommand())
+                using (var command = connection.CreateCommand())
                 {
-                    cmd.CommandText = "SELECT id, character_id, action_type, value FROM pending_admin_actions ORDER BY id";
-                    using (var reader = cmd.ExecuteReader())
+                    command.CommandText = "SELECT id, character_id, action_type, value FROM pending_admin_actions ORDER BY id";
+                    using (var reader = command.ExecuteReader())
                         while (reader.Read())
                             actions.Add((reader.GetInt32(0), reader.GetInt32(1), reader.GetString(2), reader.GetInt32(3)));
                 }
                 if (actions.Count == 0) return;
 
-                foreach (var act in actions)
+                foreach (var action in actions)
                 {
                     try
                     {
-                        // Find online connection
                         RRConnection onlineConn = null;
                         string loginName = null;
-                        foreach (var kvp in _selectedCharacter)
-                            if (kvp.Value.Id == act.charId) { loginName = kvp.Key; break; }
+                        foreach (var selectedCharacterEntry in _selectedCharacter)
+                            if (selectedCharacterEntry.Value.Id == action.charId) { loginName = selectedCharacterEntry.Key; break; }
                         if (loginName != null)
-                            foreach (var c in _connections)
-                                if (c.Value.LoginName == loginName) { onlineConn = c.Value; break; }
+                            foreach (var connectionEntry in _connections)
+                                if (connectionEntry.Value.LoginName == loginName) { onlineConn = connectionEntry.Value; break; }
 
-                        if (act.actionType == "gold" && onlineConn != null && onlineConn.UnitContainerId != 0)
+                        if (action.actionType == "gold" && onlineConn != null && onlineConn.UnitContainerId != 0)
                         {
-                            // Direct SQL update — don't use SaveCharacter which overwrites XP/level
-                            using (var gdb = GameDatabase.GetConnection())
+                            using (var goldConnection = GameDatabase.GetConnection())
                             {
-                                if (act.value > 0)
+                                if (action.value > 0)
                                 {
-                                    GameDatabase.ExecuteNonQuery(gdb,
+                                    GameDatabase.ExecuteNonQuery(goldConnection,
                                         "UPDATE characters SET gold = gold + @amt WHERE id = @id",
-                                        ("@amt", act.value), ("@id", act.charId));
-                                    // Send AddCurrency packet (0x20)
-                                    var wr = new LEWriter();
-                                    wr.WriteByte(0x07);
-                                    wr.WriteByte(0x35);
-                                    wr.WriteUInt16(onlineConn.UnitContainerId);
-                                    wr.WriteByte(0x20);
-                                    wr.WriteUInt32((uint)act.value);
-                                    wr.WriteByte(0x00);
-                                    wr.WriteUInt32(0x00000000);
-                                    wr.WriteByte(0x01);
-                                    wr.WriteByte(0x02);
-                                    wr.WriteUInt32(0x00000000);
-                                    wr.WriteByte(0x06);
-                                    SendToClient(onlineConn, wr.ToArray());
+                                        ("@amt", action.value), ("@id", action.charId));
+                                    var goldActionMessage = new LEWriter();
+                                    goldActionMessage.WriteByte(0x07);
+                                    goldActionMessage.WriteByte(0x35);
+                                    goldActionMessage.WriteUInt16(onlineConn.UnitContainerId);
+                                    goldActionMessage.WriteByte(0x20);
+                                    goldActionMessage.WriteUInt32((uint)action.value);
+                                    goldActionMessage.WriteByte(0x00);
+                                    goldActionMessage.WriteUInt32(0x00000000);
+                                    goldActionMessage.WriteByte(0x01);
+                                    goldActionMessage.WriteByte(0x02);
+                                    goldActionMessage.WriteUInt32(0x00000000);
+                                    goldActionMessage.WriteByte(0x06);
+                                    SendToClient(onlineConn, goldActionMessage.ToArray());
                                 }
-                                else if (act.value < 0)
+                                else if (action.value < 0)
                                 {
-                                    GameDatabase.ExecuteNonQuery(gdb,
+                                    GameDatabase.ExecuteNonQuery(goldConnection,
                                         "UPDATE characters SET gold = MAX(0, gold + @amt) WHERE id = @id",
-                                        ("@amt", act.value), ("@id", act.charId));
-                                    // Send AddCurrency (0x20) with negative value — 0x21 is gated behind merchant context
-                                    var wr = new LEWriter();
-                                    wr.WriteByte(0x07);
-                                    wr.WriteByte(0x35);
-                                    wr.WriteUInt16(onlineConn.UnitContainerId);
-                                    wr.WriteByte(0x20);                  // AddCurrency
-                                    wr.WriteInt32(act.value);            // already negative
-                                    wr.WriteByte(0x00);                  // source
-                                    wr.WriteUInt32(0x00000000);          // entityHandle
-                                    wr.WriteByte(0x01);                  // notifyFlag (jingle)
-                                    WritePlayerEntitySynch(onlineConn, wr);
-                                    wr.WriteByte(0x06);
-                                    SendCompressedA(onlineConn, 0x01, 0x0F, wr.ToArray());
+                                        ("@amt", action.value), ("@id", action.charId));
+                                    var goldDebitMessage = new LEWriter();
+                                    goldDebitMessage.WriteByte(0x07);
+                                    goldDebitMessage.WriteByte(0x35);
+                                    goldDebitMessage.WriteUInt16(onlineConn.UnitContainerId);
+                                    goldDebitMessage.WriteByte(0x20);
+                                    goldDebitMessage.WriteInt32(action.value);
+                                    goldDebitMessage.WriteByte(0x00);
+                                    goldDebitMessage.WriteUInt32(0x00000000);
+                                    goldDebitMessage.WriteByte(0x01);
+                                    WritePlayerEntitySynch(onlineConn, goldDebitMessage);
+                                    goldDebitMessage.WriteByte(0x06);
+                                    SendCompressedA(onlineConn, 0x01, 0x0F, goldDebitMessage.ToArray());
                                 }
-                                // Update in-memory savedChar gold too
-                                var sc = GetSavedCharacterForConn(onlineConn);
-                                if (sc != null) sc.gold = (uint)Math.Max(0, (int)sc.gold + act.value);
+                                var savedCharacter = GetSavedCharacterForConn(onlineConn);
+                                if (savedCharacter != null) savedCharacter.gold = (uint)Math.Max(0, (int)savedCharacter.gold + action.value);
                             }
-                            Debug.LogError($"[ADMIN-ACT] ✅ Gold {(act.value > 0 ? "+" : "")}{act.value} for char {act.charId}");
+                            Debug.LogError($"[ADMIN-ACT]  Gold {(action.value > 0 ? "+" : "")}{action.value} for char {action.charId}");
                         }
-                        else if (act.actionType == "level" && onlineConn != null)
+                        else if (action.actionType == "level" && onlineConn != null)
                         {
                             string connId = onlineConn.ConnId.ToString();
-                            PlayerState lvlPs = GetPlayerState(connId);
+                            PlayerState levelPlayerState = GetPlayerState(connId);
                             var savedChar = GetSavedCharacterForConn(onlineConn);
-                            if (savedChar != null && lvlPs != null)
+                            if (savedChar != null && levelPlayerState != null)
                             {
-                                int oldLevel = lvlPs.Level;
-                                int targetLevel = act.value;
+                                int oldLevel = levelPlayerState.Level;
+                                int targetLevel = action.value;
                                 byte persistedTargetLevel = SavedCharacterLevel.ResolvePersistedLevel(targetLevel);
-                                // Direct SQL — only update level and experience
-                                using (var ldb = GameDatabase.GetConnection())
-                                    GameDatabase.ExecuteNonQuery(ldb,
+                                using (var levelConnection = GameDatabase.GetConnection())
+                                    GameDatabase.ExecuteNonQuery(levelConnection,
                                         "UPDATE characters SET level=@lv, experience=0 WHERE id=@id",
-                                        ("@lv", persistedTargetLevel), ("@id", act.charId));
+                                        ("@lv", persistedTargetLevel), ("@id", action.charId));
                                 savedChar.level = persistedTargetLevel;
                                 savedChar.experience = 0;
-                                lvlPs.InitializeStats(savedChar.className ?? "Fighter", targetLevel);
-                                lvlPs.Experience = 0;
+                                levelPlayerState.InitializeStats(savedChar.className ?? "Fighter", targetLevel);
+                                levelPlayerState.Experience = 0;
                                 if (onlineConn.Avatar != null)
                                     CalculateEquipmentBonuses(connId, onlineConn.Avatar);
-                                lvlPs.RestoreToFull();
+                                levelPlayerState.RestoreToFull();
 
                                 if (targetLevel > oldLevel)
                                 {
@@ -759,51 +721,43 @@ namespace DungeonRunners.Networking
                                         uint packetXP = threshold * 256 / 5 + 100;
                                         SendAdminXPUpdate(onlineConn, packetXP, (uint)lv);
                                     }
-                                    // The DLL's XP hook on the client will echo each admin XP
-                                    // packet back to the server and write _lastClientXP. Without
-                                    // this reset, the next mob kill would consume that stale value
-                                    // and add a giant chunk of XP on top of the level we just set.
-                                    _lastClientXP = 0;
                                 }
-                                SendAdminHPSync(onlineConn, lvlPs);
-                                Debug.LogError($"[ADMIN-ACT] ✅ Level {oldLevel} → {targetLevel} for char {act.charId}");
+                                SendAdminEntitySynchInfoHP(onlineConn, levelPlayerState);
+                                Debug.LogError($"[ADMIN-ACT]  Level {oldLevel} -> {targetLevel} for char {action.charId}");
                             }
                         }
-                        // XP: update in-memory state so zone save doesn't overwrite DB
-                        if (act.actionType == "xp" && onlineConn != null)
+                        if (action.actionType == "xp" && onlineConn != null)
                         {
                             var savedChar = GetSavedCharacterForConn(onlineConn);
                             if (savedChar != null)
                             {
-                                savedChar.experience = (uint)act.value;
+                                savedChar.experience = (uint)action.value;
                                 string connId = onlineConn.ConnId.ToString();
-                                PlayerState xpPs = GetPlayerState(connId);
-                                if (xpPs != null) xpPs.Experience = (uint)act.value;
-                                Debug.LogError($"[ADMIN-ACT] ✅ XP memory updated to {act.value} for char {act.charId}");
+                                PlayerState xpPlayerState = GetPlayerState(connId);
+                                if (xpPlayerState != null) xpPlayerState.Experience = (uint)action.value;
+                                Debug.LogError($"[ADMIN-ACT]  XP memory updated to {action.value} for char {action.charId}");
                             }
                         }
-                        else if (act.actionType == "xp" && onlineConn == null)
+                        else if (action.actionType == "xp" && onlineConn == null)
                         {
-                            // Offline - DB already updated by admin panel, nothing to do
                         }
 
-                        // Delete processed action
-                        GameDatabase.ExecuteNonQuery(conn, "DELETE FROM pending_admin_actions WHERE id=@id", ("@id", act.id));
+                        GameDatabase.ExecuteNonQuery(connection, "DELETE FROM pending_admin_actions WHERE id=@id", ("@id", action.id));
                     }
-                    catch (Exception ex) { Debug.LogError($"[ADMIN-ACT] Failed action {act.id}: {ex.Message}"); }
+                    catch (Exception ex) { Debug.LogError($"[ADMIN-ACT] Failed action {action.id}: {ex.Message}"); }
                 }
             }
         }
 
         private void ProcessPendingGrants()
         {
-            using (var conn = GameDatabase.GetConnection())
+            using (var connection = GameDatabase.GetConnection())
             {
                 var grants = new List<(int id, int charId, string gcClass, int count, int width, int height, int rarity)>();
-                using (var cmd = conn.CreateCommand())
+                using (var command = connection.CreateCommand())
                 {
-                    cmd.CommandText = "SELECT id, character_id, gc_class, count, width, height, rarity FROM pending_item_grants ORDER BY id";
-                    using (var reader = cmd.ExecuteReader())
+                    command.CommandText = "SELECT id, character_id, gc_class, count, width, height, rarity FROM pending_item_grants ORDER BY id";
+                    using (var reader = command.ExecuteReader())
                     {
                         while (reader.Read())
                             grants.Add((reader.GetInt32(0), reader.GetInt32(1), reader.GetString(2),
@@ -816,18 +770,17 @@ namespace DungeonRunners.Networking
                 {
                     try
                     {
-                        // Find if character is online
                         RRConnection onlineConn = null;
                         string loginName = null;
-                        foreach (var kvp in _selectedCharacter)
+                        foreach (var selectedCharacterEntry in _selectedCharacter)
                         {
-                            if (kvp.Value.Id == grant.charId) { loginName = kvp.Key; break; }
+                            if (selectedCharacterEntry.Value.Id == grant.charId) { loginName = selectedCharacterEntry.Key; break; }
                         }
                         if (loginName != null)
                         {
-                            foreach (var c in _connections)
+                            foreach (var connectionEntry in _connections)
                             {
-                                if (c.Value.LoginName == loginName) { onlineConn = c.Value; break; }
+                                if (connectionEntry.Value.LoginName == loginName) { onlineConn = connectionEntry.Value; break; }
                             }
                         }
 
@@ -840,8 +793,8 @@ namespace DungeonRunners.Networking
                             int itemWidth = grant.width, itemHeight = grant.height;
                             try
                             {
-                                using (var db2 = GameDatabase.GetConnection())
-                                using (var dimReader = GameDatabase.ExecuteReader(db2,
+                                using (var dimensionConnection = GameDatabase.GetConnection())
+                                using (var dimReader = GameDatabase.ExecuteReader(dimensionConnection,
                                     "SELECT gc_type, width, height FROM item_dimensions WHERE LOWER(gc_type) = LOWER(@g)", ("@g", gcTypeFull)))
                                 { if (dimReader.Read()) { gcTypeFull = dimReader.GetString(0); itemWidth = dimReader.GetInt32(1); itemHeight = dimReader.GetInt32(2); } }
                             }
@@ -851,60 +804,58 @@ namespace DungeonRunners.Networking
                             if (packetGcType.StartsWith("items.pal.")) packetGcType = packetGcType.Substring(10);
 
                             byte slotX = 0, slotY = 0; bool foundSlot = false;
-                            for (byte row = 0; row < 8 && !foundSlot; row++)
-                                for (byte col = 0; col < 10 && !foundSlot; col++)
-                                    if (!IsInventorySlotOccupied(connId, col, row, itemWidth, itemHeight))
-                                    { slotX = col; slotY = row; foundSlot = true; }
+                            for (byte rowY = 0; rowY < 8 && !foundSlot; rowY++)
+                                for (byte columnX = 0; columnX < 10 && !foundSlot; columnX++)
+                                    if (!IsInventorySlotOccupied(connId, columnX, rowY, itemWidth, itemHeight))
+                                    { slotX = columnX; slotY = rowY; foundSlot = true; }
                             if (!foundSlot) { Debug.LogError($"[GRANTS] Inventory full char {grant.charId}"); continue; }
 
-                            // CRITICAL: use authored GC child count for correct mod count (NOT weapons.mod_count!)
                             int modSlots = 1;
-                            if (DungeonRunners.Managers.MerchantManager.TryGetAuthoredMerchantModSlots(packetGcType, out int ms))
-                                modSlots = ms;
+                            if (DungeonRunners.Gameplay.MerchantRuntime.TryGetAuthoredMerchantModSlots(packetGcType, out int authoredModSlots))
+                                modSlots = authoredModSlots;
 
                             uint slot = GetNextInventorySlot(connId);
-                            PlayerState ps = GetPlayerState(connId);
+                            PlayerState playerState = GetPlayerState(connId);
 
-                            byte itemLevel = ps != null ? (byte)Math.Max(1, Math.Min(ps.Level, 100)) : (byte)1;
+                            byte itemLevel = playerState != null ? (byte)Math.Max(1, Math.Min(playerState.Level, 100)) : (byte)1;
 
-                            var wr = new LEWriter();
-                            wr.WriteByte(0x07);
-                            wr.WriteByte(0x35);
-                            wr.WriteUInt16(onlineConn.UnitContainerId);
-                            wr.WriteByte(0x1E);
-                            wr.WriteByte(0x0B);
-                            wr.WriteByte(0xFF);
-                            wr.WriteCString(packetGcType);
-                            wr.WriteUInt32(slot);
-                            wr.WriteByte(slotX);
-                            wr.WriteByte(slotY);
-                            wr.WriteByte((byte)grant.count);
-                            wr.WriteByte(itemLevel);
-                            for (int mi = 0; mi < modSlots; mi++)
-                                wr.WriteByte(0x00);
-                            wr.WriteByte(0x01);
-                            wr.WriteByte(0xFF);
-                            wr.WriteCString("ScaleModPAL.Rare.Mod1");
-                            wr.WriteByte(0x03);
-                            wr.WriteByte(0x15);
-                            wr.WriteUInt32(0x11111111);
-                            WritePlayerEntitySynch(onlineConn, wr);
-                            wr.WriteByte(0x06);
+                            var grantItemMessage = new LEWriter();
+                            grantItemMessage.WriteByte(0x07);
+                            grantItemMessage.WriteByte(0x35);
+                            grantItemMessage.WriteUInt16(onlineConn.UnitContainerId);
+                            grantItemMessage.WriteByte(0x1E);
+                            grantItemMessage.WriteByte(0x0B);
+                            grantItemMessage.WriteByte(0xFF);
+                            grantItemMessage.WriteCString(packetGcType);
+                            grantItemMessage.WriteUInt32(slot);
+                            grantItemMessage.WriteByte(slotX);
+                            grantItemMessage.WriteByte(slotY);
+                            grantItemMessage.WriteByte((byte)grant.count);
+                            grantItemMessage.WriteByte(itemLevel);
+                            for (int modIndex = 0; modIndex < modSlots; modIndex++)
+                                grantItemMessage.WriteByte(0x00);
+                            grantItemMessage.WriteByte(0x01);
+                            grantItemMessage.WriteByte(0xFF);
+                            grantItemMessage.WriteCString("ScaleModPAL.Rare.Mod1");
+                            grantItemMessage.WriteByte(0x03);
+                            grantItemMessage.WriteByte(0x15);
+                            grantItemMessage.WriteUInt32(0x11111111);
+                            WritePlayerEntitySynch(onlineConn, grantItemMessage);
+                            grantItemMessage.WriteByte(0x06);
 
                             Debug.LogError($"[GRANTS] Sending: gc={packetGcType} modSlots={modSlots} slot={slot} pos=({slotX},{slotY})");
-                            SendToClient(onlineConn, wr.ToArray());
+                            SendToClient(onlineConn, grantItemMessage.ToArray());
 
-                            // Set NativeClass correctly (same as merchant buy)
-                            string gcLower2 = packetGcType.ToLowerInvariant();
-                            string nativeClass = "Armor";
-                            if (gcLower2.Contains("consumable") || gcLower2.Contains("questitem") || gcLower2.Contains("ring") || gcLower2.Contains("amulet") || gcLower2.Contains("scroll") || gcLower2.Contains("potion") || gcLower2.Contains("skillbook") || gcLower2.Contains("voucher"))
-                                nativeClass = "Item";
-                            else if (gcLower2.Contains("sword") || gcLower2.Contains("axe") || gcLower2.Contains("mace") || gcLower2.Contains("dagger") || gcLower2.Contains("hammer") || gcLower2.Contains("staff") || gcLower2.Contains("spear") || gcLower2.Contains("pick") || gcLower2.Contains("club") || gcLower2.Contains("scepter") || gcLower2.Contains("wand"))
-                                nativeClass = "MeleeWeapon";
-                            else if (gcLower2.Contains("bow") || gcLower2.Contains("cannon") || gcLower2.Contains("crossbow") || gcLower2.Contains("xbow") || gcLower2.Contains("gun"))
-                                nativeClass = "RangedWeapon";
+                            string packetGcTypeLower = packetGcType.ToLowerInvariant();
+                            string dfcClass = "Armor";
+                            if (packetGcTypeLower.Contains("consumable") || packetGcTypeLower.Contains("questitem") || packetGcTypeLower.Contains("ring") || packetGcTypeLower.Contains("amulet") || packetGcTypeLower.Contains("scroll") || packetGcTypeLower.Contains("potion") || packetGcTypeLower.Contains("skillbook") || packetGcTypeLower.Contains("voucher"))
+                                dfcClass = "Item";
+                            else if (packetGcTypeLower.Contains("sword") || packetGcTypeLower.Contains("axe") || packetGcTypeLower.Contains("mace") || packetGcTypeLower.Contains("dagger") || packetGcTypeLower.Contains("hammer") || packetGcTypeLower.Contains("staff") || packetGcTypeLower.Contains("spear") || packetGcTypeLower.Contains("pick") || packetGcTypeLower.Contains("club") || packetGcTypeLower.Contains("scepter") || packetGcTypeLower.Contains("wand"))
+                                dfcClass = "MeleeWeapon";
+                            else if (packetGcTypeLower.Contains("bow") || packetGcTypeLower.Contains("cannon") || packetGcTypeLower.Contains("crossbow") || packetGcTypeLower.Contains("xbow") || packetGcTypeLower.Contains("gun"))
+                                dfcClass = "RangedWeapon";
 
-                            var newItem = new DungeonRunners.Data.GCObject { GCClass = packetGcType, NativeClass = nativeClass };
+                            var newItem = new DungeonRunners.Data.GCObject { GCClass = packetGcType, DFCClass = dfcClass };
                             newItem.StoredRarity = grant.rarity;
                             newItem.StoredLevel = itemLevel;
                             TrackInventoryItem(connId, slot, newItem, slotX, slotY);
@@ -912,43 +863,41 @@ namespace DungeonRunners.Networking
                             SetStackCount(connId, slot, grant.count);
                             SavePlayerInventoryPublic(onlineConn);
 
-                            Debug.LogError($"[GRANTS] ✅ LIVE delivered {packetGcType} x{grant.count} modSlots={modSlots}");
-                            GameDatabase.ExecuteNonQuery(conn, "DELETE FROM pending_item_grants WHERE id=@id", ("@id", grant.id));
+                            Debug.LogError($"[GRANTS]  LIVE delivered {packetGcType} x{grant.count} modSlots={modSlots}");
+                            GameDatabase.ExecuteNonQuery(connection, "DELETE FROM pending_item_grants WHERE id=@id", ("@id", grant.id));
                             continue;
                         }
 
                         {
-                            // OFFLINE: insert into DB with proper grid placement
                             var occupied = new HashSet<string>();
-                            using (var cmd2 = conn.CreateCommand())
+                            using (var inventoryCommand = connection.CreateCommand())
                             {
-                                cmd2.CommandText = "SELECT slot_x, slot_y FROM character_inventory WHERE character_id=@cid";
-                                cmd2.Parameters.AddWithValue("@cid", grant.charId);
-                                using (var r2 = cmd2.ExecuteReader())
-                                    while (r2.Read()) occupied.Add($"{r2.GetInt32(0)},{r2.GetInt32(1)}");
+                                inventoryCommand.CommandText = "SELECT slot_x, slot_y FROM character_inventory WHERE character_id=@cid";
+                                inventoryCommand.Parameters.AddWithValue("@cid", grant.charId);
+                                using (var reader = inventoryCommand.ExecuteReader())
+                                    while (reader.Read()) occupied.Add($"{reader.GetInt32(0)},{reader.GetInt32(1)}");
                             }
 
-                            int fx = -1, fy = -1;
-                            for (int y = 0; y <= 8 - grant.height && fy < 0; y++)
-                                for (int x = 0; x <= 10 - grant.width && fx < 0; x++)
+                            int freeSlotX = -1, freeSlotY = -1;
+                            for (int slotY = 0; slotY <= 8 - grant.height && freeSlotY < 0; slotY++)
+                                for (int slotX = 0; slotX <= 10 - grant.width && freeSlotX < 0; slotX++)
                                 {
                                     bool fits = true;
-                                    for (int dx = 0; dx < grant.width && fits; dx++)
-                                        for (int dy = 0; dy < grant.height && fits; dy++)
-                                            if (occupied.Contains($"{x + dx},{y + dy}")) fits = false;
-                                    if (fits) { fx = x; fy = y; }
+                                    for (int widthOffset = 0; widthOffset < grant.width && fits; widthOffset++)
+                                        for (int heightOffset = 0; heightOffset < grant.height && fits; heightOffset++)
+                                            if (occupied.Contains($"{slotX + widthOffset},{slotY + heightOffset}")) fits = false;
+                                    if (fits) { freeSlotX = slotX; freeSlotY = slotY; }
                                 }
 
-                            if (fx < 0) { Debug.LogError($"[GRANTS] Inventory full (offline) char {grant.charId}"); continue; }
+                            if (freeSlotX < 0) { Debug.LogError($"[GRANTS] Inventory full (offline) char {grant.charId}"); continue; }
 
-                            GameDatabase.ExecuteNonQuery(conn,
+                            GameDatabase.ExecuteNonQuery(connection,
                                 "INSERT INTO character_inventory (character_id,gc_class,slot_x,slot_y,count,rarity,stored_level) VALUES(@cid,@gc,@x,@y,@n,@r,-1)",
-                                ("@cid", grant.charId), ("@gc", grant.gcClass), ("@x", fx), ("@y", fy), ("@n", grant.count), ("@r", grant.rarity));
-                            Debug.LogError($"[GRANTS] 📦 OFFLINE inserted {grant.gcClass} x{grant.count} to char {grant.charId} at ({fx},{fy})");
+                                ("@cid", grant.charId), ("@gc", grant.gcClass), ("@x", freeSlotX), ("@y", freeSlotY), ("@n", grant.count), ("@r", grant.rarity));
+                            Debug.LogError($"[GRANTS]  OFFLINE inserted {grant.gcClass} x{grant.count} to char {grant.charId} at ({freeSlotX},{freeSlotY})");
                         }
 
-                        // Delete processed grant
-                        GameDatabase.ExecuteNonQuery(conn, "DELETE FROM pending_item_grants WHERE id=@id", ("@id", grant.id));
+                        GameDatabase.ExecuteNonQuery(connection, "DELETE FROM pending_item_grants WHERE id=@id", ("@id", grant.id));
                     }
                     catch (Exception ex) { Debug.LogError($"[GRANTS] Failed grant {grant.id}: {ex.Message}"); }
                 }
@@ -968,12 +917,10 @@ namespace DungeonRunners.Networking
                         : endpoint.Address.ToString();
                     Debug.LogError($"[GAME-PORT] Connection from {remoteIP}:{endpoint.Port}");
 
-                    // Check if this is a queue connection (flagged by AuthServer)
-                    string queueUser = QueueConnectionBridge.CheckAndConsumeQueueIP(remoteIP);
+                    string queueUser = QueueConnection.CheckAndConsumeQueueIP(remoteIP);
                     if (queueUser != null)
                     {
-                        Debug.LogError($"[QUEUE] ✅ Queue connection from {remoteIP} for {queueUser} on GAME port");
-                        // Game port uses Go/Blowfish (same as PlayOk) — no crypto needed
+                        Debug.LogError($"[QUEUE]  Queue connection from {remoteIP} for {queueUser} on GAME port");
                     }
 
                     int connId = _nextConnId++;
@@ -992,13 +939,9 @@ namespace DungeonRunners.Networking
 
         private IEnumerator HandleClientCoroutine(RRConnection conn)
         {
-            // Load account flags for queue users (LoginName already set)
             if (conn.LoginName != null)
             {
                 LoadAccountFlags(conn.LoginName);
-                conn.DllSessionToken = (uint)(new System.Random().Next(1, int.MaxValue));
-                NativeRngLedger.LogSystemRandom("dll-session-token", (int)conn.DllSessionToken, conn.LoginName);
-                Debug.LogError($"[DLL-TOKEN] Generated token 0x{conn.DllSessionToken:X8} for {conn.LoginName}");
             }
 
             byte[] buffer = new byte[8192];
@@ -1006,7 +949,6 @@ namespace DungeonRunners.Networking
             {
                 try
                 {
-                    // Detect dead connections (client closed without sending data)
                     if (conn.Client.Client.Poll(0, System.Net.Sockets.SelectMode.SelectRead) && !conn.Stream.DataAvailable)
                     {
                         Debug.LogError($"[CLIENT] Connection {conn.ConnId} dead (poll detected)");
@@ -1026,36 +968,31 @@ namespace DungeonRunners.Networking
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogError($"Error handling client {conn.ConnId}: {ex.Message}\n{ex.StackTrace}");
-                    // DON'T break — one bad packet should not kill the connection
+                    Debug.LogError($"[GAME-SERVER] handleClient conn={conn.ConnId} state=failed message='{ex.Message}' stack='{ex.StackTrace}'");
                 }
                 yield return null;
             }
             Debug.Log($"Client {conn.ConnId} disconnected");
-            QueueConnectionBridge.PlayerDisconnected();
+            QueueConnection.PlayerDisconnected();
             SavePlayerInventory(conn);
             SavePlayerQuests(conn);
             SavePlayerLevel(conn);
             TouchSoloDungeonInstance(conn, "disconnect");
 
-            // Clean up Bling Gnome on disconnect
-            BlingGnomeManager.Instance.OnPlayerDisconnect(conn.ConnId);
+            BlingGnomeRuntime.Instance.OnPlayerDisconnect(conn.ConnId);
 
-            // Clear modifier tracker on disconnect (admin buffs are session-only)
             if (conn.LoginName != null)
-                _modifierTracker.ClearPlayer(conn.LoginName);
+                _activeModifiers.Clear(conn.LoginName);
 
             if (conn.LoginName != null)
                 _debuffCooldowns.Remove(conn.LoginName);
 
-            // Clean modifier sent guard so reconnect works
             if (conn.LoginName != null)
             {
                 _freePlayerModifierSent.Remove(conn.LoginName);
                 _freePlayerModifierSent.Remove(conn.LoginName + "_sent");
             }
 
-            // Clear active character in DB for admin panel
             if (conn.LoginName != null)
             {
                 try
@@ -1068,10 +1005,9 @@ namespace DungeonRunners.Networking
                 catch (System.Exception ex) { Debug.LogError($"[SAVE] clear current_character_id failed for {conn.LoginName}: {ex.Message}"); }
             }
 
-            // Clear town portal on normal logoff
             if (conn.LoginName != null && _selectedCharacter.ContainsKey(conn.LoginName))
             {
-                var logoffChar = CharacterRepository.GetCharacter(_selectedCharacter[conn.LoginName].Id);
+                var logoffChar = GetActiveCharacter(conn);
                 if (logoffChar != null)
                 {
                     logoffChar.tpZone = "";
@@ -1083,25 +1019,24 @@ namespace DungeonRunners.Networking
                     CharacterRepository.SaveCharacter(logoffChar);
                     Debug.LogError($"[DISCONNECT] Cleared town portal from DB");
                 }
+                InvalidateActiveCharacter(conn);
             }
 
-            // ═══ DROPPED ITEMS: Remove all items dropped by this player ═══
             if (conn.LoginName != null)
             {
                 string dropperName = conn.LoginName;
                 List<ushort> toRemove = new List<ushort>();
 
-                foreach (var kvp in _droppedItems)
+                foreach (var droppedItemEntry in _droppedItems)
                 {
-                    if (kvp.Value.DroppedBy == dropperName)
-                        toRemove.Add(kvp.Key);
+                    if (droppedItemEntry.Value.DroppedBy == dropperName)
+                        toRemove.Add(droppedItemEntry.Key);
                 }
 
                 foreach (ushort entityId in toRemove)
                 {
                     var info = _droppedItems[entityId];
 
-                    // Despawn for all other players in same zone
                     foreach (var other in _connections.Values)
                     {
                         if (other == conn) continue;
@@ -1111,14 +1046,13 @@ namespace DungeonRunners.Networking
                         SendDespawnEntity(other, entityId);
                     }
 
-                    // Remove from DB
                     if (info.DbId > 0)
                     {
                         try
                         {
-                            using (var db2 = DungeonRunners.Database.GameDatabase.GetConnection())
+                            using (var dropDatabase = DungeonRunners.Database.GameDatabase.GetConnection())
                             {
-                                DungeonRunners.Database.GameDatabase.ExecuteNonQuery(db2,
+                                DungeonRunners.Database.GameDatabase.ExecuteNonQuery(dropDatabase,
                                     "DELETE FROM dropped_items WHERE id = @id",
                                     ("@id", info.DbId));
                             }
@@ -1126,7 +1060,7 @@ namespace DungeonRunners.Networking
                         }
                         catch (Exception ex)
                         {
-                            Debug.LogError($"[DISCONNECT] ❌ Failed to delete dropped item dbId={info.DbId}: {ex.Message}");
+                            Debug.LogError($"[DISCONNECT]  Failed to delete dropped item dbId={info.DbId}: {ex.Message}");
                         }
                     }
 
@@ -1137,105 +1071,91 @@ namespace DungeonRunners.Networking
                     Debug.LogError($"[DISCONNECT] Removed {toRemove.Count} dropped items for {dropperName}");
             }
 
-            // ═══ GROUP: Mark member offline, send 0x49 then 0x35 ═══
-            // TTD-VERIFIED sequence:
-            //   0x49 → sets member+0x18=0, +0x30=1, shows "disconnected" chat message
-            //   0x35 → rebuilds member vector from packet data (isOnline=false for
-            //          disconnected member via readMember@0x5FA6D0), fires event 0x121111
-            //          → GroupHealth::refresh reads fresh member+0x18=0 → shows grey overlay
-            // DO NOT send 0x44 — TTD trace 20 proved it resets member state.
-            // 0x35 AFTER 0x49 works because 0x35 creates NEW member entries from packet
-            // data where isOnline byte is already 0, so no state to "undo".
-            var group = GroupManager.Instance.GetGroupForConn(conn.ConnId);
+            var group = GroupDirectory.Instance.GetGroupForConn(conn.ConnId);
             if (group != null)
             {
-                // Cache data BEFORE disconnect
-                var gm = group.Members.Find(m => m.ConnId == conn.ConnId);
-                if (gm != null)
+                var groupMember = group.Members.Find(member => member.ConnId == conn.ConnId);
+                if (groupMember != null)
                 {
-                    gm.CharSqlId = GetCharSqlId(conn);
-                    gm.AvatarEntityId = GetPlayerAvatarId(conn.LoginName);
-                    if (_selectedCharacter.TryGetValue(conn.LoginName, out var ch))
-                        gm.Name = ch.Name ?? gm.Name;
+                    groupMember.CharSqlId = GetCharSqlId(conn);
+                    groupMember.AvatarEntityId = GetPlayerAvatarId(conn.LoginName);
+                    if (_selectedCharacter.TryGetValue(conn.LoginName, out var selectedCharacter))
+                        groupMember.Name = selectedCharacter.Name ?? groupMember.Name;
                 }
 
-                uint disconnCharId = GetCharSqlId(conn);
+                uint disconnectedCharId = GetCharSqlId(conn);
 
-                if (GroupManager.Instance.DisconnectMember(conn.ConnId))
+                if (GroupDirectory.Instance.DisconnectMember(conn.ConnId))
                 {
-                    if (group.Members.Any(m => m.IsOnline))
+                    if (group.Members.Any(member => member.IsOnline))
                     {
-                        // Step 1: 0x49 — shows "Group member '%s' has disconnected." chat message
-                        byte[] disconnectPacket = GroupPackets.BuildMemberDisconnected(group.GroupId, disconnCharId);
-                        foreach (var rm in group.Members)
+                        byte[] disconnectPacket = GroupPackets.BuildMemberDisconnected(group.GroupId, disconnectedCharId);
+                        foreach (var remainingMember in group.Members)
                         {
-                            if (!rm.IsOnline) continue;
-                            var rmc = FindConnectionById(rm.ConnId);
-                            if (rmc != null)
-                                SendToClient(rmc, disconnectPacket);
+                            if (!remainingMember.IsOnline) continue;
+                            var remainingMemberConnection = FindConnectionById(remainingMember.ConnId);
+                            if (remainingMemberConnection != null)
+                                SendToClient(remainingMemberConnection, disconnectPacket);
                         }
 
-                        // Step 2: 0x35 — rebuilds member vector with isOnline=false for
-                        // disconnected member. readMember@0x5FA6D0 reads isOnline byte from
-                        // packet → stores at member+0x18. Event 0x121111 fires →
-                        // GroupHealth::refresh → reads +0x18=0 → grey overlay.
                         SendGroupConnectedToAll(group);
 
-                        Debug.LogError($"[GROUP] Sent 0x49+0x35 for disconnect: {conn.LoginName} charId=0x{disconnCharId:X8}");
+                        Debug.LogError($"[GROUP] Sent 0x49+0x35 for disconnect: {conn.LoginName} charId=0x{disconnectedCharId:X8}");
                     }
                     else
                     {
-                        foreach (var m in group.Members.ToList())
-                            GroupManager.Instance.LeaveGroup(m.ConnId);
+                        foreach (var member in group.Members.ToList())
+                            GroupDirectory.Instance.LeaveGroup(member.ConnId);
                     }
                 }
                 conn.GroupConnectedSent = false;
             }
 
-            // ═══ MULTIPLAYER: Remove avatar from other clients ═══
             if (conn.IsSpawned)
             {
                 BroadcastEntityRemove(conn, conn.CurrentZoneGcType);
                 conn.IsSpawned = false;
             }
+            _monsterSpawnSentByConn.Remove(conn.ConnId);
+            _encounterObjectSentByConn.Remove(conn.ConnId);
+            ReassignMonsterOwnership(conn);
 
             string disconnKey = conn.ConnId.ToString();
             ClearUseTarget(conn);
-            Combat.WeaponCycleTracker.Instance.ClearConnection(disconnKey);
+            Combat.WeaponUseRuntime.Instance.ClearConnection(disconnKey);
             if (conn.Avatar != null)
-                CombatManager.Instance.UnregisterPlayer((uint)conn.Avatar.Id);
+                CombatRuntime.Instance.UnregisterPlayer((uint)conn.Avatar.Id);
             else if (_playerAvatarEntityId.TryGetValue(disconnKey, out uint oldAvatarId))
-                CombatManager.Instance.UnregisterPlayer(oldAvatarId);
+                CombatRuntime.Instance.UnregisterPlayer(oldAvatarId);
             Debug.LogError($"[COMBAT-LIFECYCLE] disconnect cleared combat state conn={conn.ConnId} avatar={(conn.Avatar != null ? conn.Avatar.Id : 0)}");
             _playerAvatarEntityId.Remove(disconnKey);
             _playerNextSkillEntityId.Remove(disconnKey);
             _playerSkillsComponentId.Remove(disconnKey);
             _playerSkillSlots.Remove(disconnKey);
+            _encounterObjectSentByConn.Remove(conn.ConnId);
+            _monsterSpawnSentByConn.Remove(conn.ConnId);
+            CancelTradeOnDisconnect(conn);
             _connections.Remove(conn.ConnId);
-            if (conn.LoginName != null) { lock (_dllEndpoints) { _dllEndpoints.Remove(conn.LoginName); } }
 
-            // PVP: clean up queue + forfeit active match on disconnect
             try
             {
-                var forfeited = Managers.PVPMatchManager.Instance.HandleDisconnect(conn.LoginName);
+                var forfeited = Gameplay.PVPMatchmaking.Instance.HandleDisconnect(conn.LoginName);
                 if (forfeited != null) FinalizeMatchResults(forfeited);
             }
             catch (Exception ex) { Debug.LogError($"[PVP] disconnect cleanup: {ex.Message}"); }
 
-            // Social: notify friends this player went offline
             if (conn.LoginName != null && _selectedCharacter.TryGetValue(conn.LoginName, out var disconnChar))
             {
-                SocialManager.Instance.PlayerOffline(conn.LoginName, disconnChar.Name, SendSocialViaAuth);
-                // Posse: rebroadcast CachedPosseFull to other posse members so they see the offline state.
-                try { PosseManager.Instance.NotifyMemberStateChange(disconnChar.Id, this); }
+                SocialRuntime.Instance.PlayerOffline(conn.LoginName, disconnChar.Name, SendSocialViaAuth);
+                try { PosseRuntime.Instance.NotifyMemberStateChange(disconnChar.Id, this); }
                 catch (Exception ex) { Debug.LogError($"[POSSE] disconnect notify failed: {ex.Message}"); }
             }
             else if (conn.LoginName != null)
             {
-                // Fallback: remove from online users even without character lookup
-                SocialManager.Instance.ForceRemoveOnline(conn.LoginName);
+                SocialRuntime.Instance.ForceRemoveOnline(conn.LoginName);
             }
-            QueueConnectionBridge.RemoveQueueStream(conn.LoginName);
+            InvalidateActiveCharacter(conn);
+            QueueConnection.RemoveQueueStream(conn.LoginName);
 
             conn.Disconnect();
         }
@@ -1244,7 +1164,6 @@ namespace DungeonRunners.Networking
         {
             int offset = 0;
 
-            // Loop through all concatenated messages in the buffer (like Rainbow does)
             while (offset < data.Length)
             {
                 if (data.Length - offset < 1) break;
@@ -1258,7 +1177,6 @@ namespace DungeonRunners.Networking
                     break;
                 }
 
-                // Extract this single message
                 byte[] singleMessage = new byte[messageLen];
                 Array.Copy(data, offset, singleMessage, 0, messageLen);
 
@@ -1272,21 +1190,21 @@ namespace DungeonRunners.Networking
         {
             switch (messageType)
             {
-                case 0x02: // Ping - variable, read from buffer
-                    return data.Length - offset; // Consume all for ping
-                case 0x03: // Connect - 4 bytes total
+                case 0x02:
+                    return data.Length - offset;
+                case 0x03:
                     return 4;
-                case 0x0A: // CompressedA - 1 + 3 + 4 + bodyLen
-                case 0x0E: // CompressedE - 1 + 3 + 4 + bodyLen
+                case 0x0A:
+                case 0x0E:
                     if (data.Length - offset < 8) return -1;
                     uint bodyLen = BitConverter.ToUInt32(data, offset + 4);
                     return 8 + (int)bodyLen;
-                case 0x10: // Direct - need to figure out length
+                case 0x10:
                     if (data.Length - offset < 8) return -1;
                     uint directBodyLen = (uint)(data[offset + 4] | (data[offset + 5] << 8) | (data[offset + 6] << 16));
                     return 8 + (int)directBodyLen;
                 default:
-                    return data.Length - offset; // Unknown, consume all
+                    return data.Length - offset;
             }
         }
 
@@ -1299,7 +1217,7 @@ namespace DungeonRunners.Networking
 
             switch (messageType)
             {
-                case 0x02: // Ping - don't log these
+                case 0x02:
                     HandlePing(conn, data);
                     break;
                 case 0x03:
@@ -1342,11 +1260,11 @@ namespace DungeonRunners.Networking
             Debug.Log($"Client {conn.ConnId} sent connect message");
 
             var reader = new LEReader(data);
-            reader.ReadByte(); // Skip message type
+            reader.ReadByte();
             uint clientId = reader.ReadUInt24();
             _peerId24[conn.ConnId] = clientId;
 
-            Debug.Log($"Client peer ID: 0x{clientId:X6}");
+            Debug.Log($"[CLIENT] peerId=0x{clientId:X6}");
 
             var writer = new LEWriter();
             writer.WriteByte(0x04);
@@ -1366,12 +1284,12 @@ namespace DungeonRunners.Networking
             try
             {
                 var reader = new LEReader(data);
-                reader.ReadByte(); // 0x0A
+                reader.ReadByte();
                 uint peerId = reader.ReadUInt24();
                 uint bodyLen = reader.ReadUInt32();
                 byte channel = reader.ReadByte();
                 byte messageType = reader.ReadByte();
-                reader.ReadByte(); // 0x00
+                reader.ReadByte();
                 uint uncompressedLen = reader.ReadUInt32();
 
                 byte[] compressed = reader.ReadBytes((int)(bodyLen - 7));
@@ -1381,7 +1299,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"HandleCompressedA error: {ex.Message}");
+                Debug.LogError($"[GAME-SERVER] handleCompressedA state=failed message='{ex.Message}'");
             }
         }
 
@@ -1390,12 +1308,12 @@ namespace DungeonRunners.Networking
             try
             {
                 var reader = new LEReader(data);
-                reader.ReadByte(); // 0x0E
+                reader.ReadByte();
                 uint dest = reader.ReadUInt24();
                 uint bodyLen = reader.ReadUInt24();
-                reader.ReadByte(); // 0x00
+                reader.ReadByte();
                 uint source = reader.ReadUInt24();
-                reader.ReadBytes(5); // Skip 5 bytes
+                reader.ReadBytes(5);
                 uint uncompressedLen = reader.ReadUInt32();
 
                 byte[] compressed = reader.ReadBytes((int)(bodyLen - 12));
@@ -1418,7 +1336,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[E-LANE] ERROR: {ex.Message}");
+                Debug.LogError($"[E-LANE] state=failed message='{ex.Message}'");
             }
         }
 
@@ -1427,7 +1345,7 @@ namespace DungeonRunners.Networking
             try
             {
                 var reader = new LEReader(data);
-                reader.ReadByte(); // 0x10
+                reader.ReadByte();
                 uint peerId = reader.ReadUInt24();
                 uint bodyLen = reader.ReadUInt24();
                 byte channel = reader.ReadByte();
@@ -1438,7 +1356,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"HandleDirectMessage error: {ex.Message}");
+                Debug.LogError($"[GAME-SERVER] handleDirectMessage state=failed message='{ex.Message}'");
             }
         }
 
@@ -1448,34 +1366,29 @@ namespace DungeonRunners.Networking
 
             switch (channel)
             {
-                case 0: // Initial connection
+                case 0:
                     HandleInitialConnection(conn, messageType, data);
                     break;
-                case 3: // Social/UserManager channel (TChannelManager index 3)
-                    // Binary-verified: UserManagerClient::start @ 0x601B10 registers at
-                    // GatewayClient's TChannelManager slot 3 (push 3 @ 0x601B71).
-                    // HandleCompressedE already extracted: channel=3, messageType=socialOp, data=body
-                    // messageType IS the social operation (0x00=connect, 0x01=requestRosters,
-                    // 0x03=addContact, 0x07=requestUserList, etc.)
-                    SocialManager.Instance.HandleMessage(conn, messageType, data, SendSocialViaAuth);
+                case 3:
+                    SocialRuntime.Instance.HandleMessage(conn, messageType, data, SendSocialViaAuth);
                     break;
-                case 4: // Character channel
+                case 4:
                     HandleCharacterChannel(conn, messageType, data);
                     break;
                 case 6:
-                    // Check for admin commands first (Invulnerable, etc.)
-                    if (_adminHandler == null)
+                    Debug.LogError($"[CHAT-CH6] type=0x{messageType:X2} len={data?.Length ?? 0} hex={(data != null && data.Length > 0 ? BitConverter.ToString(data, 0, Math.Min(data.Length, 48)) : "")}");
+                    if (_adminCommands == null)
                     {
-                        _adminHandler = new AdminCommandHandler();
-                        _adminHandler.SetServerCallbacks(
-                            (c, zone) => ChatChangeZone(c, zone),
-                            (c) => {
-                                if (_selectedCharacter.TryGetValue(c.LoginName, out var ch))
-                                    return CharacterRepository.GetCharacter(ch.Id);
+                        _adminCommands = new AdminCommands();
+                        _adminCommands.SetServerCallbacks(
+                            (connection, zone) => ChatChangeZone(connection, zone),
+                            (connection) => {
+                                if (_selectedCharacter.TryGetValue(connection.LoginName, out var selectedCharacter))
+                                    return CharacterRepository.GetCharacter(selectedCharacter.Id);
                                 return null;
                             },
                             HandleAdminLevelUp,
-                            (login, gcType, modId) => _modifierTracker.TrackModifier(login, new ActiveModifier
+                            (login, gcType, modId) => _activeModifiers.AddOrReplace(login, new ActiveModifier
                             {
                                 GCType = gcType,
                                 Id = modId,
@@ -1485,32 +1398,29 @@ namespace DungeonRunners.Networking
                                 SourceIsSelf = 0,
                                 AddedAt = DateTime.UtcNow
                             }),
-                            (login, modId) => _modifierTracker.RemoveModifierById(login, modId),
+                            (login, modId) => _activeModifiers.RemoveById(login, modId),
                             AdminCompleteQuest,
                             (c, w) => { WritePlayerEntitySynch(c, w); }
                         );
                     }
                     {
                         PlayerState adminPs = GetPlayerState(conn.ConnId.ToString());
-                        // /adminui commands only for admins
-                        if (IsPlayerAdmin(conn.LoginName) && _adminHandler.TryHandleAdminCommand(conn, messageType, data, adminPs, SendSystemMessage, SendToClient))
+                        if (IsPlayerAdmin(conn.LoginName) && _adminCommands.TryExecute(conn, messageType, data, adminPs, SendSystemMessage, SendToClient))
                             break;
                     }
-                    // ═══ Bling Gnome chat commands — available to ALL players ═══
-                    // Must come BEFORE ChatCommandHandler which blocks all @ for non-admin
                     {
                         bool handledByGnome = false;
                         try
                         {
                             var peekReader = new LEReader(data);
-                            string peekMsg = peekReader.ReadCString();
-                            if (peekMsg.StartsWith("@"))
+                            string peekMessage = peekReader.ReadCString();
+                            if (peekMessage.StartsWith("@"))
                             {
-                                string cmd = peekMsg.Substring(1).Trim().ToLower();
-                                if (cmd == "gnome" || cmd == "bling" || cmd == "blinggnome" || cmd == "gs" || cmd == "gnomestatus")
+                                string command = peekMessage.Substring(1).Trim().ToLower();
+                                if (command == "gnome" || command == "bling" || command == "blinggnome" || command == "gs" || command == "gnomestatus")
                                 {
-                                    BlingGnomeManager.Instance.SetServer(this);
-                                    BlingGnomeManager.Instance.HandleChatMessage(conn, data, SendCompressedA, SendSystemMessage);
+                                    BlingGnomeRuntime.Instance.SetServer(this);
+                                    BlingGnomeRuntime.Instance.TryExecute(conn, data, SendCompressedA, SendSystemMessage);
                                     handledByGnome = true;
                                 }
                             }
@@ -1518,12 +1428,10 @@ namespace DungeonRunners.Networking
                         catch { }
                         if (handledByGnome) break;
                     }
-                    if (_chatHandler == null) _chatHandler = new ChatCommandHandler(this);
-                    if (!_chatHandler.HandleChatMessage(conn, data, SendSystemMessage))
+                    if (_chatCommands == null) _chatCommands = new ChatCommands(this);
+                    if (!_chatCommands.TryExecute(conn, data, SendSystemMessage))
                     {
-                        // Fallback — other non-admin @ commands
                     }
-                    // ═══ MULTIPLAYER: Chat relay ═══
                     {
                         try
                         {
@@ -1531,68 +1439,62 @@ namespace DungeonRunners.Networking
                             string chatText = chatReader.ReadCString();
                             if (!string.IsNullOrEmpty(chatText) && !chatText.StartsWith("/") && !chatText.StartsWith("@"))
                             {
-                                BroadcastChatToZone(conn, chatText);
+                                HandleChatMessage(conn, messageType, chatText);
                             }
                         }
                         catch (Exception ex)
                         {
-                            Debug.LogError($"[CHAT-RELAY] Error: {ex.Message}");
+                            Debug.LogError($"[CHAT-RELAY] state=failed message='{ex.Message}'");
                         }
                     }
                     break;
-                case 7: // ClientEntity channel
+                case 7:
                     HandleClientEntityChannel(conn, messageType, data);
                     break;
-                case 9: // Group channel
+                case 9:
                     HandleGroupChannel(conn, messageType, data);
                     break;
-                case 12: // Social/UserManager channel
-                    SocialManager.Instance.HandleMessage(conn, messageType, data, SendSocialViaAuth);
+                case 10:
+                    HandleTradeChannel(conn, messageType, data);
                     break;
-                case 13: // QuestManager channel
-                    Debug.LogError($"[CH13] ████ type=0x{messageType:X2} dataLen={data?.Length ?? 0} hex={(data != null && data.Length > 0 ? BitConverter.ToString(data, 0, Math.Min(30, data.Length)) : "EMPTY")} ████");
+                case 12:
+                    SocialRuntime.Instance.HandleMessage(conn, messageType, data, SendSocialViaAuth);
+                    break;
+                case 13:
+                    Debug.LogError($"[CH13]  type=0x{messageType:X2} dataLen={data?.Length ?? 0} hex={(data != null && data.Length > 0 ? BitConverter.ToString(data, 0, Math.Min(30, data.Length)) : "EMPTY")} ");
                     if (messageType == 0x07)
                     {
-                        Debug.LogError($"[CH13] → Routing to goToCheckpoint (0x07)");
+                        Debug.LogError($"[CH13] -> Routing to goToCheckpoint (0x07)");
                         HandleCheckpointTeleportRequest(conn, data);
                     }
                     else if (messageType == 0x0C)
                     {
-                        Debug.LogError($"[CH13] → Routing to Obelisk (0x0C)");
+                        Debug.LogError($"[CH13] -> Routing to Obelisk (0x0C)");
                         HandleObeliskTeleport(conn);
                     }
                     else if (messageType == 0x0B)
                     {
-                        Debug.LogError($"[CH13] → Routing to SavedPlace (0x0B)");
+                        Debug.LogError($"[CH13] -> Routing to SavedPlace (0x0B)");
                         HandleSavedPlaceTeleport(conn);
                     }
                     else
                     {
-                        Debug.LogError($"[CH13] → UNHANDLED type 0x{messageType:X2} — routing to HandleZoneChannel");
+                        Debug.LogError($"[CH13] -> UNHANDLED type 0x{messageType:X2} - routing to HandleZoneChannel");
                         HandleZoneChannel(conn, data);
                     }
                     break;
-                case 11: // GroupClient channel (0x0B) — per binary VA 0x458B9B
+                case 11:
                     HandleGroupClientChannel(conn, messageType, data);
                     break;
-                case 15: // PosseClient channel (0x0F) — binary-verified via Ghidra (2026-05-16)
-                    // PosseClient::start @ 0x00610610 has PUSH 0xf @ 0x00610676 immediately
-                    // before CALL TChannelManager<>::createChannel @ 0x0061067F. Dispatch
-                    // jump table for incoming messages lives at 0x00611F60. See PosseManager.cs
-                    // header for the full opcode map.
-                    PosseManager.Instance.HandleMessage(conn, messageType, data, SendSocialViaAuth, this);
+                case 15:
+                    PosseRuntime.Instance.HandleMessage(conn, messageType, data, SendSocialViaAuth, this);
                     break;
                 default:
                     {
-                        // Unknown-channel canary. PosseClient (slot 15) is wired above; any other
-                        // channel that surfaces here is a still-unmapped gateway client
-                        // (TradeClient candidates etc.). Keep the [POSSE-PROBE] prefix so the
-                        // existing RuntimeEvidenceManager.IsFocusedLog entry continues to surface
-                        // it in server.log.
                         string hex = (data != null && data.Length > 0)
                             ? BitConverter.ToString(data, 0, Math.Min(48, data.Length))
                             : "EMPTY";
-                        Debug.LogError($"[POSSE-PROBE] Unhandled channel={channel} type=0x{messageType:X2} dataLen={data?.Length ?? 0} hex={hex}");
+                        Debug.LogError($"[POSSE] unhandled channel={channel} type=0x{messageType:X2} dataLen={data?.Length ?? 0} hex={hex}");
                     }
                     break;
             }
@@ -1600,64 +1502,57 @@ namespace DungeonRunners.Networking
 
         private void HandleCheckpointTeleportRequest(RRConnection conn, byte[] data)
         {
-            Debug.LogError($"[CP-TELEPORT] ═══════════════════════════════════════════════════");
+            Debug.LogError($"[CP-TELEPORT] ");
             Debug.LogError($"[CP-TELEPORT] Data hex: {BitConverter.ToString(data ?? new byte[0])}");
 
             try
             {
                 if (data == null || data.Length < 1)
                 {
-                    Debug.LogError($"[CP-TELEPORT] ❌ Empty data");
+                    Debug.LogError($"[CP-TELEPORT]  Empty data");
                     return;
                 }
 
-                // Parse GC type tag format (matches binary readType @ 0x5E3C40)
-                // Tag 0xFF = [0xFF][cstring\0]  (full class name)
-                // Tag 0x00 = null reference
-                // Tag 0x01 = [0x01][byte index]
                 byte tag = data[0];
                 string checkpointName = null;
 
                 if (tag == 0xFF && data.Length > 2)
                 {
-                    // Read null-terminated string
                     int end = System.Array.IndexOf(data, (byte)0x00, 1);
                     if (end > 1)
                         checkpointName = System.Text.Encoding.ASCII.GetString(data, 1, end - 1);
-                    Debug.LogError($"[CP-TELEPORT] Tag 0xFF → checkpoint name: '{checkpointName}'");
+                    Debug.LogError($"[CP-TELEPORT] Tag 0xFF -> checkpoint name: '{checkpointName}'");
                 }
                 else if (tag == 0x00)
                 {
-                    Debug.LogError($"[CP-TELEPORT] Tag 0x00 = null ref — using obelisk rotator");
+                    Debug.LogError($"[CP-TELEPORT] Tag 0x00 = null ref - using obelisk rotator");
                     HandleObeliskTeleport(conn);
                     return;
                 }
                 else
                 {
-                    Debug.LogError($"[CP-TELEPORT] ❌ Unknown tag: 0x{tag:X2}");
+                    Debug.LogError($"[CP-TELEPORT]  Unknown tag: 0x{tag:X2}");
                     return;
                 }
 
                 if (string.IsNullOrEmpty(checkpointName))
                 {
-                    Debug.LogError($"[CP-TELEPORT] ❌ Empty checkpoint name");
+                    Debug.LogError($"[CP-TELEPORT]  Empty checkpoint name");
                     return;
                 }
 
-                // Look up checkpoint directly by GC class name
                 var checkpoint = DatabaseLoader.Checkpoints.FirstOrDefault(c =>
                     c.id.Equals(checkpointName, StringComparison.OrdinalIgnoreCase));
 
                 if (checkpoint == null)
                 {
-                    Debug.LogError($"[CP-TELEPORT] ❌ Checkpoint not in database: '{checkpointName}'");
+                    Debug.LogError($"[CP-TELEPORT]  Checkpoint not in database: '{checkpointName}'");
                     return;
                 }
 
                 string destinationZone = checkpoint.zone;
-                Debug.LogError($"[CP-TELEPORT] 🚀 Teleporting to '{destinationZone}' via checkpoint '{checkpointName}'");
+                Debug.LogError($"[CP-TELEPORT]  Teleporting to '{destinationZone}' via checkpoint '{checkpointName}'");
 
-                // Get destination zone's spawn point
                 var destZone = _zones.Values.FirstOrDefault(z =>
                     z.name.Equals(destinationZone, StringComparison.OrdinalIgnoreCase));
 
@@ -1672,81 +1567,42 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[CP-TELEPORT] ❌ Error: {ex.Message}\n{ex.StackTrace}");
+                Debug.LogError($"[CP-TELEPORT] state=failed message='{ex.Message}' stack='{ex.StackTrace}'");
             }
         }
 
-        // Track last obelisk click index per player for cycling through destinations
-        private Dictionary<string, int> _obeliskClickIndex = new Dictionary<string, int>();
         private HashSet<uint> _finalizedMonsterKills = new HashSet<uint>();
-        private uint _lastClientXP = 0; // XP reported by DLL from client — used as truth when available
-        private volatile int _dllPreConfirmCount = 0;    // DEPRECATED — kept for compat, always 0
-        private HashSet<uint> _dllPreConfirmedEntities = new HashSet<uint>();
-        private int _e1PacketCount = 0;
-        private Dictionary<string, float> _lastRelayPosX = new Dictionary<string, float>();
-        private Dictionary<string, float> _lastRelayPosY = new Dictionary<string, float>();
         private Dictionary<int, float> _forceRelayUntil = new Dictionary<int, float>();
-        private Dictionary<string, byte> _lastRawMoveCount = new Dictionary<string, byte>();
         private HashSet<string> _stopSignalSent = new HashSet<string>();
         private int _mpDiagCounter = 0;
 
-        // ═══════════════════════════════════════════════════════════════
-        // DIFFICULTY SYSTEM — Binary: GroupClient stores at GC+0xB6 (0-3)
-        // processMonsterDifficultySet @ 0x5FA320 validates cmp al, 4
-        // Format string: "Your personal difficulty setting is now %s.
-        //   This setting will not apply until you are the group leader."
-        // Original server scaled monster HP/damage/XP per difficulty.
-        // ═══════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Get the active difficulty for a connection.
-        /// Group: uses leader's MonsterDifficulty. Solo: uses server default.
-        /// Binary: only group leader's setting applies (format string proves it).
-        /// </summary>
         public int GetDifficultyForConn(RRConnection conn)
         {
-            var group = GroupManager.Instance.GetGroupForConn(conn.ConnId);
+            var group = GroupDirectory.Instance.GetGroupForConn(conn.ConnId);
             if (group != null)
                 return Math.Max(0, Math.Min(3, (int)group.MonsterDifficulty));
             return 0;
         }
 
-        /// <summary>
-        /// Get HP multiplier for difficulty level. Configurable in server.cfg.
-        /// Default: Normal=1.0, Hard=1.5, Insane=2.0, Extreme=3.0
-        /// Binary: EncounterDifficulty curve scales 4→20 (5x) over 100 levels.
-        /// </summary>
         public float GetDifficultyHPMult(int difficulty)
         {
             return 1.0f;
         }
 
-        /// <summary>
-        /// Get XP multiplier for difficulty level. Higher difficulty = more XP.
-        /// </summary>
         public float GetDifficultyXPMult(int difficulty)
         {
             return 1.0f;
         }
 
-        /// <summary>
-        /// Apply difficulty scaling to all monsters in an instance.
-        /// Called once after initial spawn, before sending to clients.
-        /// Scales MaxHP and CurrentHP. Client sees tougher monsters.
-        /// </summary>
         private void ApplyDifficultyToMonsters(RRConnection conn, string instanceKey)
         {
             int diff = GetDifficultyForConn(conn);
             if (diff == 0) return;
-            Debug.LogError($"[DIFFICULTY] Native group difficulty scaling is not applied without authored evidence diff={diff} instance='{instanceKey}'");
+            Debug.LogError($"[DIFFICULTY]  group difficulty scaling is not applied without authored evidence diff={diff} instance='{instanceKey}'");
             return;
         }
 
-        /// <summary>
-        /// Send monsters to ALL group members in the same zone+instance.
-        /// Binary: ServerEntityManager::writeClientInitMessages sends to specific client.
-        /// All clients get IDENTICAL spawn packets + FollowClient + same RNG seed.
-        /// </summary>
         public void SendMonsterToGroupInZone(string zoneName, uint instanceId, Monster monster)
         {
             foreach (var conn in _connections.Values)
@@ -1760,17 +1616,13 @@ namespace DungeonRunners.Networking
             }
         }
 
-        /// <summary>
-        /// Broadcast monster despawn (kill) to ALL players in the same zone+instance.
-        /// Binary: ServerEntityManager::writeRemoveMessages sends to all clients.
-        /// </summary>
         public void BroadcastMonsterDespawnToZone(string zoneName, uint instanceId, uint entityId)
         {
             var writer = new LEWriter();
-            writer.WriteByte(0x07);  // BeginStream
-            writer.WriteByte(0x05);  // EntityDespawn
+            writer.WriteByte(0x07);
+            writer.WriteByte(0x05);
             writer.WriteUInt16((ushort)entityId);
-            writer.WriteByte(0x06);  // EndStream
+            writer.WriteByte(0x06);
             byte[] despawnPacket = writer.ToArray();
 
             foreach (var conn in _connections.Values)
@@ -1784,18 +1636,13 @@ namespace DungeonRunners.Networking
             }
         }
 
-        /// <summary>
-        /// Send RNG reseed (opcode 0x0C) to ALL players in same zone+instance.
-        /// Binary: processRandomSeed on ClientEntityManager — reseeds room RNG.
-        /// All clients must get same seed at same time for deterministic AI.
-        /// </summary>
         public void BroadcastRNGSeedToZone(string zoneName, uint instanceId, uint seed)
         {
             var writer = new LEWriter();
-            writer.WriteByte(0x07);  // BeginStream
-            writer.WriteByte(0x0C);  // RandomSeed
+            writer.WriteByte(0x07);
+            writer.WriteByte(0x0C);
             writer.WriteUInt32(seed);
-            writer.WriteByte(0x06);  // EndStream
+            writer.WriteByte(0x06);
             byte[] seedPacket = writer.ToArray();
 
             foreach (var conn in _connections.Values)
@@ -1809,20 +1656,15 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[RNG-BROADCAST] Seed 0x{seed:X8} sent to inst={instanceId} in {zoneName}");
         }
 
-        /// <summary>
-        /// Send RNG reseed to OTHER players in same zone (not the sender — they get it in their tick stream).
-        /// Binary: ServerEntityManager writes 0x0C to ALL client streams, but each player's own tick
-        /// already includes their seed. This sends to the OTHERS.
-        /// </summary>
         private void BroadcastRNGSeedToOthersInZone(RRConnection sender, uint seed)
         {
             if (string.IsNullOrEmpty(sender.CurrentZoneName)) return;
 
             var writer = new LEWriter();
-            writer.WriteByte(0x07);  // BeginStream
-            writer.WriteByte(0x0C);  // RandomSeed
+            writer.WriteByte(0x07);
+            writer.WriteByte(0x0C);
             writer.WriteUInt32(seed);
-            writer.WriteByte(0x06);  // EndStream
+            writer.WriteByte(0x06);
             byte[] seedPacket = writer.ToArray();
 
             foreach (var conn in _connections.Values)
@@ -1835,77 +1677,32 @@ namespace DungeonRunners.Networking
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // INSTANCE SYSTEM — per binary architecture
-        // Binary: ZoneClient::GotoInstance(int) — per-group instances
-        // Binary: "You can't goto that player from here -- you must be in the same instance."
-        // Binary: GroupClient::resetInstances() — clears dungeon instances
-        //
-        // PUBLIC zones (town, tutorial/dew valley): InstanceId = 0, everyone sees everyone
-        // DUNGEON instances: InstanceId = groupId, only group members see each other
-        // Solo player in dungeon: InstanceId = unique per-player
-        // ═══════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Check if zone is public (everyone sees everyone) vs instanced (group-only).
-        /// Binary: Town is the shared hub — NPCs, merchants, trainers, no mobs.
-        /// Binary: Tutorial/Dew Valley is shared starter area with mobs — everyone sees everyone.
-        /// Binary: All dungeon## zones are INSTANCED per group — private, mobs, group-only.
-        /// Binary: "You can't goto that player from here -- you must be in the same instance."
-        /// </summary>
         public static bool IsPublicZone(string zoneName)
         {
             if (string.IsNullOrEmpty(zoneName)) return true;
             string lower = zoneName.ToLower();
-            // Town = safe hub, no mobs, public
             if (lower.Contains("town")) return true;
-            // Tutorial/Dew Valley = starter area, has mobs but shared (not instanced)
             if (lower.Contains("tutorial")) return true;
             if (lower.Contains("dew") || lower.Contains("valley")) return true;
-            // PvP hubs: pvp_start (Pwnston), pvp_hub, test_pvp1/2 — public gathering zones
-            // (Match zones like pvpgroupduelmatch / deathmatch## stay INSTANCED so each
-            // match has only its own participants — handled by name not matching here.)
             if (lower == "pvp_start" || lower == "pvp_hub") return true;
             if (lower == "test_pvp1" || lower == "test_pvp2") return true;
-            // Everything else (dungeon##_level##, pvpgroup*, deathmatch##) is instanced per group/match
-            // Each group gets their OWN dungeon with their OWN mobs
             return false;
         }
 
-        /// <summary>
-        /// Assign instance ID for a connection entering a zone.
-        /// Binary: ZoneClient::GotoInstance(int) — all group members get same instance.
-        /// Call at every zone transition AFTER setting CurrentZoneName.
-        /// </summary>
         private void AssignInstanceId(RRConnection conn)
         {
             if (IsPublicZone(conn.CurrentZoneName))
             {
                 conn.InstanceId = 0;
                 StampRuntimeInstanceKey(conn, "public-zone");
-                Debug.LogError($"[INSTANCE] {conn.LoginName} → PUBLIC zone '{conn.CurrentZoneName}' (instance 0)");
+                Debug.LogError($"[INSTANCE] {conn.LoginName} -> PUBLIC zone '{conn.CurrentZoneName}' (instance 0)");
                 return;
             }
 
-            // ─────────────────────────────────────────────────────────────
-            // DUNGEON instance assignment — defensive multi-step lookup.
-            //
-            // BUG-FIX (group members in different instances of same dungeon):
-            // If a player entered a dungeon SOLO first (instance = 0x8XXXXXXX),
-            // then later joined a group, their InstanceId never updates. When
-            // a fellow group member then enters the same dungeon, the naive
-            // logic would assign them group.GroupId, which doesn't match the
-            // first player's stale solo ID — they can't see each other.
-            //
-            // Fix: before assigning a fresh instance, scan group members already
-            // present in this exact zone and join their instance. Also fall back
-            // to a login-name scan in case _connToGroup is stale for our connId.
-            // ─────────────────────────────────────────────────────────────
 
-            var group = GroupManager.Instance.GetGroupForConn(conn.ConnId);
+            var group = GroupDirectory.Instance.GetGroupForConn(conn.ConnId);
 
-            // Step 1: if we have a group, look for any member already in this zone
-            //         and inherit their instance id.
             if (group != null)
             {
                 foreach (var member in group.Members)
@@ -1914,24 +1711,20 @@ namespace DungeonRunners.Networking
                     var memberConn = FindConnectionById(member.ConnId);
                     if (memberConn == null) continue;
                     if (memberConn.CurrentZoneName != conn.CurrentZoneName) continue;
-                    if (memberConn.InstanceId == 0) continue; // public, useless
+                    if (memberConn.InstanceId == 0) continue;
 
                     conn.InstanceId = memberConn.InstanceId;
                     StampRuntimeInstanceKey(conn, "group-member");
-                    Debug.LogError($"[INSTANCE] {conn.LoginName} → DUNGEON '{conn.CurrentZoneName}' (joined group member {memberConn.LoginName}'s instance {conn.InstanceId:X8})");
+                    Debug.LogError($"[INSTANCE] {conn.LoginName} -> DUNGEON '{conn.CurrentZoneName}' (joined group member {memberConn.LoginName}'s instance {conn.InstanceId:X8})");
                     return;
                 }
 
-                // No group member here yet — use group id as the instance.
                 conn.InstanceId = group.GroupId;
                 StampRuntimeInstanceKey(conn, "group");
-                Debug.LogError($"[INSTANCE] {conn.LoginName} → DUNGEON '{conn.CurrentZoneName}' (group instance {group.GroupId})");
+                Debug.LogError($"[INSTANCE] {conn.LoginName} -> DUNGEON '{conn.CurrentZoneName}' (group instance {group.GroupId})");
                 return;
             }
 
-            // Step 2: not in a group via connId. Maybe _connToGroup is stale or
-            //         the invite just landed. Scan online players in this zone for
-            //         someone whose group includes us by login name.
             if (!string.IsNullOrEmpty(conn.LoginName))
             {
                 foreach (var other in _connections.Values)
@@ -1940,7 +1733,7 @@ namespace DungeonRunners.Networking
                     if (other.CurrentZoneName != conn.CurrentZoneName) continue;
                     if (other.InstanceId == 0) continue;
 
-                    var otherGroup = GroupManager.Instance.GetGroupForConn(other.ConnId);
+                    var otherGroup = GroupDirectory.Instance.GetGroupForConn(other.ConnId);
                     if (otherGroup == null) continue;
 
                     bool weAreMember = otherGroup.Members.Any(m =>
@@ -1949,38 +1742,26 @@ namespace DungeonRunners.Networking
 
                     conn.InstanceId = other.InstanceId;
                     StampRuntimeInstanceKey(conn, "stale-group-recovery");
-                    Debug.LogError($"[INSTANCE] {conn.LoginName} → DUNGEON '{conn.CurrentZoneName}' (joined via stale-group-recovery, latched onto {other.LoginName}'s instance {conn.InstanceId:X8})");
+                    Debug.LogError($"[INSTANCE] {conn.LoginName} -> DUNGEON '{conn.CurrentZoneName}' (joined via stale-group-recovery, latched onto {other.LoginName}'s instance {conn.InstanceId:X8})");
                     return;
                 }
             }
 
-            // Step 3: truly solo. Keep one active instance per selected character+zone.
             conn.InstanceId = AllocateSoloDungeonInstanceId(conn, conn.CurrentZoneName);
             StampRuntimeInstanceKey(conn, "solo");
-            Debug.LogError($"[INSTANCE] {conn.LoginName} → DUNGEON '{conn.CurrentZoneName}' (SOLO instance {conn.InstanceId:X8}, owner {GetSoloDungeonInstanceOwnerKey(conn, conn.CurrentZoneName)})");
+            Debug.LogError($"[INSTANCE] {conn.LoginName} -> DUNGEON '{conn.CurrentZoneName}' (SOLO instance {conn.InstanceId:X8}, owner {GetSoloDungeonInstanceOwnerKey(conn, conn.CurrentZoneName)})");
         }
 
-        /// <summary>
-        /// Check if two players can see each other.
-        /// Binary: Public zones = everyone. Dungeons = same instance (same group) only.
-        /// </summary>
         public bool CanSeePlayer(RRConnection a, RRConnection b)
         {
             if (a == b) return false;
             if (!a.IsConnected || !b.IsConnected) return false;
             if (!a.IsSpawned || !b.IsSpawned) return false;
             if (a.CurrentZoneGcType != b.CurrentZoneGcType) return false;
-            // Instance check: in public zones both are 0 (always match).
-            // In dungeons, must be same group instance.
             if (a.InstanceId != b.InstanceId) return false;
             return true;
         }
 
-        /// <summary>
-        /// Get the instance-qualified zone key for mob tracking.
-        /// In public zones, zone name alone. In dungeons, zone + instance ID.
-        /// This ensures each group gets their OWN set of mobs.
-        /// </summary>
         public string GetInstanceZoneKey(RRConnection conn)
         {
             if (conn == null)
@@ -2009,36 +1790,25 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[INSTANCE] runtimeKey='{conn.RuntimeInstanceKey}' source={source ?? "unknown"} zone='{conn.CurrentZoneName}' instance={conn.InstanceId:X8}");
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // GROUP PROTOCOL — Channel 0x0B per binary
-        // Binary: Main dispatcher at VA 0x458B9B routes 0x0B to GroupClient
-        // Binary: GroupClient::processMessage at VA 0x5F7DD0
-        // ═══════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Build GroupMemberInfo from a connection for group packets.
-        /// Binary-verified: readMember @ 0x5FA6D0 reads only:
-        ///   uint32 charSQLID, string name, uint32 avatarEntityId, byte isOnline
-        /// </summary>
         private GroupMemberInfo BuildGroupMemberInfo(RRConnection conn)
         {
             uint avatarId = GetPlayerAvatarId(conn.LoginName);
             string charName = conn.LoginName ?? "Unknown";
             uint charSqlId = GetCharSqlId(conn);
 
-            if (_selectedCharacter.TryGetValue(conn.LoginName, out var ch))
-                charName = ch.Name ?? charName;
+            if (_selectedCharacter.TryGetValue(conn.LoginName, out var selectedCharacter))
+                charName = selectedCharacter.Name ?? charName;
 
-            // Cache on GroupMember for offline access
-            var group = GroupManager.Instance.GetGroupForConn(conn.ConnId);
+            var group = GroupDirectory.Instance.GetGroupForConn(conn.ConnId);
             if (group != null)
             {
-                var gm = group.Members.Find(m => m.ConnId == conn.ConnId);
-                if (gm != null)
+                var groupMember = group.Members.Find(member => member.ConnId == conn.ConnId);
+                if (groupMember != null)
                 {
-                    gm.CharSqlId = charSqlId;
-                    gm.AvatarEntityId = avatarId;
-                    gm.Name = charName;
+                    groupMember.CharSqlId = charSqlId;
+                    groupMember.AvatarEntityId = avatarId;
+                    groupMember.Name = charName;
                 }
             }
 
@@ -2051,37 +1821,34 @@ namespace DungeonRunners.Networking
             };
         }
 
-        /// <summary>Build GroupMemberInfo from cached GroupMember data (for offline members).</summary>
-        private GroupMemberInfo BuildGroupMemberInfoFromCache(Managers.GroupMember gm)
+        private GroupMemberInfo BuildGroupMemberInfoFromCache(Gameplay.GroupMember groupMember)
         {
             return new GroupMemberInfo
             {
-                CharSQLID = gm.CharSqlId,
-                Name = gm.Name ?? "Unknown",
-                AvatarEntityId = gm.AvatarEntityId,
-                IsOnline = gm.IsOnline
+                CharSQLID = groupMember.CharSqlId,
+                Name = groupMember.Name ?? "Unknown",
+                AvatarEntityId = groupMember.AvatarEntityId,
+                IsOnline = groupMember.IsOnline
             };
         }
 
-        /// <summary>Get charSqlId from _selectedCharacter (reliable) or conn.CharSqlId (fallback).</summary>
         private uint GetCharSqlId(RRConnection conn)
         {
             if (conn == null) return 0;
             if (!string.IsNullOrEmpty(conn.LoginName)
-                && _selectedCharacter.TryGetValue(conn.LoginName, out var ch)
-                && ch.Id != 0)
-                return (uint)ch.Id;
+                && _selectedCharacter.TryGetValue(conn.LoginName, out var selectedCharacter)
+                && selectedCharacter.Id != 0)
+                return (uint)selectedCharacter.Id;
             if (conn.CharSqlId != 0) return conn.CharSqlId;
             return (uint)(conn.ConnId + 1);
         }
 
-        /// <summary>Find a connection in a group by charSqlId.</summary>
-        private RRConnection FindGroupMemberByCharSqlId(Managers.Group group, uint charSqlId)
+        private RRConnection FindGroupMemberByCharSqlId(Gameplay.Group group, uint charSqlId)
         {
-            foreach (var m in group.Members)
+            foreach (var member in group.Members)
             {
-                var mc = FindConnectionById(m.ConnId);
-                if (mc != null && GetCharSqlId(mc) == charSqlId) return mc;
+                var memberConnection = FindConnectionById(member.ConnId);
+                if (memberConnection != null && GetCharSqlId(memberConnection) == charSqlId) return memberConnection;
             }
             return null;
         }
@@ -2150,7 +1917,7 @@ namespace DungeonRunners.Networking
                 writer.WriteByte(0x01);
                 writer.WriteByte(0xFF); writer.WriteByte(0x00); writer.WriteByte(0x00); writer.WriteByte(0x01);
                 writer.WriteByte(0x85); writer.WriteByte(0x00);
-                for (int i = 0; i < 5; i++) writer.WriteUInt32(0);
+                for (int zeroIndex = 0; zeroIndex < 5; zeroIndex++) writer.WriteUInt32(0);
                 writer.WriteByte(0x00);
                 writer.WriteByte(0xFF); writer.WriteByte(0x00); writer.WriteByte(0x00);
                 writer.WriteByte(0x00); writer.WriteByte(0x00);
@@ -2174,8 +1941,8 @@ namespace DungeonRunners.Networking
                 WriteGCType(writer, "modifiers", preserveCase: false);
                 writer.WriteByte(0x01);
                 writer.WriteUInt32(0); writer.WriteByte(0x00); writer.WriteUInt32(0);
-                MerchantManager.EnsureInventoryForLevel(displayTypes[n], GetPlayerState(conn.ConnId.ToString()).Level);
-                MerchantManager.WriteMerchantComponent(writer, displayTypes[n], npcId, merchantId);
+                MerchantRuntime.EnsureInventoryForLevel(displayTypes[n], GetPlayerState(conn.ConnId.ToString()).Level);
+                MerchantRuntime.WriteMerchantComponent(writer, displayTypes[n], npcId, merchantId);
                 writer.WriteByte(0x02);
                 writer.WriteUInt16(npcId);
                 writer.WriteUInt32(0x06);
@@ -2184,7 +1951,7 @@ namespace DungeonRunners.Networking
                 writer.WriteInt32((int)(baseZ * 256));
                 writer.WriteInt32(0);
                 writer.WriteByte(0x00); writer.WriteByte(0x01);
-                for (int i = 0; i < 8; i++) writer.WriteUInt32(0);
+                for (int zeroIndex = 0; zeroIndex < 8; zeroIndex++) writer.WriteUInt32(0);
                 writer.WriteByte(0x35);
                 writer.WriteUInt16(behaviorId);
                 writer.WriteByte(0x04); writer.WriteByte(0x11); writer.WriteByte(0x00);
@@ -2196,10 +1963,10 @@ namespace DungeonRunners.Networking
             }
             writer.WriteByte(0x06);
             byte[] adminPacket = writer.ToArray();
-            Debug.LogError($"[AdminShop] Total admin shop packet size: {adminPacket.Length} bytes");
+            Debug.LogError($"[ADMIN-SHOP] packetBytes={adminPacket.Length}");
             SendToClient(conn, adminPacket);
             _adminShopNPCs[conn.ConnId] = shopNPCs;
-            sendMessage(conn, "[Shop] 3 admin vendors spawned near you. @shop close to despawn.");
+            sendMessage(conn, "[SHOP] vendors=3 state=spawned action=@shop close");
         }
 
         public void DespawnAdminShop(RRConnection conn, Action<RRConnection, string> sendMessage)
@@ -2218,24 +1985,20 @@ namespace DungeonRunners.Networking
             writer.WriteByte(0x06);
             SendToClient(conn, writer.ToArray());
             _adminShopNPCs.Remove(conn.ConnId);
-            sendMessage(conn, "[Shop] Admin vendors despawned.");
+            sendMessage(conn, "[SHOP] state=despawned");
         }
-        /// <summary>
-        /// Send group remove packet when player leaves zone or disconnects.
-        /// Binary: type 0x1B = processRemoveUser at 0x5FA510.
-        /// </summary>
         private void SendGroupRemoveUser(RRConnection conn)
         {
-            var group = GroupManager.Instance.GetGroupForConn(conn.ConnId);
+            var group = GroupDirectory.Instance.GetGroupForConn(conn.ConnId);
             if (group == null) return;
 
             uint charSqlId = GetCharSqlId(conn);
             byte[] removePacket = GroupPackets.BuildProcessRemoveUser(group.GroupId, charSqlId);
 
-            foreach (var m in group.Members)
+            foreach (var member in group.Members)
             {
-                if (m.ConnId == conn.ConnId) continue;
-                var memberConn = FindConnectionById(m.ConnId);
+                if (member.ConnId == conn.ConnId) continue;
+                var memberConn = FindConnectionById(member.ConnId);
                 if (memberConn != null)
                     SendToClient(memberConn, removePacket);
             }
@@ -2244,22 +2007,18 @@ namespace DungeonRunners.Networking
 
     }
 
-    /// <summary>
-    /// Tracks active modifiers per player for persistence across zone transitions
-    /// and login/logout. Binary-verified format from Modifier::readData @ 0x4FF390.
-    /// </summary>
     public class ActiveModifier
     {
-        public string GCType;       // e.g. "avatar.base.FreePlayerExperienceModifier"
-        public uint Id;             // [+0x78] unique per modifier instance
-        public byte Level;          // [+0x86]
-        public uint PowerLevel;     // [+0x80] Fixed32
-        public uint Duration;       // [+0x7C] remaining ms, 0=permanent
-        public byte SourceIsSelf;   // [+0x87] bit 0 = permanent/self-sourced
-        public DateTime AddedAt;    // for duration tracking
+        public string GCType;
+        public uint Id;
+        public byte Level;
+        public uint PowerLevel;
+        public uint Duration;
+        public byte SourceIsSelf;
+        public DateTime AddedAt;
     }
 
-    public class ModifierTracker
+    public class ActiveModifiers
     {
         private readonly Dictionary<string, List<ActiveModifier>> _playerModifiers
             = new Dictionary<string, List<ActiveModifier>>(StringComparer.OrdinalIgnoreCase);
@@ -2268,7 +2027,7 @@ namespace DungeonRunners.Networking
 
         public uint NextId() => _nextModifierId++;
 
-        public void TrackModifier(string loginName, ActiveModifier mod)
+        public void AddOrReplace(string loginName, ActiveModifier mod)
         {
             if (!_playerModifiers.TryGetValue(loginName, out var list))
             {
@@ -2277,34 +2036,28 @@ namespace DungeonRunners.Networking
             }
             list.RemoveAll(m => string.Equals(m.GCType, mod.GCType, StringComparison.OrdinalIgnoreCase));
             list.Add(mod);
-            Debug.LogError($"[MOD-TRACK] Tracked '{mod.GCType}' id={mod.Id} for {loginName} (total={list.Count})");
+            Debug.LogError($"[ACTIVE-MODIFIERS] Tracked '{mod.GCType}' id={mod.Id} for {loginName} (total={list.Count})");
         }
 
-        public bool RemoveModifier(string loginName, string gcType)
+        public bool Remove(string loginName, string gcType)
         {
             if (!_playerModifiers.TryGetValue(loginName, out var list)) return false;
             int removed = list.RemoveAll(m => string.Equals(m.GCType, gcType, StringComparison.OrdinalIgnoreCase));
             if (removed > 0)
-                Debug.LogError($"[MOD-TRACK] Removed '{gcType}' from {loginName} (remaining={list.Count})");
+                Debug.LogError($"[ACTIVE-MODIFIERS] Removed '{gcType}' from {loginName} (remaining={list.Count})");
             return removed > 0;
         }
 
-        public bool RemoveModifierById(string loginName, uint modId)
+        public bool RemoveById(string loginName, uint modId)
         {
             if (!_playerModifiers.TryGetValue(loginName, out var list)) return false;
             int removed = list.RemoveAll(m => m.Id == modId);
             if (removed > 0)
-                Debug.LogError($"[MOD-TRACK] Removed modId={modId} from {loginName} (remaining={list.Count})");
+                Debug.LogError($"[ACTIVE-MODIFIERS] Removed modId={modId} from {loginName} (remaining={list.Count})");
             return removed > 0;
         }
 
-        /// <summary>
-        /// Get active modifiers with remaining duration calculated.
-        /// Returns COPIES — never mutates originals.
-        /// Duration is in TICKS (1000/24 ≈ 41.667 ticks/sec) for wire format.
-        /// Adds 3-second buffer to compensate for zone loading delay.
-        /// </summary>
-        public List<ActiveModifier> GetModifiers(string loginName)
+        public List<ActiveModifier> ListFor(string loginName)
         {
             if (!_playerModifiers.TryGetValue(loginName, out var list))
                 return new List<ActiveModifier>();
@@ -2317,15 +2070,13 @@ namespace DungeonRunners.Networking
             {
                 if (mod.Duration == 0)
                 {
-                    result.Add(mod); // permanent — return as-is
+                    result.Add(mod);
                 }
                 else
                 {
-                    // Timed modifier — calculate remaining duration in ticks
                     double elapsedTicks = (now - mod.AddedAt).TotalSeconds * TICKS_PER_SEC + ZONE_BUFFER_TICKS;
                     if (elapsedTicks < mod.Duration)
                     {
-                        // Return a COPY with remaining duration — don't mutate original
                         result.Add(new ActiveModifier
                         {
                             GCType = mod.GCType,
@@ -2339,12 +2090,11 @@ namespace DungeonRunners.Networking
                     }
                 }
             }
-            // Clean up expired modifiers
             list.RemoveAll(m => m.Duration > 0 && (DateTime.UtcNow - m.AddedAt).TotalSeconds * TICKS_PER_SEC >= m.Duration);
             return result;
         }
 
-        public void ClearPlayer(string loginName)
+        public void Clear(string loginName)
         {
             _playerModifiers.Remove(loginName);
         }
@@ -2353,17 +2103,17 @@ namespace DungeonRunners.Networking
         {
             try
             {
-                using (var conn = GameDatabase.GetConnection())
-                using (var tx = conn.BeginTransaction())
+                using (var connection = GameDatabase.GetConnection())
+                using (var transaction = connection.BeginTransaction())
                 {
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "DELETE FROM character_modifiers WHERE character_id=@cid",
                         ("@cid", characterId));
 
-                    var mods = GetModifiers(loginName);
+                    var mods = ListFor(loginName);
                     foreach (var mod in mods)
                     {
-                        GameDatabase.ExecuteNonQuery(conn,
+                        GameDatabase.ExecuteNonQuery(connection,
                             @"INSERT INTO character_modifiers
                               (character_id, gc_type, modifier_id, level, power_level, duration_remaining, source_is_self)
                               VALUES (@cid, @gc, @mid, @lv, @pl, @dur, @sis)",
@@ -2375,13 +2125,13 @@ namespace DungeonRunners.Networking
                             ("@dur", (int)mod.Duration),
                             ("@sis", (int)mod.SourceIsSelf));
                     }
-                    tx.Commit();
-                    Debug.LogError($"[MOD-TRACK] Saved {mods.Count} modifiers for charId={characterId}");
+                    transaction.Commit();
+                    Debug.LogError($"[ACTIVE-MODIFIERS] Saved {mods.Count} modifiers for charId={characterId}");
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[MOD-TRACK] SaveToDb failed: {ex.Message}");
+                Debug.LogError($"[ACTIVE-MODIFIERS] SaveToDb failed: {ex.Message}");
             }
         }
 
@@ -2389,9 +2139,9 @@ namespace DungeonRunners.Networking
         {
             try
             {
-                using (var conn = GameDatabase.GetConnection())
+                using (var connection = GameDatabase.GetConnection())
                 {
-                    using (var reader = GameDatabase.ExecuteReader(conn,
+                    using (var reader = GameDatabase.ExecuteReader(connection,
                         "SELECT gc_type, modifier_id, level, power_level, duration_remaining, source_is_self FROM character_modifiers WHERE character_id=@cid",
                         ("@cid", characterId)))
                     {
@@ -2416,18 +2166,18 @@ namespace DungeonRunners.Networking
                         if (list.Count > 0)
                         {
                             _playerModifiers[loginName] = list;
-                            Debug.LogError($"[MOD-TRACK] Loaded {list.Count} modifiers for {loginName} (charId={characterId})");
+                            Debug.LogError($"[ACTIVE-MODIFIERS] Loaded {list.Count} modifiers for {loginName} (charId={characterId})");
                         }
                     }
 
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "DELETE FROM character_modifiers WHERE character_id=@cid",
                         ("@cid", characterId));
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[MOD-TRACK] LoadFromDb failed: {ex.Message}");
+                Debug.LogError($"[ACTIVE-MODIFIERS] LoadFromDb failed: {ex.Message}");
             }
         }
     }

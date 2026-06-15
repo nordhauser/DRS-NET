@@ -1,5 +1,4 @@
-﻿// PathMap.cs - PathMap loader and height lookup for Dungeon Runners server
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using DungeonRunners.Engine;
@@ -45,6 +44,17 @@ namespace DungeonRunners.Core
         public int NodeCount => _nodeGrid.Count;
         public float NodeResolution => TILE_SIZE;
 
+        public int WalkableCount
+        {
+            get
+            {
+                int count = 0;
+                foreach (var kv in _nodeGrid)
+                    if (kv.Value.IsWalkable) count++;
+                return count;
+            }
+        }
+
         public static PathMap CreateEmpty(string zoneName, float minX, float maxX, float minY, float maxY)
         {
             return new PathMap
@@ -80,10 +90,10 @@ namespace DungeonRunners.Core
             int dyRaw = b.GridY - a.GridY;
             int dx = dxRaw < 0 ? -1 : (dxRaw > 0 ? 1 : 0);
             int dy = dyRaw < 0 ? -1 : (dyRaw > 0 ? 1 : 0);
-            for (int i = 0; i < Directions.Length; i++)
+            for (int directionIndex = 0; directionIndex < Directions.Length; directionIndex++)
             {
-                if (Directions[i].dx == dx && Directions[i].dy == dy)
-                    return i;
+                if (Directions[directionIndex].dx == dx && Directions[directionIndex].dy == dy)
+                    return directionIndex;
             }
             return -1;
         }
@@ -92,7 +102,7 @@ namespace DungeonRunners.Core
         {
             if (!File.Exists(filePath))
             {
-                DungeonRunners.Engine.Debug.LogError($"[PathMap] File not found: {filePath}");
+                DungeonRunners.Engine.Debug.LogError($"[PATHMAP] path='{filePath}' reason=file-missing");
                 return null;
             }
 
@@ -100,58 +110,55 @@ namespace DungeonRunners.Core
             return LoadFromJson(json);
         }
 
-        /// <summary>Load PathMap directly from SQLite relational tables � no JSON.</summary>
         public static PathMap LoadFromSQLite(string zoneName)
         {
             var pathMap = new PathMap();
             try
             {
-                using (var conn = DungeonRunners.Database.GameDatabase.GetConnection())
+                using (var connection = DungeonRunners.Database.GameDatabase.GetConnection())
                 {
-                    // Load zone header
-                    using (var r = DungeonRunners.Database.GameDatabase.ExecuteReader(conn,
+                    using (var zoneReader = DungeonRunners.Database.GameDatabase.ExecuteReader(connection,
                         "SELECT * FROM pathmap_zones WHERE zone_name = @z", ("@z", zoneName)))
                     {
-                        if (!r.Read())
+                        if (!zoneReader.Read())
                         {
-                            DungeonRunners.Engine.Debug.LogWarning($"[PathMap] No pathmap for zone '{zoneName}'");
+                            DungeonRunners.Engine.Debug.LogWarning($"[PATHMAP] zone='{zoneName}' reason=missing");
                             return null;
                         }
                         pathMap.ZoneName = zoneName;
-                        pathMap.WorldOffsetX = (float)DungeonRunners.Database.GameDatabase.GetFloat(r, "world_offset_x");
-                        pathMap.WorldOffsetY = (float)DungeonRunners.Database.GameDatabase.GetFloat(r, "world_offset_y");
-                        pathMap._minWorldX = (float)DungeonRunners.Database.GameDatabase.GetFloat(r, "world_min_x");
-                        pathMap._maxWorldX = (float)DungeonRunners.Database.GameDatabase.GetFloat(r, "world_max_x");
-                        pathMap._minWorldY = (float)DungeonRunners.Database.GameDatabase.GetFloat(r, "world_min_y");
-                        pathMap._maxWorldY = (float)DungeonRunners.Database.GameDatabase.GetFloat(r, "world_max_y");
+                        pathMap.WorldOffsetX = (float)DungeonRunners.Database.GameDatabase.GetFloat(zoneReader, "world_offset_x");
+                        pathMap.WorldOffsetY = (float)DungeonRunners.Database.GameDatabase.GetFloat(zoneReader, "world_offset_y");
+                        pathMap._minWorldX = (float)DungeonRunners.Database.GameDatabase.GetFloat(zoneReader, "world_min_x");
+                        pathMap._maxWorldX = (float)DungeonRunners.Database.GameDatabase.GetFloat(zoneReader, "world_max_x");
+                        pathMap._minWorldY = (float)DungeonRunners.Database.GameDatabase.GetFloat(zoneReader, "world_min_y");
+                        pathMap._maxWorldY = (float)DungeonRunners.Database.GameDatabase.GetFloat(zoneReader, "world_max_y");
                     }
 
-                    // Load all nodes
-                    using (var r = DungeonRunners.Database.GameDatabase.ExecuteReader(conn,
+                    using (var nodeReader = DungeonRunners.Database.GameDatabase.ExecuteReader(connection,
                         "SELECT gx, gy, wx, wy, h, c, s FROM pathmap_nodes WHERE zone_name = @z", ("@z", zoneName)))
                     {
-                        while (r.Read())
+                        while (nodeReader.Read())
                         {
                             var node = new PathNode
                             {
-                                GridX = r.GetInt32(0),
-                                GridY = r.GetInt32(1),
-                                WorldX = (float)r.GetDouble(2),
-                                WorldY = (float)r.GetDouble(3),
-                                Height = (float)r.GetDouble(4),
-                                ConnectionFlags = (byte)r.GetInt32(5),
-                                SolidFlag = (byte)r.GetInt32(6)
+                                GridX = nodeReader.GetInt32(0),
+                                GridY = nodeReader.GetInt32(1),
+                                WorldX = (float)nodeReader.GetDouble(2),
+                                WorldY = (float)nodeReader.GetDouble(3),
+                                Height = (float)nodeReader.GetDouble(4),
+                                ConnectionFlags = (byte)nodeReader.GetInt32(5),
+                                SolidFlag = (byte)nodeReader.GetInt32(6)
                             };
                             pathMap._nodeGrid[(node.GridX, node.GridY)] = node;
                         }
                     }
                 }
-                DungeonRunners.Engine.Debug.Log($"[PathMap] Loaded '{zoneName}' from SQLite: {pathMap._nodeGrid.Count} nodes");
+                DungeonRunners.Engine.Debug.Log($"[PATHMAP] loaded zone='{zoneName}' source=sqlite nodes={pathMap._nodeGrid.Count}");
                 return pathMap;
             }
             catch (Exception ex)
             {
-                DungeonRunners.Engine.Debug.LogError($"[PathMap] SQLite load error for '{zoneName}': {ex.Message}");
+                DungeonRunners.Engine.Debug.LogError($"[PATHMAP] zone='{zoneName}' source=sqlite error={ex.Message}");
                 return null;
             }
         }
@@ -162,12 +169,10 @@ namespace DungeonRunners.Core
 
             try
             {
-                // Simple JSON parsing without external dependencies
                 pathMap.ZoneName = ExtractString(json, "zoneName");
                 pathMap.WorldOffsetX = ExtractFloat(json, "worldOffsetX");
                 pathMap.WorldOffsetY = ExtractFloat(json, "worldOffsetY");
 
-                // Extract bounds
                 int boundsStart = json.IndexOf("\"worldBounds\"");
                 if (boundsStart >= 0)
                 {
@@ -180,7 +185,6 @@ namespace DungeonRunners.Core
                     pathMap._maxWorldY = ExtractFloat(boundsJson, "maxY");
                 }
 
-                // Extract nodes array
                 int nodesStart = json.IndexOf("\"nodes\"");
                 if (nodesStart >= 0)
                 {
@@ -188,7 +192,6 @@ namespace DungeonRunners.Core
                     int arrayEnd = json.LastIndexOf("]");
                     string nodesJson = json.Substring(arrayStart + 1, arrayEnd - arrayStart - 1);
 
-                    // Parse each node object
                     int pos = 0;
                     while (pos < nodesJson.Length)
                     {
@@ -216,12 +219,12 @@ namespace DungeonRunners.Core
                     }
                 }
 
-                DungeonRunners.Engine.Debug.Log($"[PathMap] Loaded '{pathMap.ZoneName}' with {pathMap._nodeGrid.Count} nodes");
+                DungeonRunners.Engine.Debug.Log($"[PATHMAP] loaded zone='{pathMap.ZoneName}' source=json nodes={pathMap._nodeGrid.Count}");
                 return pathMap;
             }
             catch (Exception ex)
             {
-                DungeonRunners.Engine.Debug.LogError($"[PathMap] Parse error: {ex.Message}");
+                DungeonRunners.Engine.Debug.LogError($"[PATHMAP] source=json error={ex.Message}");
                 return null;
             }
         }
@@ -247,7 +250,6 @@ namespace DungeonRunners.Core
             int colonPos = json.IndexOf(":", keyPos);
             int valueStart = colonPos + 1;
 
-            // Skip whitespace
             while (valueStart < json.Length && char.IsWhiteSpace(json[valueStart]))
                 valueStart++;
 
@@ -284,27 +286,40 @@ namespace DungeonRunners.Core
             return GetNodeAt(gx, gy);
         }
 
-        /// <summary>
-        /// Get the height (Z) at the given world X,Y position.
-        /// </summary>
         public float GetHeightAt(float worldX, float worldY, float defaultHeight = 50f)
         {
-            // Quick bounds check
             if (worldX < _minWorldX || worldX > _maxWorldX ||
                 worldY < _minWorldY || worldY > _maxWorldY)
             {
                 return defaultHeight;
             }
 
-            var (gx, gy) = WorldToGrid(worldX, worldY);
+            float cellX = (worldX - WorldOffsetX) / TILE_SIZE;
+            float cellY = (worldY - WorldOffsetY) / TILE_SIZE;
+            int gx = (int)Math.Floor(cellX);
+            int gy = (int)Math.Floor(cellY);
+            float fracX = cellX - gx;
+            float fracY = cellY - gy;
 
-            var node = GetNodeAt(gx, gy);
-            if (node != null)
-            {
-                return node.Height;
-            }
+            var n00 = GetNodeAt(gx, gy);
+            var n10 = GetNodeAt(gx + 1, gy);
+            var n01 = GetNodeAt(gx, gy + 1);
+            var n11 = GetNodeAt(gx + 1, gy + 1);
 
-            return defaultHeight;
+            float h00 = n00 != null ? n00.Height : defaultHeight;
+            float h10 = n10 != null ? n10.Height : h00;
+            float h01 = n01 != null ? n01.Height : h00;
+            float h11 = n11 != null ? n11.Height : h00;
+
+            if (n00 == null)
+                return defaultHeight;
+
+            float w00 = (1f - fracX) * (1f - fracY);
+            float w10 = fracX * (1f - fracY);
+            float w01 = (1f - fracX) * fracY;
+            float w11 = fracX * fracY;
+
+            return h00 * w00 + h10 * w10 + h01 * w01 + h11 * w11;
         }
 
         public bool IsWalkable(float worldX, float worldY)
@@ -348,16 +363,7 @@ namespace DungeonRunners.Core
                 return true;
             }
 
-            int steps = Mathf.Max(1, Mathf.CeilToInt(dist / (TILE_SIZE * 0.5f)));
-            for (int i = 1; i < steps; i++)
-            {
-                float t = i / (float)steps;
-                var node = GetNodeAtWorld(startX + dx * t, startY + dy * t);
-                if (node == null) return false;
-                if (!node.IsWalkable) return true;
-            }
-
-            canReach = true;
+            canReach = !CastGroundRayBlocked(startX, startY, endX, endY);
             return true;
         }
 
@@ -409,6 +415,84 @@ namespace DungeonRunners.Core
                 node = next;
             }
             return true;
+        }
+
+        public bool CastGroundRaySlide(float startX, float startY, float targetX, float targetY, out float slidX, out float slidY)
+        {
+            if (!CastGroundRayHit(startX, startY, targetX, targetY, out float hitX, out float hitY, out int exitEdge, out float remaining))
+            {
+                slidX = targetX; slidY = targetY;
+                return false;
+            }
+            float dx = targetX - startX;
+            float dy = targetY - startY;
+            bool horizontal = exitEdge == 0 || exitEdge == 4;
+            bool vertical = exitEdge == 2 || exitEdge == 6;
+            if (!horizontal && !vertical)
+            {
+                if (Math.Abs(dx) >= Math.Abs(dy)) horizontal = true; else vertical = true;
+            }
+            int sdx = 0, sdy = 0;
+            if (horizontal)
+            {
+                if (dx > 0f) sdx = 1; else if (dx < 0f) sdx = -1;
+            }
+            else
+            {
+                if (dy > 0f) sdy = 1; else if (dy < 0f) sdy = -1;
+            }
+            if (sdx == 0 && sdy == 0)
+            {
+                slidX = hitX; slidY = hitY;
+                return true;
+            }
+            float slideEndX = hitX + sdx * remaining;
+            float slideEndY = hitY + sdy * remaining;
+            if (CastGroundRayHit(hitX, hitY, slideEndX, slideEndY, out float fx, out float fy, out int _, out float _))
+            {
+                slidX = fx; slidY = fy;
+            }
+            else
+            {
+                slidX = slideEndX; slidY = slideEndY;
+            }
+            return true;
+        }
+
+        private bool CastGroundRayHit(float startX, float startY, float endX, float endY,
+            out float hitX, out float hitY, out int hitEdge, out float remaining)
+        {
+            hitX = endX; hitY = endY; hitEdge = -1; remaining = 0f;
+            var node = GetReachNodeAtWorld(startX, startY);
+            if (node == null) return false;
+            float dx = endX - startX;
+            float dy = endY - startY;
+            float dist = Mathf.Sqrt(dx * dx + dy * dy);
+            if (dist <= 0f) return false;
+            float dirX = dx / dist;
+            float dirY = dy / dist;
+            int maxIterations = Mathf.Max(_nodeGrid.Count, 1);
+            for (int iter = 0; iter < maxIterations; iter++)
+            {
+                if (!CollideRayWithNode(node.WorldX, node.WorldY, startX, startY, dirX, dirY,
+                        out float exitDist, out int exitEdge) || exitEdge < 0)
+                    return false;
+                if (exitDist >= dist) return false;
+                bool blocked = (node.ConnectionFlags & (1 << exitEdge)) == 0;
+                if (!blocked)
+                {
+                    var (ddx, ddy) = Directions[exitEdge];
+                    var next = GetNodeAt(node.GridX + ddx, node.GridY + ddy);
+                    if (next == null || !next.IsWalkable) blocked = true;
+                    else { node = next; continue; }
+                }
+                hitX = startX + dirX * exitDist;
+                hitY = startY + dirY * exitDist;
+                hitEdge = exitEdge;
+                remaining = dist - exitDist;
+                return true;
+            }
+            return false;
         }
 
         private static bool CollideRayWithNode(float nx, float ny, float sx, float sy, float dirX, float dirY,

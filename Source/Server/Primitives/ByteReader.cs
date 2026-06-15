@@ -3,9 +3,6 @@ using System.Text;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Reads data from byte arrays in little-endian format
-    /// </summary>
     public class ByteReader
     {
         private byte[] _buffer;

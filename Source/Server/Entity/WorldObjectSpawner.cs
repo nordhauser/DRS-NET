@@ -3,27 +3,13 @@ using System.Collections.Generic;
 using DungeonRunners.Combat;
 using DungeonRunners.Engine;
 
-namespace DungeonRunners.Managers
+namespace DungeonRunners.Gameplay
 {
-    // ═══════════════════════════════════════════════════════════════════════════
-    // WORLD OBJECT SPAWNER — Barrels + Treasure Chests in dungeon zones
-    //
-    // Barrels: Spawned as one-hit creatures via CombatManager.SpawnMonster().
-    //          When killed, ProcessMonsterKill fires → LootManager.GenerateDestroyableLoot().
-    //
-    // Chests:  Spawned as NCI entities using SAME packet pattern as checkpoints.
-    //          When clicked, HandleChestActivation fires → LootManager.GenerateChestLoot().
-    //          Uses same 0x01 create + 0x02 init + 0x35 activation as portals/checkpoints.
-    //
-    // Binary: World::attachObjects spawns StaticObjectGeneratorTable (barrels)
-    //         + WorldEntityGeneratorTable (chests/NCIs) per zone tile.
-    // ═══════════════════════════════════════════════════════════════════════════
 
     public static class WorldObjectSpawner
     {
-        private const string NativeWorldObjectRngContract = "GCObjectGeneratorTable<WorldEntity>::GenerateObjectFromTable@0x00568150 Random::generate@0x0044B1F0";
+        private const string WorldObjectRngContract = "GCObjectGeneratorTable<WorldEntity>::GenerateObjectFromTable@0x00568150 Random::generate@0x0044B1F0";
 
-        // Authored PKG barrel GC types. Keep synthetic world.objects.* as legacy fallback only.
         private static readonly string[] BarrelTypes =
         {
             "terrain.misc.interactives.Breakiable_Barrel_01",
@@ -32,7 +18,6 @@ namespace DungeonRunners.Managers
         };
         private const string CrateType = "world.objects.crate.breakable";
 
-        // ── Chest GC types (NCI entities, match original binary GC paths) ──
         private static readonly string[] SmallChestTypes =
         {
             "terrain.interactives.loot.Chest_Sm_01",
@@ -47,7 +32,6 @@ namespace DungeonRunners.Managers
         };
         private const string LargeChestType = "terrain.interactives.loot.Chest_Lg_01";
 
-        // ── Placement offsets within maze tiles ──
         private static readonly float[][] ObjectOffsets =
         {
             new[] { -40f, -30f }, new[] {  35f, -25f },
@@ -56,9 +40,6 @@ namespace DungeonRunners.Managers
             new[] {  25f,  50f }, new[] { -45f,  20f },
         };
 
-        // ═══════════════════════════════════════════════════════════════
-        // BARREL SPAWNS — returned as DungeonSpawnData for SpawnMonster
-        // ═══════════════════════════════════════════════════════════════
 
         public static List<DatabaseLoader.DungeonSpawnData> GenerateBarrels(
             string zoneName, uint seed = 0xBEEFBEEF)
@@ -79,41 +60,39 @@ namespace DungeonRunners.Managers
 
                 string cellOwner = $"{zoneName}:cell{cellIndex}";
 
-                // 40% of cells get 1-2 barrels
                 if (NextWorldObjectChance(40, "WorldObjectSpawner.barrel.cellChance", cellOwner))
                 {
                     int count = NextWorldObjectIntInclusive(1, 2, "WorldObjectSpawner.barrel.count", cellOwner);
-                    for (int i = 0; i < count; i++)
+                    for (int barrelIndex = 0; barrelIndex < count; barrelIndex++)
                     {
-                        string barrelOwner = $"{cellOwner}:barrel{i}";
+                        string barrelOwner = $"{cellOwner}:barrel{barrelIndex}";
                         var off = ObjectOffsets[NextWorldObjectIntInclusive(0, ObjectOffsets.Length - 1, "WorldObjectSpawner.barrel.offset", barrelOwner)];
-                        float px = cell.cx + off[0] + NextWorldObjectFloat(-5f, 5f, "WorldObjectSpawner.barrel.jitterX", barrelOwner);
-                        float py = cell.cy + off[1] + NextWorldObjectFloat(-5f, 5f, "WorldObjectSpawner.barrel.jitterY", barrelOwner);
+                        float spawnX = cell.cx + off[0] + NextWorldObjectFloat(-5f, 5f, "WorldObjectSpawner.barrel.jitterX", barrelOwner);
+                        float spawnY = cell.cy + off[1] + NextWorldObjectFloat(-5f, 5f, "WorldObjectSpawner.barrel.jitterY", barrelOwner);
                         spawns.Add(new DatabaseLoader.DungeonSpawnData
                         {
                             zoneName = zoneName,
                             gcType = BarrelTypes[NextWorldObjectIntInclusive(0, BarrelTypes.Length - 1, "WorldObjectSpawner.barrel.type", barrelOwner)],
-                            posX = px,
-                            posY = py,
-                            posZ = Core.PathMapManager.Instance.GetHeight(zoneName, px, py, 10f),
+                            posX = spawnX,
+                            posY = spawnY,
+                            posZ = Core.PathMapCatalog.Instance.GetHeight(zoneName, spawnX, spawnY, 10f),
                             heading = NextWorldObjectIntInclusive(0, 359, "WorldObjectSpawner.barrel.heading", barrelOwner)
                         });
                     }
                 }
 
-                // 15% of cells get a crate
                 if (NextWorldObjectChance(15, "WorldObjectSpawner.crate.cellChance", cellOwner))
                 {
                     var off = ObjectOffsets[NextWorldObjectIntInclusive(0, ObjectOffsets.Length - 1, "WorldObjectSpawner.crate.offset", cellOwner)];
-                    float px = cell.cx + off[0];
-                    float py = cell.cy + off[1];
+                    float spawnX = cell.cx + off[0];
+                    float spawnY = cell.cy + off[1];
                     spawns.Add(new DatabaseLoader.DungeonSpawnData
                     {
                         zoneName = zoneName,
                         gcType = CrateType,
-                        posX = px,
-                        posY = py,
-                        posZ = Core.PathMapManager.Instance.GetHeight(zoneName, px, py, 10f),
+                        posX = spawnX,
+                        posY = spawnY,
+                        posZ = Core.PathMapCatalog.Instance.GetHeight(zoneName, spawnX, spawnY, 10f),
                         heading = NextWorldObjectIntInclusive(0, 359, "WorldObjectSpawner.crate.heading", cellOwner)
                     });
                 }
@@ -121,14 +100,10 @@ namespace DungeonRunners.Managers
                 cellIndex++;
             }
 
-            Debug.LogError($"[WorldObjects] {zoneName}: {spawns.Count} barrels/crates");
+            Debug.LogError($"[WORLD-OBJECTS] zone={zoneName} kind=barrel-crate count={spawns.Count}");
             return spawns;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // CHEST SPAWNS — returned as ChestSpawnData for NCI entity packets
-        // Spawned using SAME pattern as checkpoints (0x01 + 0x02)
-        // ═══════════════════════════════════════════════════════════════
 
         public static List<ChestSpawnData> GenerateChests(
             string zoneName, uint seed = 0xBEEFBEEF)
@@ -145,96 +120,74 @@ namespace DungeonRunners.Managers
 
                 string cellOwner = $"{zoneName}:cell{cellIndex}";
 
-                // Small chest: ~20% of cells (1 per cell max)
                 if (NextWorldObjectChance(20, "WorldObjectSpawner.chest.smallChance", cellOwner))
                 {
                     var off = ObjectOffsets[(cellIndex + 3) % ObjectOffsets.Length];
-                    float px = cell.cx + off[0];
-                    float py = cell.cy + off[1];
-                    SnapAndGetHeight(zoneName, ref px, ref py, out float pz);
+                    float spawnX = cell.cx + off[0];
+                    float spawnY = cell.cy + off[1];
+                    SnapAndGetHeight(zoneName, ref spawnX, ref spawnY, out float spawnZ);
                     chests.Add(new ChestSpawnData
                     {
                         GCType = SmallChestTypes[NextWorldObjectIntInclusive(0, SmallChestTypes.Length - 1, "WorldObjectSpawner.chest.smallType", cellOwner)],
                         Label = "Treasure Chest",
-                        PosX = px,
-                        PosY = py,
-                        PosZ = pz,
+                        PosX = spawnX,
+                        PosY = spawnY,
+                        PosZ = spawnZ,
                         Heading = NextWorldObjectIntInclusive(0, 359, "WorldObjectSpawner.chest.smallHeading", cellOwner),
-                        ItemGenerator = "TreasureChestSmallIG",
-                        ItemCount = 1,
-                        ItemGenerator2 = "DefaultIG",
-                        ItemCount2 = 2,
                     });
                 }
 
-                // Medium chest: ~5% of cells (rarer, better loot)
                 if (NextWorldObjectChance(5, "WorldObjectSpawner.chest.mediumChance", cellOwner))
                 {
                     var off = ObjectOffsets[(cellIndex + 5) % ObjectOffsets.Length];
-                    float px = cell.cx + off[0];
-                    float py = cell.cy + off[1];
-                    SnapAndGetHeight(zoneName, ref px, ref py, out float pz);
+                    float spawnX = cell.cx + off[0];
+                    float spawnY = cell.cy + off[1];
+                    SnapAndGetHeight(zoneName, ref spawnX, ref spawnY, out float spawnZ);
                     chests.Add(new ChestSpawnData
                     {
                         GCType = MediumChestTypes[NextWorldObjectIntInclusive(0, MediumChestTypes.Length - 1, "WorldObjectSpawner.chest.mediumType", cellOwner)],
                         Label = "Large Treasure Chest",
-                        PosX = px,
-                        PosY = py,
-                        PosZ = pz,
+                        PosX = spawnX,
+                        PosY = spawnY,
+                        PosZ = spawnZ,
                         Heading = NextWorldObjectIntInclusive(0, 359, "WorldObjectSpawner.chest.mediumHeading", cellOwner),
-                        ItemGenerator = "TreasureChestMediumIG",
-                        ItemCount = 2,
-                        ItemGenerator2 = "DefaultIG",
-                        ItemCount2 = 2,
                     });
                 }
 
                 cellIndex++;
             }
 
-            // One large chest per zone (boss-quality, always in last cell)
             if (cells.Count > 2)
             {
                 var lastCell = cells[cells.Count - 1];
-                float lx = lastCell.cx;
-                float ly = lastCell.cy + 30f;
-                SnapAndGetHeight(zoneName, ref lx, ref ly, out float lz);
+                float largeChestX = lastCell.cx;
+                float largeChestY = lastCell.cy + 30f;
+                SnapAndGetHeight(zoneName, ref largeChestX, ref largeChestY, out float largeChestZ);
                 chests.Add(new ChestSpawnData
                 {
                     GCType = LargeChestType,
                     Label = "Grand Treasure Chest",
-                    PosX = lx,
-                    PosY = ly,
-                    PosZ = lz,
+                    PosX = largeChestX,
+                    PosY = largeChestY,
+                    PosZ = largeChestZ,
                     Heading = 0,
-                    ItemGenerator = "TreasureChestLargeIG",
-                    ItemCount = 1,
-                    ItemGenerator2 = "DefaultIG",
-                    ItemCount2 = 4,
                 });
             }
 
-            Debug.LogError($"[WorldObjects] {zoneName}: {chests.Count} treasure chests");
+            Debug.LogError($"[WORLD-OBJECTS] zone={zoneName} kind=treasure-chest count={chests.Count}");
             return chests;
         }
 
-        /// <summary>
-        /// Snap position to nearest walkable pathmap node and get correct Z height.
-        /// Same approach as DungeonMazeSpawner.FindWalkableSpot for mobs.
-        /// </summary>
         private static void SnapAndGetHeight(string zoneName, ref float x, ref float y, out float z)
         {
-            z = Core.PathMapManager.Instance.GetHeight(zoneName, x, y, 50f) + 3f;
+            z = Core.PathMapCatalog.Instance.GetHeight(zoneName, x, y, 50f) + 3f;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // HELPERS
-        // ═══════════════════════════════════════════════════════════════
 
         private static uint NextWorldObjectRaw(string phase, string owner)
         {
-            uint raw = NativeRandomStreams.GenerateGlobalStatic(phase, owner);
-            Debug.LogError($"[WORLDOBJECT-RNG-NATIVE] stream=globalStatic phase={phase} raw=0x{raw:X8} owner='{owner}' native={NativeWorldObjectRngContract}");
+            uint raw = RandomStreams.GenerateGlobalStatic(phase, owner);
+            Debug.LogError($"[WORLD-OBJECT-RNG] stream=globalStatic phase={phase} raw=0x{raw:X8} owner='{owner}' sourceFunction={WorldObjectRngContract}");
             return raw;
         }
 
@@ -242,8 +195,8 @@ namespace DungeonRunners.Managers
         {
             if (maxInclusive <= minInclusive)
                 return minInclusive;
-            uint value = NativeRandomStreams.GenerateGlobalStaticRangeInclusive((uint)minInclusive, (uint)maxInclusive, phase, owner);
-            Debug.LogError($"[WORLDOBJECT-RNG-NATIVE] stream=globalStatic phase={phase} value={value} range=[{minInclusive}..{maxInclusive}] owner='{owner}' native={NativeWorldObjectRngContract}");
+            uint value = RandomStreams.GenerateGlobalStaticRangeInclusive((uint)minInclusive, (uint)maxInclusive, phase, owner);
+            Debug.LogError($"[WORLD-OBJECT-RNG] stream=globalStatic phase={phase} value={value} range=[{minInclusive}..{maxInclusive}] owner='{owner}' sourceFunction={WorldObjectRngContract}");
             return (int)value;
         }
 
@@ -252,7 +205,7 @@ namespace DungeonRunners.Managers
             int clamped = Math.Max(0, Math.Min(100, percent));
             int roll = NextWorldObjectIntInclusive(0, 99, phase, owner);
             bool result = roll < clamped;
-            Debug.LogError($"[WORLDOBJECT-RNG-NATIVE] stream=globalStatic phase={phase}.result roll={roll} percent={clamped} result={result} owner='{owner}' native={NativeWorldObjectRngContract}");
+            Debug.LogError($"[WORLD-OBJECT-RNG] stream=globalStatic phase={phase}.result roll={roll} percent={clamped} result={result} owner='{owner}' sourceFunction={WorldObjectRngContract}");
             return result;
         }
 
@@ -263,7 +216,7 @@ namespace DungeonRunners.Managers
             uint raw = NextWorldObjectRaw(phase, owner);
             float unit = (raw & 0x00FFFFFF) / 16777216f;
             float value = minInclusive + unit * (maxExclusive - minInclusive);
-            Debug.LogError($"[WORLDOBJECT-RNG-NATIVE] stream=globalStatic phase={phase} value={value:F3} range=[{minInclusive:F3}..{maxExclusive:F3}) owner='{owner}' native={NativeWorldObjectRngContract}");
+            Debug.LogError($"[WORLD-OBJECT-RNG] stream=globalStatic phase={phase} value={value:F3} range=[{minInclusive:F3}..{maxExclusive:F3}) owner='{owner}' sourceFunction={WorldObjectRngContract}");
             return value;
         }
 
@@ -273,9 +226,9 @@ namespace DungeonRunners.Managers
             if (gcType.StartsWith("world.objects.barrel", StringComparison.OrdinalIgnoreCase) ||
                 gcType.StartsWith("world.objects.crate", StringComparison.OrdinalIgnoreCase))
                 return true;
-            for (int i = 0; i < BarrelTypes.Length; i++)
+            for (int barrelTypeIndex = 0; barrelTypeIndex < BarrelTypes.Length; barrelTypeIndex++)
             {
-                if (string.Equals(gcType, BarrelTypes[i], StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(gcType, BarrelTypes[barrelTypeIndex], StringComparison.OrdinalIgnoreCase))
                     return true;
             }
             return false;
@@ -292,31 +245,28 @@ namespace DungeonRunners.Managers
 
             var maze = new MazeGenerator(width, height, seed,
                 randomness, sparseness, deadEndRemoval);
-            var cells = maze.Generate();
+            var cells = maze.BuildWorld();
             var result = new List<CellPos>();
-            foreach (var c in cells)
+            foreach (var mazeCell in cells)
                 result.Add(new CellPos
                 {
-                    cx = c.WorldCenterX,
-                    cy = c.WorldCenterY,
-                    isEntry = (c.GridX == entryX && c.GridY == entryY)
+                    cx = mazeCell.WorldCenterX,
+                    cy = mazeCell.WorldCenterY,
+                    isEntry = (mazeCell.GridX == entryX && mazeCell.GridY == entryY)
                 });
             return result;
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // CHEST SPAWN DATA — position + loot info for NCI entity spawning
-    // ═══════════════════════════════════════════════════════════════════════════
 
     public class ChestSpawnData
     {
-        public string GCType;          // terrain.interactives.loot.Chest_Sm_01
-        public string Label;           // Display name
+        public string GCType;
+        public string Label;
         public float PosX, PosY, PosZ;
         public float Heading;
-        public string ItemGenerator;   // TreasureChestIG, TreasureChestSmallIG
-        public int ItemCount;          // How many items to generate
+        public string ItemGenerator;
+        public int ItemCount;
         public string ItemGenerator2;
         public int ItemCount2;
         public string ItemGenerator3;
@@ -326,15 +276,18 @@ namespace DungeonRunners.Managers
         public string ItemGenerator5;
         public int ItemCount5;
 
-        public IEnumerable<(string Generator, int Count, int Slot)> GetNativeChestGenerators(string fallbackGenerator, int fallbackCount)
+        public IEnumerable<(string Generator, int Count, int Slot)> GetChestGenerators(string fallbackGenerator, int fallbackCount)
         {
-            string gen1 = !string.IsNullOrWhiteSpace(ItemGenerator) ? ItemGenerator : fallbackGenerator;
-            int count1 = ItemCount > 0 ? ItemCount : fallbackCount;
-            if (!string.IsNullOrWhiteSpace(gen1) && count1 > 0) yield return (gen1, count1, 1);
-            if (!string.IsNullOrWhiteSpace(ItemGenerator2) && ItemCount2 > 0) yield return (ItemGenerator2, ItemCount2, 2);
-            if (!string.IsNullOrWhiteSpace(ItemGenerator3) && ItemCount3 > 0) yield return (ItemGenerator3, ItemCount3, 3);
-            if (!string.IsNullOrWhiteSpace(ItemGenerator4) && ItemCount4 > 0) yield return (ItemGenerator4, ItemCount4, 4);
-            if (!string.IsNullOrWhiteSpace(ItemGenerator5) && ItemCount5 > 0) yield return (ItemGenerator5, ItemCount5, 5);
+            var storedGenerators = new (string Generator, int Count)[]
+            {
+                (ItemGenerator, ItemCount),
+                (ItemGenerator2, ItemCount2),
+                (ItemGenerator3, ItemCount3),
+                (ItemGenerator4, ItemCount4),
+                (ItemGenerator5, ItemCount5)
+            };
+            foreach (var generator in WorldEntityLoot.GetNonCombatInteractiveItemGenerators(GCType, storedGenerators, fallbackGenerator, fallbackCount))
+                yield return generator;
         }
     }
 }

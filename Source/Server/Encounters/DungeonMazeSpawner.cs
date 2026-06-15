@@ -2,9 +2,11 @@ using System;
 using System.Collections.Generic;
 using DungeonRunners.Engine;
 using DungeonRunners.Combat;
+using DungeonRunners.Core;
 using DungeonRunners.Data;
+using CombatRandom = DungeonRunners.Combat.MersenneTwister;
 
-namespace DungeonRunners.Managers
+namespace DungeonRunners.Gameplay
 {
     public static class DungeonMazeSpawner
     {
@@ -57,6 +59,7 @@ namespace DungeonRunners.Managers
             public bool ExitPortalAnchorWalkable;
             public bool PortalAnchorWalkable;
             public List<MazeGenerator.MazeCell> Cells = new();
+            public PathMap PathMap;
             public List<MazeGenerator.PlacedRoomNode> RoomNodes = new();
             public List<DatabaseLoader.DungeonSpawnData> Spawns = new();
             public List<EncounterObjectMirror> EncounterObjects = new();
@@ -83,10 +86,6 @@ namespace DungeonRunners.Managers
             public float ChoiceChance;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // PKG effective tile encounter placeholders.
-        // Local coordinates within a 400x400 tile.
-        // ═══════════════════════════════════════════════════════════════
 
         private struct EncounterMarker
         {
@@ -134,7 +133,7 @@ namespace DungeonRunners.Managers
     { "elmforest_tileset_1s_a",       new List<EncounterMarker> { new(210, 340, 10) } },
     { "elmforest_tileset_1w_a",       new List<EncounterMarker> { new(340, 210, 10) } },
     { "elmforest_tileset_1n1s_a",     new List<EncounterMarker> { new(160, 200, -10) } },
-    { "elmforest_tileset_1e1w_a",     new List<EncounterMarker> { new(230, 170, 10, -180f, 125f, 0f) } },
+    { "elmforest_tileset_1e1w_a",     new List<EncounterMarker> { new(230, 170, 10, -180f, 125f) } },
     { "elmforest_tileset_1n1e_a",     new List<EncounterMarker> { new(230, 70, 10, -180f, 85f, 85f), new(70, 250, 10) } },
     { "elmforest_tileset_1n1w_a",     new List<EncounterMarker> { new(250, 210, 30) } },
     { "elmforest_tileset_1e1s_a",     new List<EncounterMarker> { new(180, 310, 10, 0f, 150f, 150f) } },
@@ -143,7 +142,7 @@ namespace DungeonRunners.Managers
     { "elmforest_tileset_1n1e1w_a",   new List<EncounterMarker> { new(200, 120, 10) } },
     { "elmforest_tileset_1n1s1w_a",   new List<EncounterMarker> { new(200, 190, 10) } },
     { "elmforest_tileset_1e1s1w_a",   new List<EncounterMarker> { new(220, 150, 30) } },
-    { "elmforest_tileset_1n1e1s1w_a", new List<EncounterMarker> { new(190, 190, 10) } },
+    { "elmforest_tileset_1n1e1s1w_a", new List<EncounterMarker> { new(190, 190, 10, -720f, 125f, 125f) } },
     { "tutorial_loot_1n",             new List<EncounterMarker> { new(200, 80, 10, -180f) } },
     { "tutorial_loot_1e",             new List<EncounterMarker> { new(180, 200, 30, 0f, 100f, 150f) } },
     { "tutorial_loot_1s",             new List<EncounterMarker> { new(190, 360, 10, -900f) } },
@@ -154,9 +153,6 @@ namespace DungeonRunners.Managers
  };
 
 
-        // ═══════════════════════════════════════════════════════════════
-        // ENCOUNTER TABLES (from world/dungeon00/enc/*.gc)
-        // ═══════════════════════════════════════════════════════════════
 
         private struct SpawnUnit
         {
@@ -262,7 +258,7 @@ namespace DungeonRunners.Managers
                 if (!_pkgResolutionLogged)
                 {
                     _pkgResolutionLogged = true;
-                    Debug.LogError($"[ENCOUNTER-MANIFEST] authored='{AuthoredPath}' entry={EntryId} source='{_pkgSource}' detail='{_pkgDetail}' choices={Length} fallbackChoices={FallbackLength} packCountUnchanged=True chanceWeighting=BLOCKED difficultyScalingUnchanged=True pendingSpawnUnit=BLOCKED native=RoomNode::prep+EncounterObject::update");
+                    Debug.LogError($"[ENCOUNTER-MANIFEST] authored='{AuthoredPath}' entry={EntryId} source='{_pkgSource}' detail='{_pkgDetail}' choices={Length} fallbackChoices={FallbackLength} packCount=EncounterUnit.Count chanceWeighting=generator-table difficulty=EncounterUnit sourceFunction=RoomNode::prep+EncounterObject::update");
                 }
             }
         }
@@ -272,8 +268,8 @@ namespace DungeonRunners.Managers
             if (count <= 0)
                 return Array.Empty<float>();
             var chances = new float[count];
-            for (int i = 0; i < chances.Length; i++)
-                chances[i] = 1f;
+            for (int chanceIndex = 0; chanceIndex < chances.Length; chanceIndex++)
+                chances[chanceIndex] = 1f;
             return chances;
         }
 
@@ -452,9 +448,6 @@ namespace DungeonRunners.Managers
                    typePath.IndexOf(".interactives.", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        // ---------------------------------------------------------------
-        // level01_encounter.gc  (rank1 mobs)
-        // ---------------------------------------------------------------
         private static readonly EncounterTableManifest Level01Encounter =
             new EncounterTableManifest("world.dungeon00.enc.level01_encounter", 23853, new SpawnUnit[][]
             {
@@ -466,7 +459,6 @@ namespace DungeonRunners.Managers
                         new SpawnUnit("creatures.whiskers.broodling.Basic.Grunt", 1, 0.50f, "world.dungeon00.mob.melee03.rank1") },
             });
 
-        // level01_leader_encounter.gc
         private static readonly EncounterTableManifest Level01LeaderEncounter =
             new EncounterTableManifest("world.dungeon00.enc.level01_leader_encounter", 23854, new SpawnUnit[][]
             {
@@ -474,9 +466,6 @@ namespace DungeonRunners.Managers
                         new SpawnUnit("creatures.forestCreatures.Warg.Basic.Grunt", 1, 0.5f, "world.dungeon00.mob.melee02.rank1") },
             });
 
-        // ---------------------------------------------------------------
-        // level02_encounter.gc  (rank2 mobs)
-        // ---------------------------------------------------------------
         private static readonly EncounterTableManifest Level02Encounter =
             new EncounterTableManifest("world.dungeon00.enc.level02_encounter", 23855, new SpawnUnit[][]
             {
@@ -494,7 +483,6 @@ namespace DungeonRunners.Managers
                 new[] { new SpawnUnit("creatures.whiskers.blademaster.Basic.Grunt", 1, 0.50f, "world.dungeon00.mob.melee04.rank2") },
             });
 
-        // level02_leader_encounter.gc
         private static readonly EncounterTableManifest Level02LeaderEncounter =
             new EncounterTableManifest("world.dungeon00.enc.level02_leader_encounter", 23856, new SpawnUnit[][]
             {
@@ -504,9 +492,6 @@ namespace DungeonRunners.Managers
                         new SpawnUnit("creatures.whiskers.broodling.Basic.Grunt", 1, 0.60f, "world.dungeon00.mob.melee03.rank2") },
             });
 
-        // ---------------------------------------------------------------
-        // level03_encounter.gc  (rank3 mobs)
-        // ---------------------------------------------------------------
         private static readonly EncounterTableManifest Level03Encounter =
             new EncounterTableManifest("world.dungeon00.enc.level03_encounter", 23857, new SpawnUnit[][]
             {
@@ -524,7 +509,6 @@ namespace DungeonRunners.Managers
                         new SpawnUnit("creatures.forestCreatures.Warg.Basic.Pup", 1, 0.50f, "world.dungeon00.mob.melee01.rank3") },
             });
 
-        // level03_leader_encounter.gc
         private static readonly EncounterTableManifest Level03LeaderEncounter =
             new EncounterTableManifest("world.dungeon00.enc.level03_leader_encounter", 23858, new SpawnUnit[][]
             {
@@ -534,7 +518,6 @@ namespace DungeonRunners.Managers
                         new SpawnUnit("creatures.whiskers.broodling.Basic.Grunt", 1, 0.75f, "world.dungeon00.mob.melee03.rank3") },
             });
 
-        // level04_encounter.gc, used by dungeon00_level03_boss static encounter markers.
         private static readonly EncounterTableManifest Level04Encounter =
             new EncounterTableManifest("world.dungeon00.enc.level04_encounter", 23860, new SpawnUnit[][]
             {
@@ -557,7 +540,6 @@ namespace DungeonRunners.Managers
                     new SpawnUnit("terrain.misc.interactives.Breakiable_Barrel_01", 1, 0f) },
             });
 
-        // level04_leader_encounter.gc, used by LootGuardEncounter in dungeon00_level03_boss.
         private static readonly EncounterTableManifest Level04LeaderEncounter =
             new EncounterTableManifest("world.dungeon00.enc.level04_leader_encounter", 23861, new SpawnUnit[][]
             {
@@ -583,27 +565,24 @@ namespace DungeonRunners.Managers
             Level04LeaderEncounter
         };
 
-        public static void RunStartupManifestSelfTest()
+        public static void RunStartupManifestCheck()
         {
             int pkgTables = 0;
-            int fallbackTables = 0;
-            for (int i = 0; i < DewValleyEncounterManifests.Length; i++)
+            int localTables = 0;
+            for (int manifestIndex = 0; manifestIndex < DewValleyEncounterManifests.Length; manifestIndex++)
             {
-                var table = DewValleyEncounterManifests[i];
+                var table = DewValleyEncounterManifests[manifestIndex];
                 table.LogResolution();
                 if (table.Source.Equals("GCDatabase", StringComparison.OrdinalIgnoreCase))
                     pkgTables++;
                 else
-                    fallbackTables++;
+                    localTables++;
             }
 
-            Debug.LogError($"[ENCOUNTER-MANIFEST-SELFTEST] dewValleyTables={DewValleyEncounterManifests.Length} pkgTables={pkgTables} fallbackTables={fallbackTables} packCountUnchanged=True chanceWeighting=BLOCKED difficultyScalingUnchanged=True pendingSpawnUnit=BLOCKED native=RoomNode::prep+EncounterObject::update");
+            Debug.LogError($"[ENCOUNTER-MANIFEST-CHECK] dewValleyTables={DewValleyEncounterManifests.Length} pkgTables={pkgTables} localTables={localTables} packCount=EncounterUnit.Count chanceWeighting=generator-table difficulty=EncounterUnit sourceFunction=RoomNode::prep+EncounterObject::update");
         }
 
 
-        // ═══════════════════════════════════════════════════════════════
-        // LEVEL DEFINITIONS
-        // ═══════════════════════════════════════════════════════════════
 
         private class RoomNodeDef
         {
@@ -629,7 +608,7 @@ namespace DungeonRunners.Managers
             public EncounterTableManifest EncounterTable;
             public EncounterTableManifest LeaderEncounterTable;
             public int[] LeaderGridYs;
-            public int EntryGridX;   // Grid cell where player spawns - skip encounters here
+            public int EntryGridX;
             public int EntryGridY;
             public int ExitGridX;
             public int ExitGridY;
@@ -697,73 +676,79 @@ namespace DungeonRunners.Managers
                 }
             },
         };
-        private const float DefaultEncounterFootprint = 100f;
-        private const float MinEncounterUnitSpacing = 24f;
+        private const float MinEncounterUnitSpacing = 12f;
+        private const float EncounterDifficultyBudget = 2.25f;
 
-        private static int CountSpawnSlots(SpawnUnit[] group)
+        private static int StableSpotSeed(string key)
         {
-            int count = 0;
-            if (group == null)
-                return count;
+            if (string.IsNullOrEmpty(key))
+                return 0;
+            uint h = 2166136261u;
+            for (int i = 0; i < key.Length; i++)
+            {
+                h ^= key[i];
+                h *= 16777619u;
+            }
+            return (int)h;
+        }
+
+        private static float ResolveSpotBudget(int spotSeed)
+        {
+            uint h = (uint)spotSeed * 2654435761u;
+            h ^= h >> 15;
+            float frac = (h & 0xFFFF) / 65535f;
+            return EncounterDifficultyBudget * (0.5f + 0.5f * frac);
+        }
+
+        private static List<SpawnUnit> ExpandEncounterGroup(SpawnUnit[] group, int spotSeed)
+        {
+            var result = new List<SpawnUnit>();
+            if (group == null || group.Length == 0)
+                return result;
+
+            var weighted = new List<SpawnUnit>();
+            float spent = 0f;
             foreach (var unit in group)
-                count += Math.Max(0, unit.Count);
-            return count;
-        }
-
-        private static float MarkerExtentX(EncounterMarker marker)
-        {
-            return marker.SizeX > 0f ? marker.SizeX : DefaultEncounterFootprint;
-        }
-
-        private static float MarkerExtentY(EncounterMarker marker)
-        {
-            return marker.SizeY > 0f ? marker.SizeY : DefaultEncounterFootprint;
-        }
-
-        private static float MarkerSearchRadius(EncounterMarker marker)
-        {
-            float sizeX = MarkerExtentX(marker);
-            float sizeY = MarkerExtentY(marker);
-            return Mathf.Clamp(Mathf.Max(sizeX, sizeY) * 1.5f, 80f, 250f);
-        }
-
-        private static (float x, float y) ResolveEncounterSpawnPoint(EncounterMarker marker, float worldX, float worldY, int slotIndex, int slotCount)
-        {
-            if (slotCount <= 1)
-                return (worldX, worldY);
-
-            float offsetX = 0f;
-            float offsetY = 0f;
-            float radiusX = Mathf.Min(MarkerExtentX(marker) * 0.35f, 35f);
-            float radiusY = Mathf.Min(MarkerExtentY(marker) * 0.35f, 35f);
-
-            if (slotCount == 2)
             {
-                float side = slotIndex == 0 ? -1f : 1f;
-                if (MarkerExtentY(marker) > MarkerExtentX(marker))
-                    offsetY = side * radiusY;
-                else
-                    offsetX = side * radiusX;
-            }
-            else
-            {
-                float angle = (360f / slotCount) * slotIndex;
-                float rad = angle * Mathf.Deg2Rad;
-                offsetX = Mathf.Cos(rad) * radiusX;
-                offsetY = Mathf.Sin(rad) * radiusY;
+                int authoredCount = Math.Max(1, unit.Count);
+                for (int copy = 0; copy < authoredCount; copy++)
+                {
+                    result.Add(unit);
+                    if (unit.Difficulty > 0f)
+                    {
+                        weighted.Add(unit);
+                        spent += unit.Difficulty;
+                    }
+                }
             }
 
-            float heading = NormalizeHeading(marker.Heading) * Mathf.Deg2Rad;
-            float cos = Mathf.Cos(heading);
-            float sin = Mathf.Sin(heading);
-            return (worldX + offsetX * cos - offsetY * sin, worldY + offsetX * sin + offsetY * cos);
+            if (weighted.Count == 0)
+                return result;
+
+            float spotBudget = Math.Max(spent, ResolveSpotBudget(spotSeed));
+
+            float minWeight = float.MaxValue;
+            foreach (var unit in weighted)
+                if (unit.Difficulty < minWeight)
+                    minWeight = unit.Difficulty;
+
+            int fillIndex = 0;
+            while (spotBudget - spent >= minWeight)
+            {
+                var unit = weighted[fillIndex % weighted.Count];
+                if (spent + unit.Difficulty > spotBudget)
+                    break;
+                result.Add(unit);
+                spent += unit.Difficulty;
+                fillIndex++;
+            }
+
+            return result;
         }
 
         private static Vector3 ResolveEncounterSpawnPoint(
             MazeGenerator.MazeCell cell,
             EncounterMarker marker,
-            int slotIndex,
-            int slotCount,
             out bool groundAdjusted,
             out string groundSource)
         {
@@ -774,7 +759,7 @@ namespace DungeonRunners.Managers
 
             float worldX = cell.WorldOriginX + marker.LocalX;
             float worldY = cell.WorldOriginY + marker.LocalY;
-            var resolved = ResolveEncounterSpawnPoint(marker, worldX, worldY, slotIndex, slotCount);
+            var resolved = (x: worldX, y: worldY);
 
             float localX = resolved.x - cell.WorldOriginX;
             float localY = resolved.y - cell.WorldOriginY;
@@ -806,9 +791,9 @@ namespace DungeonRunners.Managers
             if (TileEncounterPlaceholders.TryGetValue(cell.TileType, out var markers) && markers != null)
             {
                 bool found = false;
-                for (int i = 0; i < markers.Count; i++)
+                for (int markerIndex = 0; markerIndex < markers.Count; markerIndex++)
                 {
-                    var candidate = markers[i];
+                    var candidate = markers[markerIndex];
                     float dx = localX - candidate.LocalX;
                     float dy = localY - candidate.LocalY;
                     float distSq = dx * dx + dy * dy;
@@ -817,7 +802,7 @@ namespace DungeonRunners.Managers
                         found = true;
                         bestDistSq = distSq;
                         bestZ = NormalizeUnitGroundZ(candidate.LocalZ);
-                        source = $"same-tile PKG encounter anchor tile='{cell.TileType}' marker={i} authoredZ={candidate.LocalZ:F1} groundZ={bestZ:F1}";
+                        source = $"same-tile PKG encounter anchor tile='{cell.TileType}' marker={markerIndex} authoredZ={candidate.LocalZ:F1} groundZ={bestZ:F1}";
                     }
                 }
             }
@@ -839,39 +824,64 @@ namespace DungeonRunners.Managers
             return heading;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // WALKABILITY HELPER — uses PathMap to avoid spawning in walls/trees
-        // ═══════════════════════════════════════════════════════════════
 
-        // A spot is only "open" if itself AND all 4 cardinal neighbors (20u out) are walkable.
-        // Kills cliff-edge, tree-trunk, and wall-adjacent spawns that visually look clipped.
-        private static bool IsOpenSpot(string zoneName, float x, float y)
+        private const float EncounterSpotClearance = 30f;
+
+        private static bool IsOpenSpot(PathMap pathMap, float x, float y)
         {
-            var pm = DungeonRunners.Core.PathMapManager.Instance;
-            if (!pm.IsWalkable(zoneName, x, y)) return false;
-            if (!pm.IsWalkable(zoneName, x + 20f, y)) return false;
-            if (!pm.IsWalkable(zoneName, x - 20f, y)) return false;
-            if (!pm.IsWalkable(zoneName, x, y + 20f)) return false;
-            if (!pm.IsWalkable(zoneName, x, y - 20f)) return false;
+            if (pathMap == null) return false;
+            if (!pathMap.IsWalkable(x, y)) return false;
+            const float diag = EncounterSpotClearance * 0.70710678f;
+            if (!pathMap.IsWalkable(x + EncounterSpotClearance, y)) return false;
+            if (!pathMap.IsWalkable(x - EncounterSpotClearance, y)) return false;
+            if (!pathMap.IsWalkable(x, y + EncounterSpotClearance)) return false;
+            if (!pathMap.IsWalkable(x, y - EncounterSpotClearance)) return false;
+            if (!pathMap.IsWalkable(x + diag, y + diag)) return false;
+            if (!pathMap.IsWalkable(x - diag, y + diag)) return false;
+            if (!pathMap.IsWalkable(x + diag, y - diag)) return false;
+            if (!pathMap.IsWalkable(x - diag, y - diag)) return false;
             return true;
         }
 
         private static bool HasEncounterClearance(List<Vector2> occupied, float x, float y)
         {
             float minDistSq = MinEncounterUnitSpacing * MinEncounterUnitSpacing;
-            for (int i = 0; i < occupied.Count; i++)
+            for (int occupiedIndex = 0; occupiedIndex < occupied.Count; occupiedIndex++)
             {
-                float dx = occupied[i].x - x;
-                float dy = occupied[i].y - y;
+                float dx = occupied[occupiedIndex].x - x;
+                float dy = occupied[occupiedIndex].y - y;
                 if (dx * dx + dy * dy < minDistSq)
                     return false;
             }
             return true;
         }
 
-        internal static (float x, float y, bool found) FindWalkableSpot(string zoneName, float x, float y, float radius = 250f)
+        private const float DefaultEncounterArea = 100f;
+
+        private static (float x, float y, bool found) ResolveEncounterAreaSpot(
+            PathMap pathMap, float centerX, float centerY, int slot, int slotCount, float sizeX, float sizeY, List<Vector2> occupied)
         {
-            if (IsOpenSpot(zoneName, x, y))
+            float areaX = sizeX > 0f ? sizeX : DefaultEncounterArea;
+            float areaY = sizeY > 0f ? sizeY : DefaultEncounterArea;
+            float halfX = areaX * 0.5f;
+            float halfY = areaY * 0.5f;
+            int columns = Math.Max(1, (int)Math.Ceiling(Math.Sqrt(slotCount)));
+            int rows = Math.Max(1, (int)Math.Ceiling(slotCount / (float)columns));
+            int col = slot % columns;
+            int row = slot / columns;
+            float stepX = columns > 1 ? areaX / (columns - 1) : 0f;
+            float stepY = rows > 1 ? areaY / (rows - 1) : 0f;
+            float targetX = centerX - halfX + (columns > 1 ? col * stepX : halfX);
+            float targetY = centerY - halfY + (rows > 1 ? row * stepY : halfY);
+            var spot = FindWalkableSpot(pathMap, targetX, targetY, Math.Max(halfX, halfY), occupied);
+            if (spot.found)
+                return spot;
+            return FindWalkableSpot(pathMap, centerX, centerY, 250f, occupied);
+        }
+
+        internal static (float x, float y, bool found) FindWalkableSpot(PathMap pathMap, float x, float y, float radius = 250f)
+        {
+            if (IsOpenSpot(pathMap, x, y))
                 return (x, y, true);
 
             for (float r = 5f; r <= radius; r += 5f)
@@ -881,16 +891,16 @@ namespace DungeonRunners.Managers
                     float rad = angle * Mathf.Deg2Rad;
                     float testX = x + Mathf.Cos(rad) * r;
                     float testY = y + Mathf.Sin(rad) * r;
-                    if (IsOpenSpot(zoneName, testX, testY))
+                    if (IsOpenSpot(pathMap, testX, testY))
                         return (testX, testY, true);
                 }
             }
             return (x, y, false);
         }
 
-        internal static (float x, float y, bool found) FindWalkableSpot(string zoneName, float x, float y, float radius, List<Vector2> occupied)
+        internal static (float x, float y, bool found) FindWalkableSpot(PathMap pathMap, float x, float y, float radius, List<Vector2> occupied)
         {
-            if (IsOpenSpot(zoneName, x, y) && HasEncounterClearance(occupied, x, y))
+            if (IsOpenSpot(pathMap, x, y) && HasEncounterClearance(occupied, x, y))
                 return (x, y, true);
 
             for (float r = 5f; r <= radius; r += 5f)
@@ -900,7 +910,18 @@ namespace DungeonRunners.Managers
                     float rad = angle * Mathf.Deg2Rad;
                     float testX = x + Mathf.Cos(rad) * r;
                     float testY = y + Mathf.Sin(rad) * r;
-                    if (IsOpenSpot(zoneName, testX, testY) && HasEncounterClearance(occupied, testX, testY))
+                    if (IsOpenSpot(pathMap, testX, testY) && HasEncounterClearance(occupied, testX, testY))
+                        return (testX, testY, true);
+                }
+            }
+            for (float r = (float)MinEncounterUnitSpacing; r <= radius; r += (float)MinEncounterUnitSpacing)
+            {
+                for (float angle = 0; angle < 360; angle += 30)
+                {
+                    float rad = angle * Mathf.Deg2Rad;
+                    float testX = x + Mathf.Cos(rad) * r;
+                    float testY = y + Mathf.Sin(rad) * r;
+                    if (pathMap != null && pathMap.IsWalkable(testX, testY) && HasEncounterClearance(occupied, testX, testY))
                         return (testX, testY, true);
                 }
             }
@@ -944,18 +965,52 @@ namespace DungeonRunners.Managers
             return instIdx > 0 ? zoneName.Substring(0, instIdx) : zoneName;
         }
 
-        private static int NextTableIndex(MersenneTwister rng, EncounterTableManifest table, string phase, string owner)
+        private static int NextTableIndex(CombatRandom rng, EncounterTableManifest table, string phase, string owner)
         {
             int count = table?.Length ?? 0;
-            if (count <= 1)
-                return 0;
-            return (int)NativeRngLedger.Generate(
-                rng,
-                "layout",
-                phase ?? "DungeonMazeSpawner::EncounterTableChoice",
-                0,
-                (uint)(count - 1),
-                owner ?? table.AuthoredPath);
+            if (count <= 0)
+                return -1;
+
+            string drawPhase = phase ?? "DungeonMazeSpawner::EncounterTableChoice";
+            string drawOwner = owner ?? table.AuthoredPath;
+            var groups = new SortedDictionary<int, List<int>>(Comparer<int>.Create((left, right) => right.CompareTo(left)));
+            for (int choiceIndex = 0; choiceIndex < count; choiceIndex++)
+            {
+                int chance = Math.Max(1, (int)Math.Round(table.ChoiceChance(choiceIndex), MidpointRounding.AwayFromZero));
+                if (!groups.TryGetValue(chance, out var choices))
+                {
+                    choices = new List<int>();
+                    groups[chance] = choices;
+                }
+
+                choices.Add(choiceIndex);
+            }
+
+            foreach (var group in groups)
+            {
+                int chance = group.Key;
+                uint gate = RngLedger.Generate(
+                    rng,
+                    "layout",
+                    $"{drawPhase}:chance",
+                    0,
+                    (uint)(chance - 1),
+                    $"{drawOwner}:chance={chance}");
+                if (gate != 0)
+                    continue;
+
+                var choices = group.Value;
+                uint selected = RngLedger.Generate(
+                    rng,
+                    "layout",
+                    $"{drawPhase}:select",
+                    0,
+                    (uint)(choices.Count - 1),
+                    $"{drawOwner}:chance={chance}:candidates={choices.Count}");
+                return choices[(int)selected];
+            }
+
+            return -1;
         }
 
         private static void AddSpawn(List<DatabaseLoader.DungeonSpawnData> spawns, string zoneName, SpawnUnit unit,
@@ -979,7 +1034,7 @@ namespace DungeonRunners.Managers
             EncounterTableManifest table, int choiceIndex, string role, MazeGenerator.MazeCell cell, int markerIndex,
             SpawnUnit[] group, string source)
         {
-            int packSlots = CountSpawnSlots(group);
+            int packSlots = ExpandEncounterGroup(group, StableSpotSeed(groupKey)).Count;
             int unitRows = group?.Length ?? 0;
             float choiceChance = table?.ChoiceChance(choiceIndex) ?? 1f;
             string manifestSource = table?.Source ?? "";
@@ -1007,35 +1062,28 @@ namespace DungeonRunners.Managers
                 });
             }
 
-            Debug.LogError($"[ENCOUNTER-OBJECT] zone={zoneName} group={groupKey} role={role} authored='{table?.AuthoredPath ?? ""}' entry={table?.EntryId ?? 0} choice={choiceIndex} chance={choiceChance:F3} manifestSource='{manifestSource}' packSlots={packSlots} unitRows={unitRows} cell=({cell?.GridX ?? -1},{cell?.GridY ?? -1}) tile='{cell?.TileType ?? ""}' marker={markerIndex} source='{source ?? ""}' mirrorOnly=True packCountUnchanged=True difficultyScalingUnchanged=True pendingSpawnUnit=BLOCKED native=RoomNode::prep+EncounterObject::update");
+            Debug.LogError($"[ENCOUNTER-OBJECT] zone={zoneName} group={groupKey} role={role} authored='{table?.AuthoredPath ?? ""}' entry={table?.EntryId ?? 0} choice={choiceIndex} chance={choiceChance:F3} manifestSource='{manifestSource}' packSlots={packSlots} unitRows={unitRows} cell=({cell?.GridX ?? -1},{cell?.GridY ?? -1}) tile='{cell?.TileType ?? ""}' marker={markerIndex} source='{source ?? ""}' mirrorOnly=True packCount=EncounterUnit.Count difficulty=EncounterUnit sourceFunction=RoomNode::prep+EncounterObject::update");
         }
 
         private static int AddStaticEncounterSpawns(List<DatabaseLoader.DungeonSpawnData> spawns, string zoneName,
-            EncounterTableManifest table, EncounterMarker marker, string groupKey, MersenneTwister rng, string role)
+            EncounterTableManifest table, EncounterMarker marker, string groupKey, CombatRandom rng, string role)
         {
             int choiceIndex = NextTableIndex(rng, table, "DungeonMazeSpawner::static-encounter-choice", $"{groupKey}:{table?.AuthoredPath}");
+            if (choiceIndex < 0)
+                return 0;
+
             var group = table[choiceIndex];
             RecordEncounterObjectMirror(null, zoneName, groupKey, table, choiceIndex, role, null, -1, group, marker.Source);
-            int groupSlots = CountSpawnSlots(group);
-            int groupSlot = 0;
             int count = 0;
-            foreach (var unit in group)
+            foreach (var unit in ExpandEncounterGroup(group, StableSpotSeed(groupKey)))
             {
-                for (int i = 0; i < unit.Count; i++)
-                {
-                    int slot = groupSlot++;
-                    var (spawnX, spawnY) = ResolveEncounterSpawnPoint(marker, marker.LocalX, marker.LocalY, slot, groupSlots);
-                    AddSpawn(spawns, zoneName, unit, spawnX, spawnY, marker.LocalZ, marker.Heading, groupKey);
-                    count++;
-                }
+                AddSpawn(spawns, zoneName, unit, marker.LocalX, marker.LocalY, marker.LocalZ, marker.Heading, groupKey);
+                count++;
             }
             return count;
         }
 
 
-        // ═══════════════════════════════════════════════════════════════
-        // PUBLIC API
-        // ═══════════════════════════════════════════════════════════════
 
         public static bool IsStaticBossZone(string zoneName)
         {
@@ -1054,18 +1102,18 @@ namespace DungeonRunners.Managers
             if (!IsStaticBossZone(baseZone))
                 return spawns;
 
-            var rng = new MersenneTwister(seed);
-            NativeRngLedger.LogSeed("layout", "DungeonMazeSpawner::static-boss-seed", seed, baseZone);
+            var rng = new CombatRandom(seed);
+            RngLedger.LogSeed("layout", "DungeonMazeSpawner::static-boss-seed", seed, baseZone);
             int regular = 0;
-            for (int i = 0; i < Level03BossRegularMarkers.Length; i++)
-                regular += AddStaticEncounterSpawns(spawns, baseZone, Level04Encounter, Level03BossRegularMarkers[i], $"{baseZone}:enc:{i}", rng, "static-regular");
+            for (int markerIndex = 0; markerIndex < Level03BossRegularMarkers.Length; markerIndex++)
+                regular += AddStaticEncounterSpawns(spawns, baseZone, Level04Encounter, Level03BossRegularMarkers[markerIndex], $"{baseZone}:enc:{markerIndex}", rng, "static-regular");
 
             int leaders = AddStaticEncounterSpawns(spawns, baseZone, Level04LeaderEncounter, Level03BossLootGuardMarker, $"{baseZone}:leader:0", rng, "static-loot-guard");
             foreach (var posse in Level03BossPosse)
                 AddSpawn(spawns, baseZone, posse.Unit, posse.X, posse.Y, posse.Z, posse.Heading, $"{baseZone}:boss:0");
-            Debug.LogError($"[ENCOUNTER-OBJECT] zone={baseZone} group={baseZone}:boss:0 role=static-boss-posse authored='world.dungeon00.mob.boss_posse_table' entry=23867 choice=0 packSlots={Level03BossPosse.Length} unitRows={Level03BossPosse.Length} cell=(-1,-1) tile='' marker=-1 source='world.dungeon00.data.BossFightNCI01' mirrorOnly=True packCountUnchanged=True difficultyScalingUnchanged=True pendingSpawnUnit=BLOCKED native=EncounterObject::update");
+            Debug.LogError($"[ENCOUNTER-OBJECT] zone={baseZone} group={baseZone}:boss:0 role=static-boss-posse authored='world.dungeon00.mob.boss_posse_table' entry=23867 choice=0 packSlots={Level03BossPosse.Length} unitRows={Level03BossPosse.Length} cell=(-1,-1) tile='' marker=-1 source='world.dungeon00.data.BossFightNCI01' mirrorOnly=True packCount=static difficulty=static sourceFunction=EncounterObject::update");
 
-            Debug.LogError($"[MazeSpawner] BOSS STATIC TOTAL: {spawns.Count} units ({regular} regular + {leaders} loot-guard + {Level03BossPosse.Length} boss-posse) for {baseZone}");
+            Debug.LogError($"[MAZE-SPAWNER] staticBoss zone={baseZone} total={spawns.Count} regular={regular} leaders={leaders} bossPosse={Level03BossPosse.Length}");
             return spawns;
         }
 
@@ -1073,22 +1121,22 @@ namespace DungeonRunners.Managers
             out int width, out int height, out int entryX, out int entryY,
             out int randomness, out int sparseness, out int deadEndRemoval)
         {
-            if (LevelDefs.TryGetValue(NormalizeBaseZone(zoneName), out var def))
+            if (LevelDefs.TryGetValue(NormalizeBaseZone(zoneName), out var levelDef))
             {
-                width = def.MazeWidth;
-                height = def.MazeHeight;
-                entryX = def.EntryGridX;
-                entryY = def.EntryGridY;
-                randomness = def.MazeRandomness;
-                sparseness = def.MazeSparseness;
-                deadEndRemoval = def.MazeDeadEndRemovalChance;
+                width = levelDef.MazeWidth;
+                height = levelDef.MazeHeight;
+                entryX = levelDef.EntryGridX;
+                entryY = levelDef.EntryGridY;
+                randomness = levelDef.MazeRandomness;
+                sparseness = levelDef.MazeSparseness;
+                deadEndRemoval = levelDef.MazeDeadEndRemovalChance;
                 return true;
             }
             width = height = entryX = entryY = randomness = sparseness = deadEndRemoval = 0;
             return false;
         }
 
-        public static bool TryResolveNativeExploredBitCount(string zoneName, out ushort exploredBitCount)
+        public static bool TryResolveExploredBitCount(string zoneName, out ushort exploredBitCount)
         {
             exploredBitCount = 0;
             if (!TryGetMazeDimensions(zoneName, out int width, out int height, out _, out _, out _, out _, out _))
@@ -1110,41 +1158,24 @@ namespace DungeonRunners.Managers
         private static MazeGenerator.MazeCell FindCell(List<MazeGenerator.MazeCell> cells, int gridX, int gridY)
         {
             if (cells == null) return null;
-            for (int i = 0; i < cells.Count; i++)
+            for (int cellIndex = 0; cellIndex < cells.Count; cellIndex++)
             {
-                var cell = cells[i];
+                var cell = cells[cellIndex];
                 if (cell.GridX == gridX && cell.GridY == gridY)
                     return cell;
             }
             return null;
         }
 
-        private static Vector3 ResolveCellAnchor(string zoneName, MazeGenerator.MazeCell cell, float localX, float localY, float localZ)
-        {
-            if (cell == null)
-                return Vector3.zero;
-
-            float x = cell.WorldOriginX + localX;
-            float y = cell.WorldOriginY + localY;
-            var (safeX, safeY, found) = FindWalkableSpot(zoneName, x, y);
-            if (found)
-            {
-                x = safeX;
-                y = safeY;
-            }
-
-            float z = DungeonRunners.Core.PathMapManager.Instance.GetHeight(zoneName, x, y, localZ);
-            return new Vector3(x, y, z);
-        }
 
         private static MazeGenerator.PlacedRoomNode FindPlacedRoomNode(ProceduralDungeonSnapshot snapshot, int sourceIndex, params string[] tileSetFallbacks)
         {
             if (snapshot?.RoomNodes == null)
                 return null;
 
-            for (int i = 0; i < snapshot.RoomNodes.Count; i++)
+            for (int roomNodeIndex = 0; roomNodeIndex < snapshot.RoomNodes.Count; roomNodeIndex++)
             {
-                var placed = snapshot.RoomNodes[i];
+                var placed = snapshot.RoomNodes[roomNodeIndex];
                 if (placed != null && placed.SourceIndex == sourceIndex)
                     return placed;
             }
@@ -1152,15 +1183,15 @@ namespace DungeonRunners.Managers
             if (tileSetFallbacks == null || tileSetFallbacks.Length == 0)
                 return null;
 
-            for (int i = 0; i < snapshot.RoomNodes.Count; i++)
+            for (int roomNodeIndex = 0; roomNodeIndex < snapshot.RoomNodes.Count; roomNodeIndex++)
             {
-                var placed = snapshot.RoomNodes[i];
+                var placed = snapshot.RoomNodes[roomNodeIndex];
                 if (placed == null || string.IsNullOrEmpty(placed.TileSet))
                     continue;
 
-                for (int j = 0; j < tileSetFallbacks.Length; j++)
+                for (int fallbackIndex = 0; fallbackIndex < tileSetFallbacks.Length; fallbackIndex++)
                 {
-                    if (placed.TileSet.StartsWith(tileSetFallbacks[j], StringComparison.OrdinalIgnoreCase))
+                    if (placed.TileSet.StartsWith(tileSetFallbacks[fallbackIndex], StringComparison.OrdinalIgnoreCase))
                         return placed;
                 }
             }
@@ -1250,9 +1281,9 @@ namespace DungeonRunners.Managers
                 "elmforest_up_"
             };
 
-            for (int i = 0; i < prefixes.Length; i++)
+            for (int prefixIndex = 0; prefixIndex < prefixes.Length; prefixIndex++)
             {
-                string prefix = prefixes[i];
+                string prefix = prefixes[prefixIndex];
                 if (tileType.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                     return tileType.Substring(prefix.Length);
             }
@@ -1362,12 +1393,12 @@ namespace DungeonRunners.Managers
                    y <= cell.WorldOriginY + MazeGenerator.TILE_SIZE;
         }
 
-        private static (float x, float y, bool found) FindWalkableSpotInCell(string zoneName, MazeGenerator.MazeCell cell, float x, float y, float radius = 60f)
+        private static (float x, float y, bool found) FindWalkableSpotInCell(PathMap pathMap, MazeGenerator.MazeCell cell, float x, float y, float radius = 60f)
         {
             if (cell == null)
                 return (x, y, false);
 
-            if (IsInsideCell(cell, x, y) && IsOpenSpot(zoneName, x, y))
+            if (IsInsideCell(cell, x, y) && IsOpenSpot(pathMap, x, y))
                 return (x, y, true);
 
             float maxRadius = Mathf.Min(radius, MazeGenerator.TILE_SIZE * 0.25f);
@@ -1378,7 +1409,7 @@ namespace DungeonRunners.Managers
                     float rad = angle * Mathf.Deg2Rad;
                     float testX = x + Mathf.Cos(rad) * r;
                     float testY = y + Mathf.Sin(rad) * r;
-                    if (IsInsideCell(cell, testX, testY) && IsOpenSpot(zoneName, testX, testY))
+                    if (IsInsideCell(cell, testX, testY) && IsOpenSpot(pathMap, testX, testY))
                         return (testX, testY, true);
                 }
             }
@@ -1386,17 +1417,7 @@ namespace DungeonRunners.Managers
             return (x, y, false);
         }
 
-        private static Vector3 ResolveAuthoredAnchor(string zoneName, MazeGenerator.MazeCell cell, AuthoredAnchor anchor, out bool walkable)
-        {
-            return ResolveAuthoredAnchor(zoneName, cell, anchor, out walkable, out _);
-        }
-
-        private static Vector3 ResolveAuthoredAnchor(string zoneName, MazeGenerator.MazeCell cell, AuthoredAnchor anchor, out bool walkable, out Vector3 rawWorld)
-        {
-            return ResolveAuthoredAnchor(zoneName, cell, anchor, out walkable, out rawWorld, true);
-        }
-
-        private static Vector3 ResolveAuthoredAnchor(string zoneName, MazeGenerator.MazeCell cell, AuthoredAnchor anchor, out bool walkable, out Vector3 rawWorld, bool snapToWalkable)
+        private static Vector3 ResolveAuthoredAnchor(PathMap pathMap, MazeGenerator.MazeCell cell, AuthoredAnchor anchor, out bool walkable, out Vector3 rawWorld, bool snapToWalkable)
         {
             walkable = false;
             rawWorld = Vector3.zero;
@@ -1408,7 +1429,7 @@ namespace DungeonRunners.Managers
             rawWorld = new Vector3(x, y, anchor.LocalZ);
             if (snapToWalkable)
             {
-                var safe = FindWalkableSpotInCell(zoneName, cell, x, y);
+                var safe = FindWalkableSpotInCell(pathMap, cell, x, y);
                 if (safe.found)
                 {
                     x = safe.x;
@@ -1416,14 +1437,14 @@ namespace DungeonRunners.Managers
                     walkable = true;
                 }
 
-                float z = DungeonRunners.Core.PathMapManager.Instance.GetHeight(zoneName, x, y, anchor.LocalZ);
+                float z = pathMap?.GetHeightAt(x, y, anchor.LocalZ) ?? anchor.LocalZ;
                 return new Vector3(x, y, z);
             }
 
             return rawWorld;
         }
 
-        private static void ResolveSnapshotAnchors(ProceduralDungeonSnapshot snapshot, LevelDef level, string zoneName, List<MazeGenerator.MazeCell> cells)
+        private static void ResolveSnapshotAnchors(ProceduralDungeonSnapshot snapshot, LevelDef level, PathMap pathMap, List<MazeGenerator.MazeCell> cells)
         {
             if (snapshot == null || level == null || cells == null || cells.Count == 0)
                 return;
@@ -1464,13 +1485,13 @@ namespace DungeonRunners.Managers
             snapshot.ExitPortalGcType = exitDef?.PortalGcType;
 
             if (!TryGetAuthoredDungeonAnchor(snapshot.EntryTileType, true, out var playerAnchor))
-                playerAnchor = new AuthoredAnchor(200f, 200f, 0f, 0f, "PARTIAL fallback local tile center");
+                playerAnchor = new AuthoredAnchor(200f, 200f, 0f, 0f, "fallback local tile center");
             if (!TryGetAuthoredDungeonAnchor(snapshot.ExitTileType, true, out var exitPlayerAnchor))
-                exitPlayerAnchor = new AuthoredAnchor(200f, 200f, 0f, 0f, "PARTIAL fallback local tile center");
+                exitPlayerAnchor = new AuthoredAnchor(200f, 200f, 0f, 0f, "fallback local tile center");
             if (!TryGetAuthoredDungeonAnchor(snapshot.EntryTileType, false, out var entryPortalAnchor))
-                entryPortalAnchor = new AuthoredAnchor(200f, 200f, 0f, 0f, "PARTIAL fallback local tile center");
+                entryPortalAnchor = new AuthoredAnchor(200f, 200f, 0f, 0f, "fallback local tile center");
             if (!TryGetAuthoredDungeonAnchor(snapshot.ExitTileType, false, out var exitPortalAnchor))
-                exitPortalAnchor = new AuthoredAnchor(200f, 200f, 0f, 0f, "PARTIAL fallback local tile center");
+                exitPortalAnchor = new AuthoredAnchor(200f, 200f, 0f, 0f, "fallback local tile center");
 
             snapshot.PlayerAnchorLocal = new Vector3(playerAnchor.LocalX, playerAnchor.LocalY, playerAnchor.LocalZ);
             snapshot.ExitPlayerAnchorLocal = new Vector3(exitPlayerAnchor.LocalX, exitPlayerAnchor.LocalY, exitPlayerAnchor.LocalZ);
@@ -1480,16 +1501,16 @@ namespace DungeonRunners.Managers
             snapshot.ExitPlayerAnchorSource = exitPlayerAnchor.Source;
             snapshot.EntryPortalAnchorSource = entryPortalAnchor.Source;
             snapshot.ExitPortalAnchorSource = exitPortalAnchor.Source;
-            snapshot.PlayerSpawn = ResolveAuthoredAnchor(zoneName, entryCell, playerAnchor, out bool playerWalkable, out Vector3 playerRawWorld, snapToWalkable: false);
+            snapshot.PlayerSpawn = ResolveAuthoredAnchor(pathMap, entryCell, playerAnchor, out bool playerWalkable, out Vector3 playerRawWorld, snapToWalkable: false);
             snapshot.PlayerHeading = NormalizeHeading(playerAnchor.Heading);
             snapshot.PlayerAnchorWalkable = playerWalkable;
-            snapshot.ExitPlayerSpawn = ResolveAuthoredAnchor(zoneName, exitCell, exitPlayerAnchor, out bool exitPlayerWalkable, out Vector3 exitPlayerRawWorld, snapToWalkable: false);
+            snapshot.ExitPlayerSpawn = ResolveAuthoredAnchor(pathMap, exitCell, exitPlayerAnchor, out bool exitPlayerWalkable, out Vector3 exitPlayerRawWorld, snapToWalkable: false);
             snapshot.ExitPlayerHeading = NormalizeHeading(exitPlayerAnchor.Heading);
             snapshot.ExitPlayerAnchorWalkable = exitPlayerWalkable;
-            snapshot.EntryPortalSpawn = ResolveAuthoredAnchor(zoneName, entryCell, entryPortalAnchor, out bool entryPortalWalkable, out Vector3 entryPortalRawWorld, snapToWalkable: false);
+            snapshot.EntryPortalSpawn = ResolveAuthoredAnchor(pathMap, entryCell, entryPortalAnchor, out bool entryPortalWalkable, out Vector3 entryPortalRawWorld, snapToWalkable: false);
             snapshot.EntryPortalHeading = NormalizeHeading(entryPortalAnchor.Heading);
             snapshot.EntryPortalAnchorWalkable = entryPortalWalkable;
-            snapshot.ExitPortalSpawn = ResolveAuthoredAnchor(zoneName, exitCell, exitPortalAnchor, out bool exitPortalWalkable, out Vector3 exitPortalRawWorld, snapToWalkable: false);
+            snapshot.ExitPortalSpawn = ResolveAuthoredAnchor(pathMap, exitCell, exitPortalAnchor, out bool exitPortalWalkable, out Vector3 exitPortalRawWorld, snapToWalkable: false);
             snapshot.ExitPortalHeading = NormalizeHeading(exitPortalAnchor.Heading);
             snapshot.ExitPortalAnchorWalkable = exitPortalWalkable;
 
@@ -1566,24 +1587,23 @@ namespace DungeonRunners.Managers
 
             if (!LevelDefs.TryGetValue(baseZone, out LevelDef level))
             {
-                Debug.LogError($"[MazeSpawner] No level definition for zone '{zoneName}'");
+                Debug.LogError($"[MAZE-SPAWNER] zone='{zoneName}' reason=no-level-definition");
                 return snapshot;
             }
 
-            Debug.LogError($"[MazeSpawner] ═══════════════════════════════════════════════════");
-            Debug.LogError($"[MazeSpawner] GENERATING MAZE for {baseZone}");
-            Debug.LogError($"[MazeSpawner]   Size: {level.MazeWidth}x{level.MazeHeight}  Seed: 0x{seed:X8}");
+            Debug.LogError($"[MAZE-SPAWNER] begin zone={baseZone} size={level.MazeWidth}x{level.MazeHeight} seed=0x{seed:X8}");
 
-            // 1. Generate the maze
-            Debug.LogError($"[MazeSpawner]   RNG source: local dungeon layout seed=0x{seed:X8} entityManagerOpcode0CSeed=0x{roomSeed:X8}");
+            Debug.LogError($"[MAZE-SPAWNER] rng layoutSeed=0x{seed:X8} entityManagerOpcode0CSeed=0x{roomSeed:X8}");
+            var rng = new CombatRandom(seed);
+            RngLedger.LogSeed("layout", "DungeonMazeSpawner::layout-seed", seed, baseZone);
 
             var maze = new MazeGenerator(
                 level.MazeWidth, level.MazeHeight, seed,
                 level.MazeRandomness, level.MazeSparseness,
                 level.MazeDeadEndRemovalChance,
-                null
+                rng
             );
-            Debug.LogError($"[MazeSpawner]   Generated world root: native integer half-grid, tileSize={MazeGenerator.TILE_SIZE}, no PathMap bounds center override");
+            Debug.LogError($"[MAZE-SPAWNER] worldRoot=client-integer-half-grid tileSize={MazeGenerator.TILE_SIZE} pathMapCenterOverride=False");
             if (level.RoomNodes != null)
             {
                 for (int nodeIndex = 0; nodeIndex < level.RoomNodes.Length; nodeIndex++)
@@ -1592,15 +1612,18 @@ namespace DungeonRunners.Managers
                     maze.AddRoomNode(node.TileSet, node.GridX, node.GridY, node.Chance, nodeIndex);
                 }
             }
-            var cells = maze.Generate();
+            var cells = maze.BuildWorld();
 
-            Debug.LogError($"[MazeSpawner]   Generated {cells.Count} cells");
+            Debug.LogError($"[MAZE-SPAWNER] cells={cells.Count}");
 
-            // 2. Place encounters at tile encounter markers
+            var mazePathMap = DungeonRunners.Utilities.PathMapBuilder.Build(baseZone, cells);
+            snapshot.PathMap = mazePathMap;
+            if (mazePathMap == null)
+                Debug.LogError($"[MAZE-SPAWNER] zone={baseZone} reason=pathmap-build-null cells={cells.Count}");
+
             int encIdx = 0;
             int totalRegular = 0;
 
-            // Process cells top-to-bottom, left-to-right (match client iteration order)
             cells.Sort((a, b) =>
             {
                 int cmp = b.GridY.CompareTo(a.GridY);
@@ -1623,13 +1646,13 @@ namespace DungeonRunners.Managers
                     if (level.RoomNodes != null && placed.SourceIndex >= 0 && placed.SourceIndex < level.RoomNodes.Length)
                         node = level.RoomNodes[placed.SourceIndex];
 
-                    Debug.LogError($"[MazeSpawner]   RoomNode src={placed.SourceIndex} tileSet='{placed.TileSet}' tile='{placed.TileType}' grid=({placed.GridX},{placed.GridY}) encounter={(node?.EncounterTable != null)}");
+                    Debug.LogError($"[MAZE-SPAWNER] roomNode src={placed.SourceIndex} tileSet='{placed.TileSet}' tile='{placed.TileType}' grid=({placed.GridX},{placed.GridY}) encounter={(node?.EncounterTable != null)}");
                     if (node?.EncounterTable != null)
                         encounterRooms.Add((cell, node, placed));
                 }
                 else
                 {
-                    Debug.LogError($"[MazeSpawner]   RoomNode src={placed.SourceIndex} grid=({placed.GridX},{placed.GridY}) has no generated cell");
+                    Debug.LogError($"[MAZE-SPAWNER] roomNode src={placed.SourceIndex} grid=({placed.GridX},{placed.GridY}) reason=no-cell");
                 }
             }
 
@@ -1650,32 +1673,35 @@ namespace DungeonRunners.Managers
                     var marker = markers[markerIndex];
                     int groupOrdinal = encIdx;
                     string groupKey = $"{baseZone}:enc:{groupOrdinal}";
-                    int encounterChoiceIndex = maze.NextInt(
-                        0,
-                        level.EncounterTable.Length,
-                        "DungeonMazeSpawner::regular-encounter-choice",
-                        $"{groupKey}:{level.EncounterTable.AuthoredPath}:cell={cell.GridX},{cell.GridY}:marker={markerIndex}");
-                    var group = level.EncounterTable[encounterChoiceIndex];
-                    RecordEncounterObjectMirror(snapshot, baseZone, groupKey, level.EncounterTable, encounterChoiceIndex, "regular", cell, markerIndex, group, marker.Source);
-                    int groupSlots = CountSpawnSlots(group);
-                    int groupSlot = 0;
                     encIdx++;
+                    int choiceIndex = NextTableIndex(rng, level.EncounterTable, "DungeonMazeSpawner::encounter-choice", $"{groupKey}:{level.EncounterTable?.AuthoredPath}:marker={markerIndex}");
+                    if (choiceIndex < 0)
+                        continue;
 
-                    foreach (var unit in group)
+                    var group = level.EncounterTable[choiceIndex];
+                    RecordEncounterObjectMirror(snapshot, baseZone, groupKey, level.EncounterTable, choiceIndex, "regular", cell, markerIndex, group, marker.Source);
+
+                    var occupied = new List<Vector2>();
+                    var expandedGroup = ExpandEncounterGroup(group, StableSpotSeed(groupKey));
+                    int packCount = expandedGroup.Count;
+                    for (int packIndex = 0; packIndex < packCount; packIndex++)
                     {
-                        for (int i = 0; i < unit.Count; i++)
+                        var unit = expandedGroup[packIndex];
                         {
-                            int slot = groupSlot++;
-                            Vector3 spawnPoint = ResolveEncounterSpawnPoint(cell, marker, slot, groupSlots, out bool groundApplied, out string groundSource);
+                            Vector3 spawnPoint = ResolveEncounterSpawnPoint(cell, marker, out bool groundApplied, out string groundSource);
+                            var scattered = ResolveEncounterAreaSpot(mazePathMap, spawnPoint.x, spawnPoint.y, packIndex, packCount, marker.SizeX, marker.SizeY, occupied);
+                            float sx = scattered.found ? scattered.x : spawnPoint.x;
+                            float sy = scattered.found ? scattered.y : spawnPoint.y;
+                            occupied.Add(new Vector2(sx, sy));
 
                             spawns.Add(new DatabaseLoader.DungeonSpawnData
                             {
                                 zoneName = baseZone,
                                 gcType = unit.GcType,
                                 spawnGcTypeOverride = unit.SpawnGcTypeOverride,
-                                posX = spawnPoint.x,
-                                posY = spawnPoint.y,
-                                posZ = spawnPoint.z,
+                                posX = sx,
+                                posY = sy,
+                                posZ = mazePathMap?.GetHeightAt(sx, sy, spawnPoint.z) ?? spawnPoint.z,
                                 heading = NormalizeHeading(marker.Heading),
                                 encounterGroupKey = groupKey,
                                 encounterDifficulty = unit.Difficulty,
@@ -1692,7 +1718,7 @@ namespace DungeonRunners.Managers
                                 placeholderIndex = markerIndex,
                                 placeholderSizeX = marker.SizeX,
                                 placeholderSizeY = marker.SizeY,
-                                encounterChoiceIndex = encounterChoiceIndex,
+                                encounterChoiceIndex = choiceIndex,
                                 snapApplied = groundApplied
                             });
                             totalRegular++;
@@ -1701,9 +1727,8 @@ namespace DungeonRunners.Managers
                 }
             }
 
-            Debug.LogError($"[MazeSpawner]   Placed {totalRegular} regular mobs from {encIdx} markers");
+            Debug.LogError($"[MAZE-SPAWNER] regular={totalRegular} markers={encIdx}");
 
-            // 3. Place authored EncounterType rooms at their actual generated RoomNode cells.
             int leaderIdx = 0;
             int totalLeaders = 0;
 
@@ -1723,37 +1748,42 @@ namespace DungeonRunners.Managers
                     var bestCell = leaderRoom.Cell;
                     int leaderGroupOrdinal = leaderIdx;
                     string leaderGroupKey = $"{baseZone}:leader:{leaderGroupOrdinal}";
-                    int leaderChoiceIndex = maze.NextInt(
-                        0,
-                        leaderRoom.Table.Length,
-                        "DungeonMazeSpawner::leader-encounter-choice",
-                        $"{leaderGroupKey}:{leaderRoom.Table.AuthoredPath}:{leaderRoom.Source}");
-                    var leaderGroup = leaderRoom.Table[leaderChoiceIndex];
-                    RecordEncounterObjectMirror(snapshot, baseZone, leaderGroupKey, leaderRoom.Table, leaderChoiceIndex, "leader", bestCell, -1, leaderGroup, leaderRoom.Source);
                     leaderIdx++;
-                    Debug.LogError($"[MazeSpawner]   Leader encounter source={leaderRoom.Source} group={leaderGroupKey} cell=({bestCell.GridX},{bestCell.GridY}) tile='{bestCell.TileType}'");
-                    if (!TileEncounterPlaceholders.TryGetValue(bestCell.TileType, out var leaderMarkers) || leaderMarkers.Count == 0)
-                        leaderMarkers = new List<EncounterMarker> { new(200f, 200f, 0f, source: "PARTIAL fallback tile center; PKG placeholder missing") };
+                    int choiceIndex = NextTableIndex(rng, leaderRoom.Table, "DungeonMazeSpawner::leader-encounter-choice", $"{leaderGroupKey}:{leaderRoom.Table?.AuthoredPath}");
+                    if (choiceIndex < 0)
+                        continue;
 
-                    int leaderSlots = CountSpawnSlots(leaderGroup);
+                    var leaderGroup = leaderRoom.Table[choiceIndex];
+                    RecordEncounterObjectMirror(snapshot, baseZone, leaderGroupKey, leaderRoom.Table, choiceIndex, "leader", bestCell, -1, leaderGroup, leaderRoom.Source);
+                    Debug.LogError($"[MAZE-SPAWNER] leader source={leaderRoom.Source} group={leaderGroupKey} cell=({bestCell.GridX},{bestCell.GridY}) tile='{bestCell.TileType}'");
+                    if (!TileEncounterPlaceholders.TryGetValue(bestCell.TileType, out var leaderMarkers) || leaderMarkers.Count == 0)
+                        leaderMarkers = new List<EncounterMarker> { new(200f, 200f, 0f, source: "fallback tile center; package placeholder missing") };
+
                     int leaderMobs = 0;
-                    foreach (var unit in leaderGroup)
+                    var leaderOccupied = new List<Vector2>();
+                    var expandedLeaderGroup = ExpandEncounterGroup(leaderGroup, StableSpotSeed(leaderGroupKey));
+                    int packCount = expandedLeaderGroup.Count;
+                    for (int packIndex = 0; packIndex < packCount; packIndex++)
                     {
-                        for (int i = 0; i < unit.Count; i++)
+                        var unit = expandedLeaderGroup[packIndex];
                         {
                             int slot = leaderMobs++;
                             int markerIndex = Math.Min(slot, leaderMarkers.Count - 1);
                             EncounterMarker marker = leaderMarkers[markerIndex];
 
-                            Vector3 spawnPoint = ResolveEncounterSpawnPoint(bestCell, marker, slot, leaderSlots, out bool groundApplied, out string groundSource);
+                            Vector3 spawnPoint = ResolveEncounterSpawnPoint(bestCell, marker, out bool groundApplied, out string groundSource);
+                            var leaderScattered = ResolveEncounterAreaSpot(mazePathMap, spawnPoint.x, spawnPoint.y, packIndex, packCount, marker.SizeX, marker.SizeY, leaderOccupied);
+                            float lsx = leaderScattered.found ? leaderScattered.x : spawnPoint.x;
+                            float lsy = leaderScattered.found ? leaderScattered.y : spawnPoint.y;
+                            leaderOccupied.Add(new Vector2(lsx, lsy));
                             spawns.Add(new DatabaseLoader.DungeonSpawnData
                             {
                                 zoneName = baseZone,
                                 gcType = unit.GcType,
                                 spawnGcTypeOverride = unit.SpawnGcTypeOverride,
-                                posX = spawnPoint.x,
-                                posY = spawnPoint.y,
-                                posZ = spawnPoint.z,
+                                posX = lsx,
+                                posY = lsy,
+                                posZ = mazePathMap?.GetHeightAt(lsx, lsy, spawnPoint.z) ?? spawnPoint.z,
                                 heading = NormalizeHeading(marker.Heading),
                                 encounterGroupKey = leaderGroupKey,
                                 encounterDifficulty = unit.Difficulty,
@@ -1770,7 +1800,7 @@ namespace DungeonRunners.Managers
                                 placeholderIndex = markerIndex,
                                 placeholderSizeX = marker.SizeX,
                                 placeholderSizeY = marker.SizeY,
-                                encounterChoiceIndex = leaderChoiceIndex,
+                                encounterChoiceIndex = choiceIndex,
                                 snapApplied = groundApplied
                             });
                             totalLeaders++;
@@ -1781,9 +1811,9 @@ namespace DungeonRunners.Managers
 
             snapshot.Cells = new List<MazeGenerator.MazeCell>(cells);
             snapshot.RoomNodes = new List<MazeGenerator.PlacedRoomNode>(maze.PlacedRoomNodes);
-            ResolveSnapshotAnchors(snapshot, level, baseZone, cells);
-            Debug.LogError($"[MazeSpawner] ✅ TOTAL: {spawns.Count} mobs ({totalRegular} regular + {totalLeaders} leaders) for {baseZone}");
-            Debug.LogError($"[DUNGEON-SNAPSHOT] zone={baseZone} layoutSeed=0x{snapshot.LayoutSeed:X8} roomSeed=0x{snapshot.RoomSeed:X8} cells={snapshot.Cells.Count} roomNodes={snapshot.RoomNodes.Count} spawns={snapshot.Spawns.Count} entry=({snapshot.EntryGridX},{snapshot.EntryGridY}) entryTile='{snapshot.EntryTileType}' player=({snapshot.PlayerSpawn.x:F1},{snapshot.PlayerSpawn.y:F1},{snapshot.PlayerSpawn.z:F1}) entryPortal=({snapshot.EntryPortalSpawn.x:F1},{snapshot.EntryPortalSpawn.y:F1},{snapshot.EntryPortalSpawn.z:F1}) exit=({snapshot.ExitGridX},{snapshot.ExitGridY}) exitTile='{snapshot.ExitTileType}' exitPortal=({snapshot.ExitPortalSpawn.x:F1},{snapshot.ExitPortalSpawn.y:F1},{snapshot.ExitPortalSpawn.z:F1}) yTransform=worldGridY=gridY/native-BuildWorld");
+            ResolveSnapshotAnchors(snapshot, level, mazePathMap, cells);
+            Debug.LogError($"[MAZE-SPAWNER] total={spawns.Count} regular={totalRegular} leaders={totalLeaders} zone={baseZone}");
+            Debug.LogError($"[DUNGEON-SNAPSHOT] zone={baseZone} layoutSeed=0x{snapshot.LayoutSeed:X8} roomSeed=0x{snapshot.RoomSeed:X8} cells={snapshot.Cells.Count} roomNodes={snapshot.RoomNodes.Count} spawns={snapshot.Spawns.Count} entry=({snapshot.EntryGridX},{snapshot.EntryGridY}) entryTile='{snapshot.EntryTileType}' player=({snapshot.PlayerSpawn.x:F1},{snapshot.PlayerSpawn.y:F1},{snapshot.PlayerSpawn.z:F1}) entryPortal=({snapshot.EntryPortalSpawn.x:F1},{snapshot.EntryPortalSpawn.y:F1},{snapshot.EntryPortalSpawn.z:F1}) exit=({snapshot.ExitGridX},{snapshot.ExitGridY}) exitTile='{snapshot.ExitTileType}' exitPortal=({snapshot.ExitPortalSpawn.x:F1},{snapshot.ExitPortalSpawn.y:F1},{snapshot.ExitPortalSpawn.z:F1}) yTransform=worldGridY=gridY/BuildWorld");
             return snapshot;
         }
     }

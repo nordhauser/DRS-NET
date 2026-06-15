@@ -7,29 +7,15 @@ using DungeonRunners.Engine;
 
 namespace DungeonRunners.Data
 {
-    // ═══════════════════════════════════════════════════════════════
-    // GC DATABASE
-    // Loads all .gc files, resolves inheritance, provides lookups.
-    // This is the server's source of truth — same data the client reads.
-    //
-    // Usage:
-    //   GCDatabase.Instance.Load("path/to/gc/files");
-    //   float wpnDmgPerLevel = GCDatabase.Instance.GlobalKnobs.GetFloat("WeaponDamagePerLevel");
-    //   GCNode mob = GCDatabase.Instance.Resolve("creatures.forestCreatures.Warg.Basic.Pup");
-    // ═══════════════════════════════════════════════════════════════
-
     public class GCDatabase
     {
         private static GCDatabase _instance;
         public static GCDatabase Instance => _instance ??= new GCDatabase();
 
-        // All parsed top-level nodes, keyed by filename (== GC object name)
         private Dictionary<string, GCNode> _nodes = new Dictionary<string, GCNode>(StringComparer.OrdinalIgnoreCase);
 
-        // Full path registry: "Basic.Pup" → GCNode, "melee01.rank1" → GCNode, etc.
         private Dictionary<string, GCNode> _pathRegistry = new Dictionary<string, GCNode>(StringComparer.OrdinalIgnoreCase);
 
-        // Resolved (flattened) nodes cache — inheritance applied
         private Dictionary<string, GCNode> _resolvedCache = new Dictionary<string, GCNode>(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, List<(int levelF32, int valueF32)>> _curveCache = new Dictionary<string, List<(int, int)>>(StringComparer.OrdinalIgnoreCase);
 
@@ -39,7 +25,6 @@ namespace DungeonRunners.Data
             { "creatures.whiskers.blademaster.Basic.Grunt", "Whisker_BlademasterBase_Grunt" }
         };
 
-        // ── Quick Access ──
 
         public GCNode GlobalKnobs => GetNode("GlobalKnobs");
         public GCNode Tables => GetNode("Tables");
@@ -51,16 +36,13 @@ namespace DungeonRunners.Data
         public int NodeCount => _pathRegistry.Count;
         public IEnumerable<string> RegisteredPaths => _pathRegistry.Keys.ToArray();
 
-        // ═══════════════════════════════════════════════════════════════
-        // LOADING
-        // ═══════════════════════════════════════════════════════════════
 
         public void Load(string directoryPath)
         {
             IsLoaded = false;
             if (!Directory.Exists(directoryPath))
             {
-                Debug.LogError($"[GCDatabase] Directory not found: {directoryPath}");
+                Debug.LogError($"[GC-DATABASE] directoryNotFound path='{directoryPath}'");
                 throw new DirectoryNotFoundException(directoryPath);
             }
 
@@ -82,7 +64,7 @@ namespace DungeonRunners.Data
             {
                 try
                 {
-                    GCNode node = GCParser.ParseFile(file);
+                    GCNode node = GcParser.ParseFile(file);
                     if (node != null && !string.IsNullOrEmpty(node.Name))
                     {
                         string fileName = Path.GetFileNameWithoutExtension(file);
@@ -92,14 +74,14 @@ namespace DungeonRunners.Data
                 catch (Exception ex)
                 {
                     parseErrors++;
-                    if (parseErrors <= 10) // Only log first 10
-                        Debug.LogError($"[GCDatabase] Parse error in {Path.GetFileName(file)}: {ex.Message}");
+                    if (parseErrors <= 10)
+                        Debug.LogError($"[GC-DATABASE] parseError file='{Path.GetFileName(file)}' message='{ex.Message}'");
                 }
             }
 
             try
             {
-                var packageCatalog = NativePackageCatalog.Instance;
+                var packageCatalog = PackageCatalog.Instance;
                 if (!packageCatalog.IsLoaded)
                     packageCatalog.LoadFromAssets();
                 if (packageCatalog.IsLoaded)
@@ -110,7 +92,7 @@ namespace DungeonRunners.Data
                             continue;
                         try
                         {
-                            GCNode node = GCParser.Parse(doc.Text, doc.Stem);
+                            GCNode node = GcParser.Parse(doc.Text, doc.Stem);
                             if (node == null || string.IsNullOrEmpty(node.Name))
                                 continue;
                             RegisterParsedNode(node, ResolveRegistryName(node, doc.Stem), doc.GcPath, false);
@@ -120,29 +102,29 @@ namespace DungeonRunners.Data
                         {
                             parseErrors++;
                             if (parseErrors <= 10)
-                                Debug.LogError($"[GCDatabase] Package parse error in {doc.Name}: {ex.Message}");
+                                Debug.LogError($"[GC-DATABASE] packageParseError doc='{doc.Name}' message='{ex.Message}'");
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[GCDatabase] Package-backed GC load failed: {ex.Message}");
+                Debug.LogError($"[GC-DATABASE] packageLoadFailed message='{ex.Message}'");
             }
             FileCount = FlatFileCount + PackageFileCount;
 
-            Debug.LogError($"[GCDatabase] ═══════════════════════════════════════════════════");
-            Debug.LogError($"[GCDatabase] Loaded {FileCount} files (flat={FlatFileCount}, packageGc={PackageFileCount}), {_pathRegistry.Count} paths registered");
+            Debug.LogError($"[GC-DATABASE] loadSummary phase=start");
+            Debug.LogError($"[GC-DATABASE] files={FileCount} flat={FlatFileCount} packageGc={PackageFileCount} paths={_pathRegistry.Count}");
             if (parseErrors > 0)
             {
-                Debug.LogError($"[GCDatabase] {parseErrors} parse errors");
-                throw new InvalidDataException($"GCDatabase parse errors: {parseErrors}");
+                Debug.LogError($"[GC-DATABASE] parseErrors={parseErrors}");
+                throw new InvalidDataException($"GC-DATABASE parseErrors={parseErrors}");
             }
 
             if (GlobalKnobs == null)
                 throw new InvalidDataException("GlobalKnobs.gc not found");
             else
-                Debug.LogError($"[GCDatabase] GlobalKnobs: WeaponDamagePerLevel={GlobalKnobs.GetFloat("WeaponDamagePerLevel")}, MeleeDamagePerStrength={GlobalKnobs.GetFloat("MeleeDamagePerStrength")}");
+                Debug.LogError($"[GC-DATABASE] globalKnobs weaponDamagePerLevel={GlobalKnobs.GetFloat("WeaponDamagePerLevel")} meleeDamagePerStrength={GlobalKnobs.GetFloat("MeleeDamagePerStrength")}");
 
             if (Tables == null)
                 throw new InvalidDataException("Tables.gc not found");
@@ -163,7 +145,7 @@ namespace DungeonRunners.Data
             }
 
             IsLoaded = true;
-            Debug.LogError($"[GCDatabase] ═══════════════════════════════════════════════════");
+            Debug.LogError($"[GC-DATABASE] loadSummary phase=end");
         }
 
         private static string ResolveRegistryName(GCNode node, string fallbackName)
@@ -212,19 +194,15 @@ namespace DungeonRunners.Data
 
         private void RegisterChildren(string parentPath, GCNode parent, bool overwriteExisting)
         {
-            foreach (var kvp in parent.Children)
+            foreach (var childEntry in parent.Children)
             {
-                string childPath = parentPath + "." + kvp.Key;
-                RegisterPath(childPath, kvp.Value, overwriteExisting);
-                RegisterChildren(childPath, kvp.Value, overwriteExisting);
+                string childPath = parentPath + "." + childEntry.Key;
+                RegisterPath(childPath, childEntry.Value, overwriteExisting);
+                RegisterChildren(childPath, childEntry.Value, overwriteExisting);
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // LOOKUP
-        // ═══════════════════════════════════════════════════════════════
 
-        /// <summary>Get a raw (unresolved) node by name or path.</summary>
         public GCNode GetNode(string nameOrPath)
         {
             if (_pathRegistry.TryGetValue(nameOrPath, out GCNode node))
@@ -232,22 +210,16 @@ namespace DungeonRunners.Data
             return null;
         }
 
-        /// <summary>
-        /// Resolve a dotted GC path like "creatures.forestCreatures.Warg.Basic.Pup".
-        /// Tries: exact path match → last segment match → partial path match.
-        /// </summary>
         public GCNode Resolve(string path)
         {
             if (string.IsNullOrEmpty(path)) return null;
 
-            // 1. Exact match in path registry
             if (_pathRegistry.TryGetValue(path, out GCNode exact))
                 return exact;
 
             if (_pathAliases.TryGetValue(path, out string alias) && _pathRegistry.TryGetValue(alias, out GCNode aliased))
                 return aliased;
 
-            // 2. Last segment match (e.g. "creatures.base.UnitMelee" → "UnitMelee")
             string lastSegment = path;
             int lastDot = path.LastIndexOf('.');
             if (lastDot >= 0)
@@ -256,7 +228,6 @@ namespace DungeonRunners.Data
             if (_pathRegistry.TryGetValue(lastSegment, out GCNode byLast))
                 return byLast;
 
-            // 3. Try matching last two segments (e.g. "Basic.Pup")
             if (lastDot > 0)
             {
                 int prevDot = path.LastIndexOf('.', lastDot - 1);
@@ -303,10 +274,6 @@ namespace DungeonRunners.Data
             return null;
         }
 
-        /// <summary>
-        /// Get a fully resolved node with inherited properties applied.
-        /// Walks the extends chain and merges properties.
-        /// </summary>
         public GCNode ResolveWithInheritance(string path)
         {
             if (_resolvedCache.TryGetValue(path, out GCNode cached))
@@ -322,24 +289,19 @@ namespace DungeonRunners.Data
 
         private GCNode FlattenInheritance(GCNode node, HashSet<string> visited)
         {
-            // Prevent infinite loops
             string key = node.Name + "|" + (node.Extends ?? "");
             if (visited.Contains(key)) return node;
             visited.Add(key);
 
-            // If no parent, return as-is
             if (string.IsNullOrEmpty(node.Extends))
                 return node;
 
-            // Find parent
             GCNode parent = Resolve(node.Extends);
             if (parent == null)
                 return node;
 
-            // Recursively resolve parent first
             GCNode resolvedParent = FlattenInheritance(parent, visited);
 
-            // Merge: child overrides parent
             var merged = new GCNode
             {
                 Name = node.Name,
@@ -349,35 +311,30 @@ namespace DungeonRunners.Data
                 SourceFile = node.SourceFile
             };
 
-            // Start with parent properties
-            foreach (var kvp in resolvedParent.Properties)
-                merged.Properties[kvp.Key] = kvp.Value;
-            // Override with child properties
-            foreach (var kvp in node.Properties)
-                merged.Properties[kvp.Key] = kvp.Value;
+            foreach (var propertyEntry in resolvedParent.Properties)
+                merged.Properties[propertyEntry.Key] = propertyEntry.Value;
+            foreach (var propertyEntry in node.Properties)
+                merged.Properties[propertyEntry.Key] = propertyEntry.Value;
 
-            // Merge children: parent children first, child overrides
-            foreach (var kvp in resolvedParent.Children)
-                merged.Children[kvp.Key] = kvp.Value;
+            foreach (var childEntry in resolvedParent.Children)
+                merged.Children[childEntry.Key] = childEntry.Value;
             foreach (string childName in resolvedParent.ChildOrder)
                 if (!merged.ChildOrder.Contains(childName))
                     merged.ChildOrder.Add(childName);
-            foreach (var kvp in node.Children)
+            foreach (var childEntry in node.Children)
             {
-                if (merged.Children.ContainsKey(kvp.Key))
+                if (merged.Children.ContainsKey(childEntry.Key))
                 {
-                    // Deep merge child block — child properties override parent's child
-                    merged.Children[kvp.Key] = MergeNodes(merged.Children[kvp.Key], kvp.Value);
+                    merged.Children[childEntry.Key] = MergeNodes(merged.Children[childEntry.Key], childEntry.Value);
                 }
                 else
                 {
-                    merged.Children[kvp.Key] = kvp.Value;
+                    merged.Children[childEntry.Key] = childEntry.Value;
                 }
-                if (!merged.ChildOrder.Contains(kvp.Key))
-                    merged.ChildOrder.Add(kvp.Key);
+                if (!merged.ChildOrder.Contains(childEntry.Key))
+                    merged.ChildOrder.Add(childEntry.Key);
             }
 
-            // Anonymous children: concatenate
             merged.AnonymousChildren.AddRange(resolvedParent.AnonymousChildren);
             merged.AnonymousChildren.AddRange(node.AnonymousChildren);
 
@@ -395,21 +352,21 @@ namespace DungeonRunners.Data
                 SourceFile = child.SourceFile
             };
 
-            foreach (var kvp in parent.Properties) merged.Properties[kvp.Key] = kvp.Value;
-            foreach (var kvp in child.Properties) merged.Properties[kvp.Key] = kvp.Value;
+            foreach (var propertyEntry in parent.Properties) merged.Properties[propertyEntry.Key] = propertyEntry.Value;
+            foreach (var propertyEntry in child.Properties) merged.Properties[propertyEntry.Key] = propertyEntry.Value;
 
-            foreach (var kvp in parent.Children) merged.Children[kvp.Key] = kvp.Value;
+            foreach (var childEntry in parent.Children) merged.Children[childEntry.Key] = childEntry.Value;
             foreach (string childName in parent.ChildOrder)
                 if (!merged.ChildOrder.Contains(childName))
                     merged.ChildOrder.Add(childName);
-            foreach (var kvp in child.Children)
+            foreach (var childEntry in child.Children)
             {
-                if (merged.Children.ContainsKey(kvp.Key))
-                    merged.Children[kvp.Key] = MergeNodes(merged.Children[kvp.Key], kvp.Value);
+                if (merged.Children.ContainsKey(childEntry.Key))
+                    merged.Children[childEntry.Key] = MergeNodes(merged.Children[childEntry.Key], childEntry.Value);
                 else
-                    merged.Children[kvp.Key] = kvp.Value;
-                if (!merged.ChildOrder.Contains(kvp.Key))
-                    merged.ChildOrder.Add(kvp.Key);
+                    merged.Children[childEntry.Key] = childEntry.Value;
+                if (!merged.ChildOrder.Contains(childEntry.Key))
+                    merged.ChildOrder.Add(childEntry.Key);
             }
 
             merged.AnonymousChildren.AddRange(parent.AnonymousChildren);
@@ -418,9 +375,6 @@ namespace DungeonRunners.Data
             return merged;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // CONVENIENCE: GlobalKnobs typed accessors
-        // ═══════════════════════════════════════════════════════════════
 
         public float GetKnob(string name, float fallback = 0f)
         {
@@ -432,9 +386,6 @@ namespace DungeonRunners.Data
             return GlobalKnobs?.GetInt(name, fallback) ?? fallback;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // CONVENIENCE: XP Curve from Tables.gc
-        // ═══════════════════════════════════════════════════════════════
 
         private List<(int level, float value)> _xpCurve;
 
@@ -460,29 +411,25 @@ namespace DungeonRunners.Data
             _xpCurve.Sort((a, b) => a.level.CompareTo(b.level));
             if (_xpCurve.Count == 0)
                 throw new InvalidDataException("Tables.Experience has no entries");
-            Debug.LogError($"[GCDatabase] XP Curve loaded: {_xpCurve.Count} entries");
+            Debug.LogError($"[GC-DATABASE] xpCurve entries={_xpCurve.Count}");
             foreach (var e in _xpCurve)
-                Debug.LogError($"[GCDatabase]   Level {e.level}: {e.value} kills");
+                Debug.LogError($"[GC-DATABASE] xpCurve level={e.level} kills={e.value}");
 
             return _xpCurve;
         }
 
-        /// <summary>
-        /// Interpolate XP curve for a given target level — same as client CurveTable logic.
-        /// Returns number of same-level kills needed (before ExperienceMod).
-        /// </summary>
         public float InterpolateXPCurve(int targetLevel)
         {
             var curve = GetXPCurve();
             if (curve.Count == 0) throw new InvalidDataException("Tables.Experience has no entries");
 
-            for (int i = 0; i < curve.Count; i++)
+            for (int curveIndex = 0; curveIndex < curve.Count; curveIndex++)
             {
-                if (targetLevel <= curve[i].level)
+                if (targetLevel <= curve[curveIndex].level)
                 {
-                    if (i == 0) return curve[i].value;
-                    float t = (float)(targetLevel - curve[i - 1].level) / (curve[i].level - curve[i - 1].level);
-                    return curve[i - 1].value + t * (curve[i].value - curve[i - 1].value);
+                    if (curveIndex == 0) return curve[curveIndex].value;
+                    float t = (float)(targetLevel - curve[curveIndex - 1].level) / (curve[curveIndex].level - curve[curveIndex - 1].level);
+                    return curve[curveIndex - 1].value + t * (curve[curveIndex].value - curve[curveIndex - 1].value);
                 }
             }
             return curve[curve.Count - 1].value;
@@ -516,10 +463,10 @@ namespace DungeonRunners.Data
             int last = curve.Count - 1;
             if (levelF32 >= curve[last].levelF32) return curve[last].valueF32;
 
-            for (int i = 0; i < last; i++)
+            for (int curveIndex = 0; curveIndex < last; curveIndex++)
             {
-                var lo = curve[i];
-                var hi = curve[i + 1];
+                var lo = curve[curveIndex];
+                var hi = curve[curveIndex + 1];
                 if (levelF32 > hi.levelF32) continue;
                 if (hi.levelF32 == lo.levelF32) return hi.valueF32;
 
@@ -563,14 +510,7 @@ namespace DungeonRunners.Data
             return (int)(value * 256f);
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // CONVENIENCE: Weapon properties
-        // ═══════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Get weapon Description properties from a resolved weapon node.
-        /// Walks inheritance to find Damage, DamageVolatility, Range, CoolDown, WeaponClass.
-        /// </summary>
         public (float damage, float volatility, float range, float cooldown, string weaponClass, float weaponSpeed,
                 string damageType, string weaponCategory, bool useProjectile, float projectileSpeed, float projectileSize, int burstCount)
             GetWeaponStats(string weaponGCPath)
@@ -580,13 +520,13 @@ namespace DungeonRunners.Data
                 return (0f, 0f, 0f, 0f, "", 0f, "", "", false, 0f, 0f, 1);
 
             var desc = node.GetChild("Description");
-            if (desc == null) desc = node; // Some files put props at top level
+            if (desc == null) desc = node;
 
             return (
                 damage: desc.GetFloat("Damage", 1.0f),
                 volatility: desc.GetFloat("DamageVolatility", 0.25f),
                 range: desc.GetFloat("Range", 0f),
-                cooldown: desc.GetFloat("CoolDown", 0f),
+                cooldown: desc.GetFloat("CoolDown", 1.75f),
                 weaponClass: desc.GetString("WeaponClass", "HTH"),
                 weaponSpeed: desc.GetFloat("WeaponSpeed", 0f),
                 damageType: desc.GetString("DamageType", "CRUSHING"),
@@ -608,27 +548,15 @@ namespace DungeonRunners.Data
             return desc.GetFloat("DefenseRating", 0f);
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // CONVENIENCE: Creature stats (with inheritance)
-        // ═══════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Get creature Description properties from a resolved creature node.
-        /// Walks inheritance for AttackRating, DamageMod, DefenseRating, MaxHealth, etc.
-        /// </summary>
         public GCNode GetCreatureStats(string creatureGCPath)
         {
             var node = ResolveWithInheritance(creatureGCPath);
             if (node == null) return null;
 
-            // Creature stats live in Description child
             return node.GetChild("Description") ?? node;
         }
 
-        /// <summary>
-        /// Get creature weapon/manipulator properties (Damage, Range, CoolDown, etc.)
-        /// from the Manipulators.PrimaryWeapon.Description block.
-        /// </summary>
         public GCNode GetCreatureWeaponStats(string creatureGCPath)
         {
             var node = ResolveWithInheritance(creatureGCPath);
@@ -643,16 +571,13 @@ namespace DungeonRunners.Data
             return weapon.GetChild("Description") ?? weapon;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // DEBUG: Dump a node tree
-        // ═══════════════════════════════════════════════════════════════
 
         public void DumpNode(string path, int maxDepth = 3)
         {
             var node = Resolve(path);
             if (node == null)
             {
-                Debug.LogError($"[GCDatabase] DumpNode: '{path}' not found");
+                Debug.LogError($"[GC-DATABASE] dumpNode path='{path}' state=missing");
                 return;
             }
             DumpNodeRecursive(node, 0, maxDepth);
@@ -664,10 +589,10 @@ namespace DungeonRunners.Data
             string indent = new string(' ', depth * 2);
 
             Debug.LogError($"{indent}[{node.Name}] extends={node.Extends ?? "none"} src={node.SourceFile}");
-            foreach (var kvp in node.Properties)
-                Debug.LogError($"{indent}  {kvp.Key} = {kvp.Value}");
-            foreach (var kvp in node.Children)
-                DumpNodeRecursive(kvp.Value, depth + 1, maxDepth);
+            foreach (var propertyEntry in node.Properties)
+                Debug.LogError($"{indent}  {propertyEntry.Key} = {propertyEntry.Value}");
+            foreach (var childEntry in node.Children)
+                DumpNodeRecursive(childEntry.Value, depth + 1, maxDepth);
             foreach (var anon in node.AnonymousChildren)
                 DumpNodeRecursive(anon, depth + 1, maxDepth);
         }

@@ -4,36 +4,9 @@ using System.Text;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Parses Dungeon Runners <c>.cobj</c> collision files. Each <c>.cobj</c> stores one
-    /// <c>HybridCollisionObject</c>: a two-layer grid encoding used for static world geometry
-    /// (walls, props, floor segments). The format was reversed from
-    /// <c>dfc::HybridCollisionObject::readObject</c> at <c>0x004e4560</c> in
-    /// <c>DungeonRunners.exe</c> on 2026-05-27.
-    ///
-    /// File layout (little-endian):
-    /// <code>
-    ///   uint8  tag = 0x05
-    ///   char   className[21] = "HybridCollisionObject"
-    ///   uint8  terminator = 0x00
-    ///   uint32 dfcHash                            // ignored by us
-    ///   // Sub-shape 1: heightmap (one uint16 per cell)
-    ///   int32  cellSize1
-    ///   int32  originX1, originY1
-    ///   int32  width1, height1
-    ///   uint16 heightmap[width1 * height1]
-    ///   // Sub-shape 2: per-cell vertical bbox stacks (bridges, stairs, archways)
-    ///   int32  cellSize2
-    ///   int32  originX2, originY2, originZ2
-    ///   int32  width2, height2, depth2
-    ///   // For each of (width2 * height2) cells:
-    ///   //   uint16 bboxCount
-    ///   //   struct { int16 zLow; int16 zHigh; } bboxes[bboxCount]
-    /// </code>
-    /// </summary>
     public static class CobjParser
     {
-        public const int HeaderSize = 27; // 1 tag + 21 className + 1 terminator + 4 hash
+        public const int HeaderSize = 27;
         public const string ExpectedClassName = "HybridCollisionObject";
 
         public static CobjData Parse(byte[] bytes)
@@ -44,9 +17,6 @@ namespace DungeonRunners.Utilities
 
             var reader = new LEReader(bytes);
 
-            // Tag byte varies per-file (0x01 or 0x05 observed in samples). It's a DFC stream
-            // protocol marker, not a class identifier — the class name + body layout are
-            // identical regardless. We read but don't validate.
             byte tag = reader.ReadByte();
 
             byte[] nameBytes = reader.ReadBytes(ExpectedClassName.Length);
@@ -70,9 +40,9 @@ namespace DungeonRunners.Utilities
 
             int cellCount1 = width1 * height1;
             ushort[] heightmap = new ushort[cellCount1];
-            for (int i = 0; i < cellCount1; i++)
+            for (int cellIndex = 0; cellIndex < cellCount1; cellIndex++)
             {
-                heightmap[i] = reader.ReadUInt16();
+                heightmap[cellIndex] = reader.ReadUInt16();
             }
 
             int cellSize2 = reader.ReadInt32();
@@ -87,17 +57,17 @@ namespace DungeonRunners.Utilities
 
             int cellCount2 = width2 * height2;
             CobjBBoxCell[] cells = new CobjBBoxCell[cellCount2];
-            for (int i = 0; i < cellCount2; i++)
+            for (int cellIndex = 0; cellIndex < cellCount2; cellIndex++)
             {
                 ushort count = reader.ReadUInt16();
                 var bboxes = new CobjBBox[count];
-                for (int j = 0; j < count; j++)
+                for (int boxIndex = 0; boxIndex < count; boxIndex++)
                 {
                     short zLow = (short)reader.ReadUInt16();
                     short zHigh = (short)reader.ReadUInt16();
-                    bboxes[j] = new CobjBBox(zLow, zHigh);
+                    bboxes[boxIndex] = new CobjBBox(zLow, zHigh);
                 }
-                cells[i] = new CobjBBoxCell(bboxes);
+                cells[cellIndex] = new CobjBBoxCell(bboxes);
             }
 
             return new CobjData(
@@ -126,7 +96,7 @@ namespace DungeonRunners.Utilities
 
     public sealed class CobjData
     {
-        public uint DfcHash { get; }
+        public uint DFCHash { get; }
 
         public int CellSize1 { get; }
         public int OriginX1 { get; }
@@ -152,7 +122,7 @@ namespace DungeonRunners.Utilities
             int cellSize2, int originX2, int originY2, int originZ2, int width2, int height2, int depth2,
             CobjBBoxCell[] cells, int bytesConsumed)
         {
-            DfcHash = dfcHash;
+            DFCHash = dfcHash;
             CellSize1 = cellSize1;
             OriginX1 = originX1;
             OriginY1 = originY1;

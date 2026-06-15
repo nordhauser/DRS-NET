@@ -1,4 +1,4 @@
-﻿using DungeonRunners.Combat;
+using DungeonRunners.Combat;
 using DungeonRunners.Data;
 using DungeonRunners.Core;
 using DungeonRunners.Engine;
@@ -13,8 +13,6 @@ namespace DungeonRunners.Networking
         public float PositionY { get; set; } = 100f;
         public GCObject ActiveItem { get; set; }
 
-        // Weapon fields are authored/equipment resolved. Defaults stay unresolved so
-        // bootstrap gaps cannot masquerade as a native starter weapon.
         public float WeaponDamage { get; set; } = 0f;
         public float WeaponDamageVolatility { get; set; } = 0f;
         public int WeaponLevel { get; set; } = 0;
@@ -22,12 +20,12 @@ namespace DungeonRunners.Networking
         public string WeaponDamageType { get; set; } = "";
         public string WeaponCategory { get; set; } = "";
         public bool WeaponStatsResolved { get; set; } = false;
-        public int NativeWeaponClassId { get; set; } = 0;
-        public int NativeDamageTypeId { get; set; } = -1;
-        public int NativeWeaponDamageLevel { get; set; } = 0;
-        public int NativeWeaponBaseDamage { get; set; } = 0;
-        public bool NativeWeaponBaseDamageTracksPlayerLevel { get; set; } = false;
-        public string NativeWeaponBaseDamageSource { get; set; } = "unresolved";
+        public int WeaponClassId { get; set; } = 0;
+        public int DamageTypeId { get; set; } = -1;
+        public int WeaponDamageLevel { get; set; } = 0;
+        public int WeaponBaseDamage { get; set; } = 0;
+        public bool WeaponBaseDamageTracksPlayerLevel { get; set; } = false;
+        public string WeaponBaseDamageSource { get; set; } = "unresolved";
         public int WeaponRange { get; set; } = 0;
         public float WeaponCooldown { get; set; } = 0f;
         public float WeaponSpeed { get; set; } = 0f;
@@ -43,10 +41,9 @@ namespace DungeonRunners.Networking
         public float DamageTakenMod { get; set; } = 100f;
         public int ArmorDefenseRating { get; set; } = 0;
 
-        // Base stats from FighterBase/RangerBase/MageBase.gc — all start at 10
         public int Strength { get; set; } = 10;
         public int Agility { get; set; } = 10;
-        public int Intelligence { get; set; } = 10;  // ADD THIS LINE
+        public int Intelligence { get; set; } = 10;
         public int Toughness { get; set; } = 10;
         public int Power { get; set; } = 10;
         private const int BASE_STAT_VALUE = 10;
@@ -62,8 +59,6 @@ namespace DungeonRunners.Networking
         public uint Experience { get; set; } = 0;
         public uint Gold { get; set; } = 0;
 
-        // Tables.gc Experience CurveTable — "Value = # of 1.0 monsters at your level required for next level"
-        // These are the keyframes, we interpolate between them
         private static readonly (int level, float value)[] XPCurve = new[]
         {
             (2, 10f),
@@ -78,36 +73,27 @@ namespace DungeonRunners.Networking
             int targetLevel = _level + 1;
             if (targetLevel > GCDatabase.Instance.GetKnobInt("MaxLevel", 100)) return uint.MaxValue;
 
-            // Linear interpolation on CurveTable, same as client
             float kills = 0;
-            for (int i = 0; i < XPCurve.Length; i++)
+            for (int curveIndex = 0; curveIndex < XPCurve.Length; curveIndex++)
             {
-                if (targetLevel <= XPCurve[i].level)
+                if (targetLevel <= XPCurve[curveIndex].level)
                 {
-                    if (i == 0)
+                    if (curveIndex == 0)
                     {
-                        kills = XPCurve[i].value;
+                        kills = XPCurve[curveIndex].value;
                     }
                     else
                     {
-                        float t = (float)(targetLevel - XPCurve[i - 1].level) / (XPCurve[i].level - XPCurve[i - 1].level);
-                        kills = XPCurve[i - 1].value + t * (XPCurve[i].value - XPCurve[i - 1].value);
+                        float t = (float)(targetLevel - XPCurve[curveIndex - 1].level) / (XPCurve[curveIndex].level - XPCurve[curveIndex - 1].level);
+                        kills = XPCurve[curveIndex - 1].value + t * (XPCurve[curveIndex].value - XPCurve[curveIndex - 1].value);
                     }
                     break;
                 }
             }
             if (kills == 0) kills = XPCurve[XPCurve.Length - 1].value;
 
-            // GlobalKnobs.ExperienceMod = 5.0
-            // Threshold IS the raw CurveTable value — ExperienceMod only applies to XP per kill
-            // Binary at 0x4FAF85: imul eax, eax, 0x64 — CurveTable × 100
             return (uint)(kills * 100.0f);
         }
-        // XP gained per kill — scales with monster level using same CurveTable
-        // Binary at 0x4F8409: CurveTable(monsterLevel) × 50
-        // Binary at 0x4F83AA: clamps monsterLevel to playerLevel, then divides
-        // Result: ratio always ≤ 1.0, CurveTable always returns base value
-        // Every kill within 5 levels = 500 XP. Mobs 5+ levels below = 0 XP.
         public static uint GetXPPerKill(int monsterLevel, int playerLevel)
         {
             if (monsterLevel <= playerLevel - 5)
@@ -115,77 +101,60 @@ namespace DungeonRunners.Networking
 
             int effectiveLevel = Math.Min(monsterLevel, playerLevel);
 
-            // Binary 0x42BFF0: Fixed32 divide
-            // (effectiveLevel << 8) shifted left 8 more, divided by (playerLevel << 8)
             long num = (long)(effectiveLevel << 8) << 8;
             int den = playerLevel << 8;
             int ratioF32 = (int)(num / den);
 
-            // Apply ratio to base 500 XP, convert from Fixed8.8
             uint xp = (uint)((ratioF32 * 500) >> 8);
             if (xp < 1) xp = 1;
             return xp;
         }
 
-        /// <summary>
-        /// Raw CurveTable lookup for XP packet to client.
-        /// Client's Hero::onAddExperience applies its own ExperienceMod scaling.
-        /// Returns the base value from Tables.Experience CurveTable at the given level.
-        /// </summary>
         public static uint GetBaseXPForLevel(int level)
         {
-            // Linear interpolation on CurveTable, same as GetXPThreshold but at arbitrary level
             float kills = 0;
-            for (int i = 0; i < XPCurve.Length; i++)
+            for (int curveIndex = 0; curveIndex < XPCurve.Length; curveIndex++)
             {
-                if (level <= XPCurve[i].level)
+                if (level <= XPCurve[curveIndex].level)
                 {
-                    if (i == 0)
-                        kills = XPCurve[i].value;
+                    if (curveIndex == 0)
+                        kills = XPCurve[curveIndex].value;
                     else
                     {
-                        float t = (float)(level - XPCurve[i - 1].level) / (XPCurve[i].level - XPCurve[i - 1].level);
-                        kills = XPCurve[i - 1].value + t * (XPCurve[i].value - XPCurve[i - 1].value);
+                        float t = (float)(level - XPCurve[curveIndex - 1].level) / (XPCurve[curveIndex].level - XPCurve[curveIndex - 1].level);
+                        kills = XPCurve[curveIndex - 1].value + t * (XPCurve[curveIndex].value - XPCurve[curveIndex - 1].value);
                     }
                     break;
                 }
             }
             if (kills == 0) kills = XPCurve[XPCurve.Length - 1].value;
-            // Return as Fixed32 8.8 (multiply by 256), then scale by ExperienceMod (5.0)
-            // Binary at 0x4F8409: CurveTable(level) × 50 — base XP per monster
             return (uint)(kills * 50);
         }
 
-        /// <summary>
-        /// Reproduces the client's exact Fixed-point XP threshold calculation.
-        /// Binary: HeroDesc::getRequiredExp @ 0x4FAF60: CurveTable::GetValue(level) >> 8, then * 100.
-        /// Matches native thresholds: L2=1000, L3=2500, L4=4500, L5=6500.
-        /// </summary>
         public static uint GetClientThreshold(int nextLevel)
         {
             const int MULTIPLIER = 100;
 
-            int target = nextLevel << 8; // Fixed8.8
+            int targetLevelFixed = nextLevel << 8;
 
-            for (int i = 0; i < XPCurve.Length; i++)
+            for (int curveIndex = 0; curveIndex < XPCurve.Length; curveIndex++)
             {
-                int lvFixed = (int)XPCurve[i].level << 8;
-                int valFixed = (int)XPCurve[i].value << 8;
+                int levelFixed = (int)XPCurve[curveIndex].level << 8;
+                int valueFixed = (int)XPCurve[curveIndex].value << 8;
 
-                if (target <= lvFixed)
+                if (targetLevelFixed <= levelFixed)
                 {
-                    if (i == 0)
-                        return (uint)((int)XPCurve[i].value * MULTIPLIER);
+                    if (curveIndex == 0)
+                        return (uint)((int)XPCurve[curveIndex].value * MULTIPLIER);
 
-                    int prevLv = (int)XPCurve[i - 1].level << 8;
-                    int prevVal = (int)XPCurve[i - 1].value << 8;
-                    int delta = valFixed - prevVal;
+                    int previousLevelFixed = (int)XPCurve[curveIndex - 1].level << 8;
+                    int previousValueFixed = (int)XPCurve[curveIndex - 1].value << 8;
+                    int delta = valueFixed - previousValueFixed;
 
-                    // Client uses Fixed16.16 precision for t
-                    int t = (int)((long)(target - prevLv) << 16) / (lvFixed - prevLv);
-                    int interp = prevVal + (int)((long)delta * t >> 16);
+                    int interpolationQ16 = (int)((long)(targetLevelFixed - previousLevelFixed) << 16) / (levelFixed - previousLevelFixed);
+                    int interpolatedValue = previousValueFixed + (int)((long)delta * interpolationQ16 >> 16);
 
-                    return (uint)((interp >> 8) * MULTIPLIER);
+                    return (uint)((interpolatedValue >> 8) * MULTIPLIER);
                 }
             }
             return (uint)((int)XPCurve[XPCurve.Length - 1].value * MULTIPLIER);
@@ -213,15 +182,14 @@ namespace DungeonRunners.Networking
                 _currentManaWire = MaxManaWire;
                 HasClientHP = true;
                 HasClientMana = true;
-                SetClientSyncHP(_currentHPWire);
-                Debug.LogError($"[LEVEL-UP-NATIVE] level={oldLevel}->{_level} hp={oldHPWire}->{_currentHPWire}/{oldMaxHPWire}->{MaxHPWire} mana={oldManaWire}->{_currentManaWire}/{oldMaxManaWire}->{MaxManaWire} native=Hero::onAddExperience full-hp-mana next={GetClientThreshold(_level + 1)}");
+                SetEntitySynchInfoHP(_currentHPWire);
+                Debug.LogError($"[LEVEL-UP-CLIENT] level={oldLevel}->{_level} hp={oldHPWire}->{_currentHPWire}/{oldMaxHPWire}->{MaxHPWire} mana={oldManaWire}->{_currentManaWire}/{oldMaxManaWire}->{MaxManaWire} sourceFunction=Hero::onAddExperience full-hp-mana next={GetClientThreshold(_level + 1)}");
                 didLevel = true;
                 needed = GetClientThreshold(_level + 1);
             }
             return didLevel;
         }
 
-        // heroHealthPerLevel: 16 * 256 = 4096 wire.
         private static uint HP_PER_LEVEL_WIRE => (uint)(GCDatabase.Instance.GetKnobInt("HeroHealthPerLevel", 16) * 256);
         private static int HP_PER_ENDURANCE => GCDatabase.Instance.GetKnobInt("HealthPerEndurance", 25);
 
@@ -230,34 +198,39 @@ namespace DungeonRunners.Networking
         private uint _equipmentHPBonusWire = 0;
         private uint _modifierHPBonusWire = 0;
         private int _passiveHPBonusWire = 0;
+        private int _passiveStrengthMod = 0;
+        private int _passiveAgilityMod = 0;
+        private int _passiveEnduranceMod = 0;
+        private int _passiveIntellectMod = 0;
         private uint _currentHPWire = 0;
-        private uint _clientSyncHPWire = 0;
-        private float _clientSyncHPTime = -1f;
-        private double _clientSyncHPCarry = 0d;
-        private float _clientSyncRegenSuppressUntil = -1f;
+        private uint _entitySynchInfoHPWire = 0;
+        private float _entitySynchInfoHPTime = -1f;
+        private double _entitySynchInfoHPCarry = 0d;
+        private bool _passiveMaxTransition = false;
+        private uint _passiveTransitionMaxWire = 0;
+        private float _clientRegenSuppressUntil = -1f;
         private bool _hasObservedClientHP = false;
         private uint _lastObservedClientHPWire = 0;
         private float _lastObservedClientHPTime = 0f;
         private string _lastObservedClientHPSource = null;
-        private const float NativeDamageRegenSuppressSeconds = 10f;
-        public const ushort NativeDamageRegenSuppressTicks = 300;
-        public const ushort NativeManaRegenSuppressTicks = 0x96;
+        private const float DamageRegenSuppressSeconds = 10f;
+        public const ushort DamageRegenSuppressTicks = 300;
+        public const ushort ManaRegenSuppressTicks = 0x96;
         private uint _baseManaWire = 0;
         private uint _equipmentManaBonusWire = 0;
         private int _passiveManaBonusWire = 0;
         private uint _currentManaWire = 0;
 
-        // All equipment stat bonuses (human-readable values, not wire format)
-        // Populated by CalculateEquipmentBonuses from ItemStatDatabase
         public Dictionary<string, int> EquipmentStats { get; private set; } = new Dictionary<string, int>();
 
         private int _regenFactor = 0;
+        private int _hitPointRegenBonusBase = -1;
         private ushort _regenCooldown = 0;
         private int _manaRegenFactor = 0;
         private ushort _manaRegenCooldown = 0;
-        private readonly List<NativeAttributeModifierRuntime> _nativeAttributeModifiers = new List<NativeAttributeModifierRuntime>();
+        private readonly List<AttributeModifierRuntime> _attributeModifiers = new List<AttributeModifierRuntime>();
 
-        private class NativeAttributeModifierRuntime
+        private class AttributeModifierRuntime
         {
             public string ModifierType;
             public string ModifierKey;
@@ -272,7 +245,7 @@ namespace DungeonRunners.Networking
             public bool RemoveOnDeath;
         }
 
-        public class NativeAttributeModifierRemoval
+        public class AttributeModifierRemoval
         {
             public string ModifierType;
             public string ModifierKey;
@@ -280,12 +253,12 @@ namespace DungeonRunners.Networking
             public string EffectPath;
             public string Source;
             public uint SourceEntityId;
-            public string Native;
+            public string SourceFunction;
         }
 
-        public event Action<PlayerState, NativeAttributeModifierRemoval> OnNativeAttributeModifierRemoved;
+        public event Action<PlayerState, AttributeModifierRemoval> OnAttributeModifierRemoved;
 
-        private static bool ShouldAcceptNativeModifierStack(string stackRule, uint incomingPowerLevel, uint incomingDurationTicks, uint existingPowerLevel, uint existingDurationTicks)
+        private static bool ShouldAcceptModifierStack(string stackRule, uint incomingPowerLevel, uint incomingDurationTicks, uint existingPowerLevel, uint existingDurationTicks)
         {
             if (string.IsNullOrWhiteSpace(stackRule))
                 return true;
@@ -305,20 +278,20 @@ namespace DungeonRunners.Networking
             return true;
         }
 
-        public bool ShouldAcceptNativeAttributeModifier(string modifierKey, string modifierType, string stackRule, uint powerLevel, ushort durationTicks)
+        public bool ShouldAcceptAttributeModifier(string modifierKey, string modifierType, string stackRule, uint powerLevel, ushort durationTicks)
         {
             string runtimeKey = !string.IsNullOrWhiteSpace(modifierKey) ? modifierKey : modifierType;
-            int existingIndex = _nativeAttributeModifiers.FindIndex(m =>
+            int existingIndex = _attributeModifiers.FindIndex(m =>
                 string.Equals(!string.IsNullOrWhiteSpace(m.ModifierKey) ? m.ModifierKey : m.ModifierType, runtimeKey, StringComparison.OrdinalIgnoreCase));
             if (existingIndex < 0)
                 return true;
-            var existing = _nativeAttributeModifiers[existingIndex];
-            return ShouldAcceptNativeModifierStack(stackRule, powerLevel, durationTicks, existing.PowerLevel, existing.RemainingTicks);
+            var existing = _attributeModifiers[existingIndex];
+            return ShouldAcceptModifierStack(stackRule, powerLevel, durationTicks, existing.PowerLevel, existing.RemainingTicks);
         }
 
         private uint CalculateBaseHP()
         {
-            return ClassPassiveData.CalculateNativeHPWire(_level, BASE_STAT_VALUE + Math.Max(0, _allocatedEndurance), 0);
+            return ClassPassiveData.CalculateHPWire(_level, BASE_STAT_VALUE + Math.Max(0, _allocatedEndurance), 0);
         }
 
         private static uint ClampWire(long wire)
@@ -328,42 +301,32 @@ namespace DungeonRunners.Networking
             return (uint)wire;
         }
 
-        public void SetCurrentMana(uint wireMana, string source = null, bool applyNativeCooldown = true)
+        public void SetCurrentMana(uint wireMana, string source = null, bool applyCooldown = true)
         {
             uint oldMana = _currentManaWire;
             _currentManaWire = Math.Min(wireMana, MaxManaWire);
             HasClientMana = true;
-            if (applyNativeCooldown && _currentManaWire < oldMana)
-                _manaRegenCooldown = NativeManaRegenSuppressTicks;
+            if (applyCooldown && _currentManaWire < oldMana)
+                _manaRegenCooldown = ManaRegenSuppressTicks;
             if (_currentManaWire != oldMana)
                 Debug.LogError($"[MANA] source={source ?? "SetCurrentMana"} mana={oldMana}->{_currentManaWire}/{MaxManaWire} cooldown={_manaRegenCooldown}");
         }
         private uint CalculateMaxMana()
         {
-            return ClassPassiveData.CalculateNativeManaWire(_level, BASE_STAT_VALUE + Math.Max(0, _allocatedIntellect), 0);
+            return ClassPassiveData.CalculateManaWire(_level, BASE_STAT_VALUE + Math.Max(0, _allocatedIntellect), 0);
         }
 
         public uint Op12HP => MaxHPWire;
         public uint Op12MaxHP => MaxHPWire;
-        public uint SynchHP
+        public uint EntitySynchInfoHP
         {
             get
             {
-                uint maxHP = MaxHPWire;
-                uint baseSync;
-                if (!HasClientSyncHP) baseSync = _currentHPWire;
-                else
-                {
-                    uint current = maxHP > 0 ? Math.Min(_currentHPWire, maxHP) : _currentHPWire;
-                    uint sync = maxHP > 0 ? Math.Min(_clientSyncHPWire, maxHP) : _clientSyncHPWire;
-                    baseSync = HasClientHP && current < sync ? current : sync;
-                }
-                if (_hasObservedClientHP)
-                {
-                    uint obs = maxHP > 0 ? Math.Min(_lastObservedClientHPWire, maxHP) : _lastObservedClientHPWire;
-                    if (obs < baseSync) return obs;
-                }
-                return baseSync;
+                uint maxHP = _passiveMaxTransition ? _passiveTransitionMaxWire : MaxHPWire;
+                if (!HasEntitySynchInfoHP) return _currentHPWire;
+                uint current = maxHP > 0 ? Math.Min(_currentHPWire, maxHP) : _currentHPWire;
+                uint entitySynchInfoHP = maxHP > 0 ? Math.Min(_entitySynchInfoHPWire, maxHP) : _entitySynchInfoHPWire;
+                return HasClientHP && current < entitySynchInfoHP ? current : entitySynchInfoHP;
             }
         }
 
@@ -379,15 +342,20 @@ namespace DungeonRunners.Networking
         public uint ModifierHPBonusWire => _modifierHPBonusWire;
         public int PassiveHPBonusWire => _passiveHPBonusWire;
         public int PassiveManaBonusWire => _passiveManaBonusWire;
+        public int AllocatedStrength => _allocatedStrength;
+        public int AllocatedAgility => _allocatedAgility;
         public int AllocatedEndurance => _allocatedEndurance;
         public int AllocatedIntellect => _allocatedIntellect;
+        public int ClientSpellStrength => Math.Max(1, BASE_STAT_VALUE + _allocatedStrength);
+        public int ClientSpellAgility => Math.Max(1, BASE_STAT_VALUE + _allocatedAgility);
+        public int ClientSpellIntellect => Math.Max(1, BASE_STAT_VALUE + _allocatedIntellect);
         public byte UpdateNumber = 0;
         public bool IsDamageImmune { get; set; } = false;
         public bool IsZoneSpawnDamageImmune { get; set; } = false;
         public bool HasAnyDamageImmunity => IsDamageImmune || IsZoneSpawnDamageImmune;
         public bool IsInvisible { get; set; } = false;
         public bool HasClientHP { get; private set; } = false;
-        public bool HasClientSyncHP { get; private set; } = false;
+        public bool HasEntitySynchInfoHP { get; private set; } = false;
         public bool HasClientMana { get; private set; } = false;
         public bool HasObservedClientHP => _hasObservedClientHP;
         public uint LastObservedClientHPWire => _lastObservedClientHPWire;
@@ -401,7 +369,7 @@ namespace DungeonRunners.Networking
             {
                 _currentHPWire = MaxHPWire > 0 ? Math.Min(value, MaxHPWire) : value;
                 HasClientHP = true;
-                SetClientSyncHP(_currentHPWire);
+                SetEntitySynchInfoHP(_currentHPWire);
             }
         }
 
@@ -423,17 +391,21 @@ namespace DungeonRunners.Networking
             _equipmentHPBonusWire = 0;
             _modifierHPBonusWire = 0;
             _passiveHPBonusWire = 0;
+            _passiveStrengthMod = 0;
+            _passiveAgilityMod = 0;
+            _passiveEnduranceMod = 0;
+            _passiveIntellectMod = 0;
             MeleeAttackRatingModPercent = 0;
             MeleeAttackSpeedModPercent = 0f;
             RangeAttackSpeedModPercent = 0f;
             MovementSpeedModPercent = 0;
             MinMovementSpeedModValue = 0;
             _currentHPWire = _baseHPWire;
-            _clientSyncHPWire = _currentHPWire;
-            _clientSyncHPTime = -1f;
-            _clientSyncHPCarry = 0d;
-            _clientSyncRegenSuppressUntil = -1f;
-            RefreshNativeRegenFactors("InitializeStats");
+            _entitySynchInfoHPWire = _currentHPWire;
+            _entitySynchInfoHPTime = -1f;
+            _entitySynchInfoHPCarry = 0d;
+            _clientRegenSuppressUntil = -1f;
+            RefreshRegenFactors("InitializeStats");
             _regenCooldown = 0;
             _manaRegenCooldown = 0;
             _hasObservedClientHP = false;
@@ -444,8 +416,8 @@ namespace DungeonRunners.Networking
             _equipmentManaBonusWire = 0;
             _passiveManaBonusWire = 0;
             _currentManaWire = _baseManaWire;
-            HasClientHP = false;  // Reset so RecalculateCurrentHP sets HP = MaxHP (with equipment)
-            HasClientSyncHP = false;
+            HasClientHP = false;
+            HasEntitySynchInfoHP = false;
             HasClientMana = false;
             EquipmentStats.Clear();
             Debug.LogError($"[PLAYERSTATE] INITIALIZED: {_className} Level {_level} | BaseHP={_baseHPWire} BaseMana={_baseManaWire}");
@@ -453,18 +425,18 @@ namespace DungeonRunners.Networking
 
         public void ApplyAllocatedStats(int strength, int agility, int endurance, int intellect)
         {
-            bool preserveNativeRegenClock = HasClientSyncHP && _clientSyncHPTime >= 0f;
-            if (preserveNativeRegenClock)
-                AdvanceClientSyncHP(Time.time, "ApplyAllocatedStats-pre");
+            bool preserveRegenClock = HasEntitySynchInfoHP && _entitySynchInfoHPTime >= 0f;
+            if (preserveRegenClock)
+                AdvanceEntitySynchInfoHP(Time.time, "ApplyAllocatedStats-pre");
 
             _allocatedStrength = Math.Max(0, strength);
             _allocatedAgility = Math.Max(0, agility);
             _allocatedEndurance = Math.Max(0, endurance);
             _allocatedIntellect = Math.Max(0, intellect);
-            int finalStrength = BASE_STAT_VALUE + _allocatedStrength;
-            int finalAgility = BASE_STAT_VALUE + _allocatedAgility;
-            int finalEndurance = BASE_STAT_VALUE + _allocatedEndurance;
-            int finalIntellect = BASE_STAT_VALUE + _allocatedIntellect;
+            int finalStrength = BASE_STAT_VALUE + _allocatedStrength + _passiveStrengthMod;
+            int finalAgility = BASE_STAT_VALUE + _allocatedAgility + _passiveAgilityMod;
+            int finalEndurance = BASE_STAT_VALUE + _allocatedEndurance + _passiveEnduranceMod;
+            int finalIntellect = BASE_STAT_VALUE + _allocatedIntellect + _passiveIntellectMod;
             Strength = Math.Max(1, finalStrength);
             Agility = Math.Max(1, finalAgility);
             Toughness = Math.Max(1, finalEndurance);
@@ -493,8 +465,8 @@ namespace DungeonRunners.Networking
                 _currentManaWire = MaxManaWire;
             }
 
-            SetClientSyncHP(_currentHPWire, resetNativeTickClock: !preserveNativeRegenClock);
-            Debug.LogError($"[ALLOC-STATS] STR={strength}->{Strength} AGI={agility}->{Agility} END={endurance}->{Toughness} INT={intellect}->{Intelligence} AllocHP={_allocatedHPBonusWire} MaxHP={MaxHPWire} CurrentHP={_currentHPWire} preserveRegenClock={preserveNativeRegenClock}");
+            SetEntitySynchInfoHP(_currentHPWire, resetTickClock: !preserveRegenClock);
+            Debug.LogError($"[ALLOC-STATS] STR={strength}->{Strength} AGI={agility}->{Agility} END={endurance}->{Toughness} INT={intellect}->{Intelligence} AllocHP={_allocatedHPBonusWire} MaxHP={MaxHPWire} CurrentHP={_currentHPWire} preserveRegenClock={preserveRegenClock}");
         }
 
         public void AddTotalHealthBonus(int hpBonus)
@@ -505,9 +477,13 @@ namespace DungeonRunners.Networking
 
         public void AddEnduranceBonus(int enduranceBonus)
         {
-            int hpFromEndurance = enduranceBonus * HP_PER_ENDURANCE;
-            uint wireBonus = (uint)(hpFromEndurance * 256);
+            int healthPerEnduranceMod = ClassPassiveData.Passives.TryGetValue(_className, out var passive) ? passive.HealthPerEnduranceMod : 0;
+            int percent = Math.Max(0, 100 + healthPerEnduranceMod);
+            int percentFixed = (int)(((long)percent * 0x10000L) / 0x6400L);
+            long hpPerEnduranceFixed = ((long)HP_PER_ENDURANCE * 256L * percentFixed) >> 8;
+            uint wireBonus = (uint)(((((long)enduranceBonus << 8) * hpPerEnduranceFixed) >> 16) * 256L);
             _equipmentHPBonusWire += wireBonus;
+            Debug.LogError($"[HP-END] END+{enduranceBonus} hpeMod={healthPerEnduranceMod}% -> wire +{wireBonus}");
         }
 
         public void AddModifierHPBonus(uint wireBonus)
@@ -522,6 +498,10 @@ namespace DungeonRunners.Networking
             MeleeAttackRatingModPercent = meleeAttackRatingModPercent;
             MeleeAttackSpeedModPercent = meleeAttackSpeedModPercent;
             RangeAttackSpeedModPercent = rangeAttackSpeedModPercent;
+            _passiveStrengthMod = strengthMod;
+            _passiveAgilityMod = agilityMod;
+            _passiveEnduranceMod = enduranceMod;
+            _passiveIntellectMod = intellectMod;
             Strength = Math.Max(1, BASE_STAT_VALUE + _allocatedStrength + strengthMod);
             Agility = Math.Max(1, BASE_STAT_VALUE + _allocatedAgility + agilityMod);
             Toughness = Math.Max(1, BASE_STAT_VALUE + _allocatedEndurance + enduranceMod);
@@ -536,7 +516,7 @@ namespace DungeonRunners.Networking
             {
                 _currentHPWire = MaxHPWire;
             }
-            SetClientSyncHP(_currentHPWire);
+            SetEntitySynchInfoHP(_currentHPWire);
             if (HasClientMana)
             {
                 if (_currentManaWire > MaxManaWire) _currentManaWire = MaxManaWire;
@@ -559,7 +539,7 @@ namespace DungeonRunners.Networking
             _modifierHPBonusWire = wireBonusToRemove > _modifierHPBonusWire
                 ? 0 : _modifierHPBonusWire - wireBonusToRemove;
             if (_currentHPWire > MaxHPWire) _currentHPWire = MaxHPWire;
-            SetClientSyncHP(_currentHPWire);
+            SetEntitySynchInfoHP(_currentHPWire);
             Debug.LogError($"[HP-MOD] MaxHP now {MaxHPWire} (CurrentHP={_currentHPWire})");
         }
 
@@ -575,12 +555,12 @@ namespace DungeonRunners.Networking
             WeaponDamageType = "";
             WeaponCategory = "";
             WeaponStatsResolved = false;
-            NativeWeaponClassId = 0;
-            NativeDamageTypeId = -1;
-            NativeWeaponDamageLevel = 0;
-            NativeWeaponBaseDamage = 0;
-            NativeWeaponBaseDamageTracksPlayerLevel = false;
-            NativeWeaponBaseDamageSource = "unresolved";
+            WeaponClassId = 0;
+            DamageTypeId = -1;
+            WeaponDamageLevel = 0;
+            WeaponBaseDamage = 0;
+            WeaponBaseDamageTracksPlayerLevel = false;
+            WeaponBaseDamageSource = "unresolved";
             WeaponRange = 0;
             WeaponCooldown = 0f;
             WeaponSpeed = 0f;
@@ -618,7 +598,7 @@ namespace DungeonRunners.Networking
             long manaPerIntellectFixed = ((long)ClassPassiveData.POWER_PER_INTELLECT * 256L * percentFixed) >> 8;
             uint wireBonus = (uint)(((((long)intellectBonus << 8) * manaPerIntellectFixed) >> 16) * 256L);
             _equipmentManaBonusWire += wireBonus;
-            Debug.LogError($"[MANA-INT] INT+{intellectBonus} mpiMod={manaPerIntellectMod}% → wire +{wireBonus}");
+            Debug.LogError($"[MANA-INT] INT+{intellectBonus} mpiMod={manaPerIntellectMod}% -> wire +{wireBonus}");
         }
 
         public void RecalculateCurrentHP()
@@ -629,29 +609,29 @@ namespace DungeonRunners.Networking
                 if (_currentHPWire > newMaxHP)
                     _currentHPWire = newMaxHP;
                 HasClientHP = true;
-                Debug.LogError($"[HP-FINAL] Kept client HP: {_currentHPWire} (max={newMaxHP}, SynchHP={SynchHP})");
+                Debug.LogError($"[HP-FINAL] Kept client HP: {_currentHPWire} (max={newMaxHP}, EntitySynchInfoHP={EntitySynchInfoHP})");
             }
             else
             {
                 _currentHPWire = newMaxHP;
-                Debug.LogError($"[HP-FINAL] base={_baseHPWire} + allocated={_allocatedHPBonusWire} + equip={_equipmentHPBonusWire} + mod={_modifierHPBonusWire} + passive={_passiveHPBonusWire} = {_currentHPWire} (SynchHP={SynchHP})");
+                Debug.LogError($"[HP-FINAL] base={_baseHPWire} + allocated={_allocatedHPBonusWire} + equip={_equipmentHPBonusWire} + mod={_modifierHPBonusWire} + passive={_passiveHPBonusWire} = {_currentHPWire} (EntitySynchInfoHP={EntitySynchInfoHP})");
             }
-            SetClientSyncHP(_currentHPWire);
+            SetEntitySynchInfoHP(_currentHPWire);
         }
 
 
-        public bool ApplyNativeOnDamageCallback(uint appliedDamageWire, float nativeNow, string source = null)
+        public bool ApplyOnDamageCallback(uint appliedDamageWire, float clientNow, string source = null)
         {
             if (appliedDamageWire == 0 || EquipmentStats == null) return false;
             int hpSteal = GetEquipmentStat("HIT_POINT_STEAL", "HITPOINTSTEAL");
             int manaSteal = GetEquipmentStat("MANA_POINT_STEAL", "MANAPOINTSTEAL", "MANA_STEAL", "MANASTEAL");
             if (hpSteal <= 0 && manaSteal <= 0) return false;
 
-            if (nativeNow >= 0f)
-                AdvanceClientSyncHP(nativeNow, $"{source ?? "Damage::apply"}-onDamageCallback-pre");
+            if (clientNow >= 0f)
+                AdvanceEntitySynchInfoHP(clientNow, $"{source ?? "Damage::apply"}-onDamageCallback-pre");
 
             uint oldHP = _currentHPWire;
-            uint oldSync = _clientSyncHPWire;
+            uint oldEntitySynchInfoHP = _entitySynchInfoHPWire;
             uint oldMana = _currentManaWire;
             uint maxHP = MaxHPWire;
             uint maxMana = MaxManaWire;
@@ -664,7 +644,7 @@ namespace DungeonRunners.Networking
                     ulong next = (ulong)_currentHPWire + heal;
                     _currentHPWire = next >= maxHP ? maxHP : (uint)next;
                     ClearObservedClientHP();
-                    SetClientSyncHP(_currentHPWire, resetNativeTickClock: nativeNow >= 0f, nativeTime: nativeNow >= 0f ? nativeNow : (float?)null);
+                    SetEntitySynchInfoHP(_currentHPWire, resetTickClock: clientNow >= 0f, clientTime: clientNow >= 0f ? clientNow : (float?)null);
                     HasClientHP = true;
                 }
             }
@@ -680,9 +660,9 @@ namespace DungeonRunners.Networking
                 }
             }
 
-            bool changed = oldHP != _currentHPWire || oldSync != _clientSyncHPWire || oldMana != _currentManaWire;
+            bool changed = oldHP != _currentHPWire || oldEntitySynchInfoHP != _entitySynchInfoHPWire || oldMana != _currentManaWire;
             if (changed)
-                Debug.LogError($"[DAMAGE-CALLBACK] source=player hpSteal={hpSteal} manaSteal={manaSteal} appliedWire={appliedDamageWire} hp={oldHP}->{_currentHPWire}/{maxHP} sync={oldSync}->{_clientSyncHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} native=Unit::onDamageCallback@0x0050C470");
+                Debug.LogError($"[DAMAGE-CALLBACK] source=player hpSteal={hpSteal} manaSteal={manaSteal} appliedWire={appliedDamageWire} hp={oldHP}->{_currentHPWire}/{maxHP} entitySynchInfoHP={oldEntitySynchInfoHP}->{_entitySynchInfoHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} sourceFunction=Unit::onDamageCallback@0x0050C470");
             return changed;
         }
 
@@ -700,14 +680,14 @@ namespace DungeonRunners.Networking
             ApplyDamage(wireAmount, true, null, false);
         }
 
-        public void TakeDamage(uint wireAmount, float nativeDamageTime, bool advanceBeforeDamage = false)
+        public void TakeDamage(uint wireAmount, float clientDamageTime, bool advanceBeforeDamage = false)
         {
-            ApplyDamage(wireAmount, true, nativeDamageTime, advanceBeforeDamage);
+            ApplyDamage(wireAmount, true, clientDamageTime, advanceBeforeDamage);
         }
 
-        public void TakeQueriedDamage(uint wireAmount, float nativeDamageTime, bool advanceBeforeDamage = false)
+        public void TakeQueriedDamage(uint wireAmount, float clientDamageTime, bool advanceBeforeDamage = false)
         {
-            ApplyDamage(wireAmount, true, nativeDamageTime, advanceBeforeDamage, false);
+            ApplyDamage(wireAmount, true, clientDamageTime, advanceBeforeDamage, false);
         }
 
         public void TakeRuntimeDamage(uint wireAmount)
@@ -715,21 +695,21 @@ namespace DungeonRunners.Networking
             ApplyDamage(wireAmount, false, null, false);
         }
 
-        public void TakeRuntimeDamage(uint wireAmount, float nativeDamageTime, bool advanceBeforeDamage = false)
+        public void TakeRuntimeDamage(uint wireAmount, float clientDamageTime, bool advanceBeforeDamage = false)
         {
-            ApplyDamage(wireAmount, false, nativeDamageTime, advanceBeforeDamage);
+            ApplyDamage(wireAmount, false, clientDamageTime, advanceBeforeDamage);
         }
 
-        public void ApplyNativeQueriedDamage(uint wireAmount, float nativeDamageTime, bool advanceBeforeDamage = false)
+        public void ApplyQueriedDamage(uint wireAmount, float clientDamageTime, bool advanceBeforeDamage = false)
         {
-            float? damageTime = nativeDamageTime >= 0f ? nativeDamageTime : (float?)null;
+            float? damageTime = clientDamageTime >= 0f ? clientDamageTime : (float?)null;
             ApplyDamage(wireAmount, true, damageTime, advanceBeforeDamage, false);
         }
 
-        private void ApplyDamage(uint wireAmount, bool updateClientSync, float? nativeDamageTime, bool advanceBeforeDamage, bool applyDamageTakenMod = true)
+        private void ApplyDamage(uint wireAmount, bool updateEntitySynchInfo, float? clientDamageTime, bool advanceBeforeDamage, bool applyDamageTakenMod = true)
         {
-            if (advanceBeforeDamage && (nativeDamageTime.HasValue || _clientSyncHPTime >= 0f))
-                AdvanceClientSyncHP(nativeDamageTime ?? _clientSyncHPTime, updateClientSync ? "TakeDamage-pre" : "TakeRuntimeDamage-pre");
+            if (advanceBeforeDamage && (clientDamageTime.HasValue || _entitySynchInfoHPTime >= 0f))
+                AdvanceEntitySynchInfoHP(clientDamageTime ?? _entitySynchInfoHPTime, updateEntitySynchInfo ? "TakeDamage-pre" : "TakeRuntimeDamage-pre");
             if (HasAnyDamageImmunity)
             {
                 Debug.LogError($"[TAKEDAMAGE] Immune: {wireAmount} ignored at hp={_currentHPWire}");
@@ -739,11 +719,11 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[TAKEDAMAGE] Before: {_currentHPWire}, Subtracting: {adjustedWireAmount}");
             _currentHPWire = adjustedWireAmount > _currentHPWire ? 0 : _currentHPWire - adjustedWireAmount;
             HasClientHP = true;
-            if (updateClientSync)
-                SetClientSyncHP(_currentHPWire, resetNativeTickClock: nativeDamageTime.HasValue, nativeTime: nativeDamageTime);
-            ApplyNativeDamageRegenCooldown(nativeDamageTime);
+            if (updateEntitySynchInfo)
+                SetEntitySynchInfoHP(_currentHPWire, resetTickClock: clientDamageTime.HasValue, clientTime: clientDamageTime);
+            ApplyDamageRegenCooldown(clientDamageTime);
             if (_currentHPWire == 0)
-                ClearNativeAttributeModifiers("death-damage");
+                ClearAttributeModifiers("death-damage");
             Debug.LogError($"[TAKEDAMAGE] After: {_currentHPWire}");
         }
 
@@ -761,17 +741,36 @@ namespace DungeonRunners.Networking
             _currentHPWire = Math.Min(_currentHPWire + wireAmount, MaxHPWire);
             HasClientHP = true;
             ClearObservedClientHP();
-            SetClientSyncHP(_currentHPWire);
+            SetEntitySynchInfoHP(_currentHPWire);
         }
 
-        public void SetCurrentHP(uint wireHP, bool applyNativeDamageCooldown = false)
+        public void SetCurrentHP(uint wireHP, bool applyDamageCooldown = false)
         {
             _currentHPWire = Math.Min(wireHP, MaxHPWire);
             HasClientHP = true;
             ClearObservedClientHP();
-            SetClientSyncHP(_currentHPWire);
-            if (applyNativeDamageCooldown && _currentHPWire < MaxHPWire)
-                ApplyNativeDamageRegenCooldown();
+            SetEntitySynchInfoHP(_currentHPWire);
+            if (applyDamageCooldown && _currentHPWire < MaxHPWire)
+                ApplyDamageRegenCooldown();
+        }
+
+        public void SetCurrentHPDeferClamp(uint wireHP)
+        {
+            _currentHPWire = wireHP;
+            HasClientHP = true;
+            ClearObservedClientHP();
+            _entitySynchInfoHPWire = wireHP;
+            HasEntitySynchInfoHP = true;
+            _entitySynchInfoHPTime = Time.time;
+            _entitySynchInfoHPCarry = 0d;
+        }
+
+        public void BeginPassiveMaxTransition(uint oldMaxWire)
+        {
+            if (oldMaxWire == 0) return;
+            _passiveMaxTransition = true;
+            _passiveTransitionMaxWire = oldMaxWire;
+            Debug.LogError($"[MAX-TRANSITION] begin oldMax={oldMaxWire} newMax={MaxHPWire} curHp={_currentHPWire}");
         }
 
         public void SetClientReportedHP(uint wireHP, bool updateRuntimeHP = true)
@@ -796,9 +795,9 @@ namespace DungeonRunners.Networking
             HasClientMana = true;
             _regenCooldown = 0;
             _manaRegenCooldown = 0;
-            ClearNativeAttributeModifiers("RestoreToFull");
+            ClearAttributeModifiers("RestoreToFull");
             ClearObservedClientHP();
-            SetClientSyncHP(_currentHPWire);
+            SetEntitySynchInfoHP(_currentHPWire);
         }
 
         private void ClearObservedClientHP()
@@ -808,15 +807,15 @@ namespace DungeonRunners.Networking
             _lastObservedClientHPTime = 0f;
             _lastObservedClientHPSource = null;
         }
-        private void SetClientSyncHP(uint wireHP, bool resetNativeTickClock = true, float? nativeTime = null)
+        private void SetEntitySynchInfoHP(uint wireHP, bool resetTickClock = true, float? clientTime = null)
         {
             uint maxHP = MaxHPWire;
-            _clientSyncHPWire = maxHP > 0 ? Math.Min(wireHP, maxHP) : wireHP;
-            HasClientSyncHP = true;
-            if (resetNativeTickClock)
+            _entitySynchInfoHPWire = maxHP > 0 ? Math.Min(wireHP, maxHP) : wireHP;
+            HasEntitySynchInfoHP = true;
+            if (resetTickClock)
             {
-                _clientSyncHPTime = nativeTime ?? Time.time;
-                _clientSyncHPCarry = 0d;
+                _entitySynchInfoHPTime = clientTime ?? Time.time;
+                _entitySynchInfoHPCarry = 0d;
             }
         }
 
@@ -836,17 +835,12 @@ namespace DungeonRunners.Networking
             return null;
         }
 
-        private float ResolveClientSyncHPRegenPerSecond()
+        private float ResolveHitPointRegenBase()
         {
-            float classRegen = 0f;
-            var desc = ResolveClassDescriptionNode();
-            if (desc != null && desc.HasProperty("HealthRegen"))
-                classRegen = desc.GetFloat("HealthRegen", 0f);
-            float globalRegen = GCDatabase.Instance?.GetKnob("HeroHealthRegen", 2f) ?? 2f;
-            return Math.Max(0f, classRegen * globalRegen);
+            return GCDatabase.Instance?.GetKnob("HeroHealthRegen", 2f) ?? 2f;
         }
 
-        private float ResolveClientSyncManaRegenPerSecond()
+        private float ResolveClientManaRegenPerSecond()
         {
             float classRegen = 0f;
             var desc = ResolveClassDescriptionNode();
@@ -859,76 +853,99 @@ namespace DungeonRunners.Networking
             return Math.Max(0f, classRegen * globalRegen);
         }
 
-        public void AdvanceClientSyncHP(float now, string source = null)
+        public void AdvanceEntitySynchInfoHP(float now, string source = null, bool clientDriven = false)
         {
-            if (!HasClientSyncHP)
+            if (!HasEntitySynchInfoHP)
             {
-                SetClientSyncHP(_currentHPWire, nativeTime: now);
+                SetEntitySynchInfoHP(_currentHPWire, clientTime: now);
                 return;
             }
 
             uint maxHP = MaxHPWire;
+            if (_passiveMaxTransition)
+            {
+                if (clientDriven)
+                {
+                    _passiveMaxTransition = false;
+                    Debug.LogError($"[MAX-TRANSITION] end source={source ?? "client-mover"} newMax={maxHP} curHp={_currentHPWire}");
+                }
+                else
+                    maxHP = _passiveTransitionMaxWire;
+            }
             uint maxMana = MaxManaWire;
-            if (maxHP > 0 && _clientSyncHPWire > maxHP)
-                _clientSyncHPWire = maxHP;
+            if (maxHP > 0 && _entitySynchInfoHPWire > maxHP)
+                _entitySynchInfoHPWire = maxHP;
             if (_currentHPWire > maxHP)
                 _currentHPWire = maxHP;
             if (_currentManaWire > maxMana)
                 _currentManaWire = maxMana;
 
             uint oldCurrentHP = _currentHPWire;
-            uint oldSyncHP = _clientSyncHPWire;
+            uint oldEntitySynchInfoHP = _entitySynchInfoHPWire;
             uint oldMana = _currentManaWire;
             ushort oldHPCooldown = _regenCooldown;
             ushort oldManaCooldown = _manaRegenCooldown;
             int totalModifierDelta = 0;
             int totalModifierTicks = 0;
-            int lastModifierBonus = ResolveNativeHitPointRegenBonus();
+            int lastModifierBonus = ResolveHitPointRegenBonus();
 
             if (maxHP > 0)
             {
                 uint runtimeHP = Math.Min(maxHP, _currentHPWire);
                 _currentHPWire = runtimeHP;
-                _clientSyncHPWire = runtimeHP;
+                _entitySynchInfoHPWire = runtimeHP;
             }
 
-            if (maxHP == 0 || (_clientSyncHPWire == 0 && _currentHPWire == 0))
+            if (maxHP == 0 || (_entitySynchInfoHPWire == 0 && _currentHPWire == 0))
             {
-                _clientSyncHPTime = now;
-                _clientSyncHPCarry = 0d;
+                _entitySynchInfoHPTime = now;
+                _entitySynchInfoHPCarry = 0d;
                 return;
             }
 
-            if (_clientSyncHPTime < 0f)
+            if (_entitySynchInfoHPTime < 0f)
             {
-                _clientSyncHPTime = now;
-                _clientSyncHPCarry = 0d;
-                if (oldCurrentHP != _currentHPWire || oldSyncHP != _clientSyncHPWire)
-                    Debug.LogError($"[PLAYER-REGEN] source={source ?? "init"} hp={oldCurrentHP}->{_currentHPWire} sync={oldSyncHP}->{_clientSyncHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} hpCooldown={oldHPCooldown}->{_regenCooldown} manaCooldown={oldManaCooldown}->{_manaRegenCooldown} ticks=0 hpFactor={_regenFactor} manaFactor={_manaRegenFactor}");
+                _entitySynchInfoHPTime = now;
+                _entitySynchInfoHPCarry = 0d;
+                if (oldCurrentHP != _currentHPWire || oldEntitySynchInfoHP != _entitySynchInfoHPWire)
+                    Debug.LogError($"[PLAYER-REGEN] source={source ?? "init"} hp={oldCurrentHP}->{_currentHPWire} entitySynchInfoHP={oldEntitySynchInfoHP}->{_entitySynchInfoHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} hpCooldown={oldHPCooldown}->{_regenCooldown} manaCooldown={oldManaCooldown}->{_manaRegenCooldown} ticks=0 hpFactor={_regenFactor} manaFactor={_manaRegenFactor}");
                 return;
             }
 
-            const double nativeTickSeconds = 1d / 30d;
-            double elapsed = now - _clientSyncHPTime + _clientSyncHPCarry;
-            int ticks = (int)(elapsed / nativeTickSeconds);
+            const double clientTickSeconds = 1d / 30d;
+            double elapsed = now - _entitySynchInfoHPTime + _entitySynchInfoHPCarry;
+            int ticks = (int)(elapsed / clientTickSeconds);
             if (ticks <= 0)
             {
-                _clientSyncHPCarry = elapsed;
-                _clientSyncHPTime = now;
-                if (oldCurrentHP != _currentHPWire || oldSyncHP != _clientSyncHPWire)
-                    Debug.LogError($"[PLAYER-REGEN] source={source ?? "sync"} hp={oldCurrentHP}->{_currentHPWire} sync={oldSyncHP}->{_clientSyncHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} hpCooldown={oldHPCooldown}->{_regenCooldown} manaCooldown={oldManaCooldown}->{_manaRegenCooldown} ticks=0 hpFactor={_regenFactor} manaFactor={_manaRegenFactor}");
+                _entitySynchInfoHPCarry = elapsed;
+                _entitySynchInfoHPTime = now;
+                if (oldCurrentHP != _currentHPWire || oldEntitySynchInfoHP != _entitySynchInfoHPWire)
+                    Debug.LogError($"[PLAYER-REGEN] source={source ?? "entity-synch-info"} hp={oldCurrentHP}->{_currentHPWire} entitySynchInfoHP={oldEntitySynchInfoHP}->{_entitySynchInfoHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} hpCooldown={oldHPCooldown}->{_regenCooldown} manaCooldown={oldManaCooldown}->{_manaRegenCooldown} ticks=0 hpFactor={_regenFactor} manaFactor={_manaRegenFactor}");
                 return;
             }
 
+            if (_passiveMaxTransition)
+            {
+                _passiveMaxTransition = false;
+                maxHP = MaxHPWire;
+                if (maxHP > 0 && _currentHPWire > maxHP)
+                    _currentHPWire = maxHP;
+                if (maxHP > 0 && _entitySynchInfoHPWire > maxHP)
+                    _entitySynchInfoHPWire = maxHP;
+                Debug.LogError($"[MAX-TRANSITION] end source=tick-clamp newMax={maxHP} curHp={_currentHPWire} sourceFunction=Unit::update@0x005093E0");
+            }
+
+            if (_regenFactor == 0)
+                _regenFactor = Mathf.RoundToInt(ResolveHitPointRegenBase());
             if (_manaRegenFactor == 0)
-                _manaRegenFactor = Mathf.RoundToInt(ResolveClientSyncManaRegenPerSecond());
+                _manaRegenFactor = Mathf.RoundToInt(ResolveClientManaRegenPerSecond());
 
             uint runtime = _currentHPWire;
             uint mana = _currentManaWire;
-            for (int i = 0; i < ticks; i++)
+            for (int tickIndex = 0; tickIndex < ticks; tickIndex++)
             {
-                AdvanceNativeAttributeModifierTick(source ?? "AdvanceClientSyncHP");
-                int hitPointRegenBonus = ResolveNativeHitPointRegenBonus();
+                AdvanceAttributeModifierTick(source ?? "AdvanceEntitySynchInfoHP");
+                int hitPointRegenBonus = ResolveHitPointRegenBonus();
                 lastModifierBonus = hitPointRegenBonus;
                 if (_regenCooldown > 0)
                     _regenCooldown--;
@@ -937,11 +954,11 @@ namespace DungeonRunners.Networking
 
                 if (runtime > 0 && (runtime < maxHP || hitPointRegenBonus < 0))
                 {
-                    int regenDelta = CombatManager.ComputeNativeUnitRegenDeltaWire(maxHP, _regenFactor, 0, hitPointRegenBonus, _regenCooldown > 0);
+                    int regenDelta = CombatRuntime.ComputeUnitRegenDeltaWire(maxHP, _regenFactor, 0, hitPointRegenBonus, _regenCooldown > 0);
                     if (regenDelta != 0)
                     {
                         uint beforeRuntime = runtime;
-                        runtime = CombatManager.ApplyNativeUnitHPShiftWire(runtime, maxHP, regenDelta);
+                        runtime = CombatRuntime.ApplyUnitHPShiftWire(runtime, maxHP, regenDelta);
                         if (hitPointRegenBonus != 0 && beforeRuntime != runtime)
                         {
                             totalModifierTicks++;
@@ -958,51 +975,51 @@ namespace DungeonRunners.Networking
             }
 
             _currentHPWire = runtime;
-            _clientSyncHPWire = runtime;
+            _entitySynchInfoHPWire = runtime;
             if (_currentHPWire == 0)
-                ClearNativeAttributeModifiers("death-regen");
+                ClearAttributeModifiers("death-regen");
             _currentManaWire = mana;
             if (_currentHPWire > 0)
             {
                 HasClientHP = true;
-                HasClientSyncHP = true;
+                HasEntitySynchInfoHP = true;
             }
             if (oldMana != _currentManaWire)
                 HasClientMana = true;
-            _clientSyncHPCarry = elapsed - ticks * nativeTickSeconds;
-            _clientSyncHPTime = now;
+            _entitySynchInfoHPCarry = elapsed - ticks * clientTickSeconds;
+            _entitySynchInfoHPTime = now;
             if (oldCurrentHP != _currentHPWire
-                || oldSyncHP != _clientSyncHPWire
+                || oldEntitySynchInfoHP != _entitySynchInfoHPWire
                 || oldMana != _currentManaWire
                 || (oldHPCooldown > 0 && _regenCooldown == 0)
                 || (oldManaCooldown > 0 && _manaRegenCooldown == 0))
             {
-                Debug.LogError($"[PLAYER-REGEN] source={source ?? "tick"} hp={oldCurrentHP}->{_currentHPWire} sync={oldSyncHP}->{_clientSyncHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} hpCooldown={oldHPCooldown}->{_regenCooldown} manaCooldown={oldManaCooldown}->{_manaRegenCooldown} ticks={ticks} hpFactor={_regenFactor} manaFactor={_manaRegenFactor}");
+                Debug.LogError($"[PLAYER-REGEN] source={source ?? "tick"} hp={oldCurrentHP}->{_currentHPWire} entitySynchInfoHP={oldEntitySynchInfoHP}->{_entitySynchInfoHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} hpCooldown={oldHPCooldown}->{_regenCooldown} manaCooldown={oldManaCooldown}->{_manaRegenCooldown} ticks={ticks} hpFactor={_regenFactor} manaFactor={_manaRegenFactor}");
             }
-            if (totalModifierTicks > 0 || lastModifierBonus != 0)
+            if (totalModifierTicks > 0)
             {
-                Debug.LogError($"[PLAYER-REGEN-MOD] source={source ?? "tick"} hp={oldCurrentHP}->{_currentHPWire}/{maxHP} ticks={ticks} modTicks={totalModifierTicks} bonus={lastModifierBonus} modDelta={totalModifierDelta} active={_nativeAttributeModifiers.Count} native=Unit::update@0x005093E0 attr=HIT_POINT_REGEN_BONUS");
+                Debug.LogError($"[PLAYER-REGEN-MOD] source={source ?? "tick"} hp={oldCurrentHP}->{_currentHPWire}/{maxHP} ticks={ticks} modTicks={totalModifierTicks} bonus={lastModifierBonus} modDelta={totalModifierDelta} active={_attributeModifiers.Count} sourceFunction=Unit::update@0x005093E0 attr=HIT_POINT_REGEN_BONUS");
             }
         }
 
-        public bool ApplyNativeHitPointRegenBonusModifier(string modifierType, int hitPointRegenBonus, ushort durationTicks, bool removeOnDeath, float nativeNow, string source = null, string modifierKey = null, uint sourceEntityId = 0, string skillPath = null, string effectPath = null, uint powerLevel = 0, string stackRule = null)
+        public bool ApplyHitPointRegenBonusModifier(string modifierType, int hitPointRegenBonus, ushort durationTicks, bool removeOnDeath, float clientNow, string source = null, string modifierKey = null, uint sourceEntityId = 0, string skillPath = null, string effectPath = null, uint powerLevel = 0, string stackRule = null)
         {
             if (string.IsNullOrWhiteSpace(modifierType) || hitPointRegenBonus == 0)
                 return false;
 
             string runtimeKey = !string.IsNullOrWhiteSpace(modifierKey) ? modifierKey : modifierType;
-            int existingIndex = _nativeAttributeModifiers.FindIndex(m =>
+            int existingIndex = _attributeModifiers.FindIndex(m =>
                 string.Equals(!string.IsNullOrWhiteSpace(m.ModifierKey) ? m.ModifierKey : m.ModifierType, runtimeKey, StringComparison.OrdinalIgnoreCase));
-            if (existingIndex >= 0 && !ShouldAcceptNativeModifierStack(stackRule, powerLevel, durationTicks, _nativeAttributeModifiers[existingIndex].PowerLevel, _nativeAttributeModifiers[existingIndex].RemainingTicks))
+            if (existingIndex >= 0 && !ShouldAcceptModifierStack(stackRule, powerLevel, durationTicks, _attributeModifiers[existingIndex].PowerLevel, _attributeModifiers[existingIndex].RemainingTicks))
             {
-                Debug.LogError($"[PLAYER-MODIFIER] reject type={modifierType} key={runtimeKey} hpRegenBonus={hitPointRegenBonus} durationTicks={durationTicks} power={powerLevel} existingPower={_nativeAttributeModifiers[existingIndex].PowerLevel} existingRemaining={_nativeAttributeModifiers[existingIndex].RemainingTicks} stack={stackRule ?? ""} source={source ?? "unknown"} native=Modifiers::addModifierLocal@0x00501770");
+                Debug.LogError($"[PLAYER-MODIFIER] reject type={modifierType} key={runtimeKey} hpRegenBonus={hitPointRegenBonus} durationTicks={durationTicks} power={powerLevel} existingPower={_attributeModifiers[existingIndex].PowerLevel} existingRemaining={_attributeModifiers[existingIndex].RemainingTicks} stack={stackRule ?? ""} source={source ?? "unknown"} sourceFunction=Modifiers::addModifierLocal@0x00501770");
                 return false;
             }
 
-            if (nativeNow >= 0f)
-                AdvanceClientSyncHP(nativeNow, $"{source ?? "modifier"}-pre-attach");
+            if (clientNow >= 0f)
+                AdvanceEntitySynchInfoHP(clientNow, $"{source ?? "modifier"}-pre-attach");
 
-            var runtime = new NativeAttributeModifierRuntime
+            var runtime = new AttributeModifierRuntime
             {
                 ModifierType = modifierType,
                 ModifierKey = runtimeKey,
@@ -1018,27 +1035,32 @@ namespace DungeonRunners.Networking
             };
 
             if (existingIndex >= 0)
-                _nativeAttributeModifiers[existingIndex] = runtime;
+                _attributeModifiers[existingIndex] = runtime;
             else
-                _nativeAttributeModifiers.Add(runtime);
+                _attributeModifiers.Add(runtime);
 
-            Debug.LogError($"[PLAYER-MODIFIER] apply type={modifierType} key={runtimeKey} hpRegenBonus={hitPointRegenBonus} durationTicks={durationTicks} power={powerLevel} stack={stackRule ?? ""} replace={existingIndex >= 0} removeOnDeath={removeOnDeath} source={source ?? "unknown"} native=SpellModEffect::doEffect@0x00554460 Modifiers::addModifierLocal@0x00501770");
+            Debug.LogError($"[PLAYER-MODIFIER] apply type={modifierType} key={runtimeKey} hpRegenBonus={hitPointRegenBonus} durationTicks={durationTicks} power={powerLevel} stack={stackRule ?? ""} replace={existingIndex >= 0} removeOnDeath={removeOnDeath} source={source ?? "unknown"} sourceFunction=SpellModEffect::doEffect@0x00554460 Modifiers::addModifierLocal@0x00501770");
             return true;
         }
 
-        private int ResolveNativeHitPointRegenBonus()
+        private int ResolveHitPointRegenBonus()
         {
-            int bonus = 0;
-            foreach (var mod in _nativeAttributeModifiers)
+            if (_hitPointRegenBonusBase < 0)
+            {
+                var attr = GCDatabase.Instance?.Resolve("AttributesPAL.HitPointRegenB");
+                _hitPointRegenBonusBase = Mathf.RoundToInt(attr?.GetFloat("Value", 1f) ?? 1f);
+            }
+            int bonus = _hitPointRegenBonusBase;
+            foreach (var mod in _attributeModifiers)
                 bonus += mod.HitPointRegenBonus;
             return bonus;
         }
 
-        private void EmitNativeAttributeModifierRemoved(NativeAttributeModifierRuntime mod, string source, string native)
+        private void EmitAttributeModifierRemoved(AttributeModifierRuntime mod, string source, string sourceFunction)
         {
             if (mod == null)
                 return;
-            OnNativeAttributeModifierRemoved?.Invoke(this, new NativeAttributeModifierRemoval
+            OnAttributeModifierRemoved?.Invoke(this, new AttributeModifierRemoval
             {
                 ModifierType = mod.ModifierType,
                 ModifierKey = !string.IsNullOrWhiteSpace(mod.ModifierKey) ? mod.ModifierKey : mod.ModifierType,
@@ -1046,67 +1068,67 @@ namespace DungeonRunners.Networking
                 EffectPath = mod.EffectPath,
                 Source = source ?? mod.Source ?? "unknown",
                 SourceEntityId = mod.SourceEntityId,
-                Native = native
+                SourceFunction = sourceFunction
             });
         }
 
-        private void AdvanceNativeAttributeModifierTick(string source)
+        private void AdvanceAttributeModifierTick(string source)
         {
-            for (int i = _nativeAttributeModifiers.Count - 1; i >= 0; i--)
+            for (int modifierIndex = _attributeModifiers.Count - 1; modifierIndex >= 0; modifierIndex--)
             {
-                var mod = _nativeAttributeModifiers[i];
+                var mod = _attributeModifiers[modifierIndex];
                 if (mod.RemainingTicks == 0)
                     continue;
                 mod.RemainingTicks--;
                 if (mod.RemainingTicks == 0)
                 {
-                    Debug.LogError($"[PLAYER-MODIFIER] expire type={mod.ModifierType} key={mod.ModifierKey ?? mod.ModifierType} hpRegenBonus={mod.HitPointRegenBonus} source={source ?? "unknown"} native=Modifier::update@0x004FF1B0");
-                    EmitNativeAttributeModifierRemoved(mod, source, "Modifiers::update@0x00501E50 Modifiers::removeModifierLocal@0x00501B50");
-                    _nativeAttributeModifiers.RemoveAt(i);
+                    Debug.LogError($"[PLAYER-MODIFIER] expire type={mod.ModifierType} key={mod.ModifierKey ?? mod.ModifierType} hpRegenBonus={mod.HitPointRegenBonus} source={source ?? "unknown"} sourceFunction=Modifier::update@0x004FF1B0");
+                    EmitAttributeModifierRemoved(mod, source, "Modifiers::update@0x00501E50 Modifiers::removeModifierLocal@0x00501B50");
+                    _attributeModifiers.RemoveAt(modifierIndex);
                 }
             }
         }
 
-        private void ClearNativeAttributeModifiers(string source)
+        private void ClearAttributeModifiers(string source)
         {
-            for (int i = _nativeAttributeModifiers.Count - 1; i >= 0; i--)
+            for (int modifierIndex = _attributeModifiers.Count - 1; modifierIndex >= 0; modifierIndex--)
             {
-                if (!_nativeAttributeModifiers[i].RemoveOnDeath && source != "RestoreToFull")
+                if (!_attributeModifiers[modifierIndex].RemoveOnDeath && source != "RestoreToFull")
                     continue;
-                Debug.LogError($"[PLAYER-MODIFIER] remove type={_nativeAttributeModifiers[i].ModifierType} key={_nativeAttributeModifiers[i].ModifierKey ?? _nativeAttributeModifiers[i].ModifierType} source={source ?? "unknown"} native=ModifierDesc.RemoveOnDeath");
-                EmitNativeAttributeModifierRemoved(_nativeAttributeModifiers[i], source, "ModifierDesc.RemoveOnDeath Modifiers::processRemoveModifier@0x00502390");
-                _nativeAttributeModifiers.RemoveAt(i);
+                Debug.LogError($"[PLAYER-MODIFIER] remove type={_attributeModifiers[modifierIndex].ModifierType} key={_attributeModifiers[modifierIndex].ModifierKey ?? _attributeModifiers[modifierIndex].ModifierType} source={source ?? "unknown"} sourceFunction=ModifierDesc.RemoveOnDeath");
+                EmitAttributeModifierRemoved(_attributeModifiers[modifierIndex], source, "ModifierDesc.RemoveOnDeath Modifiers::processRemoveModifier@0x00502390");
+                _attributeModifiers.RemoveAt(modifierIndex);
             }
         }
 
-        public int RemoveNativeAttributeModifiersFromSource(uint sourceEntityId, string source = null)
+        public int RemoveAttributeModifiersFromSource(uint sourceEntityId, string source = null)
         {
-            if (sourceEntityId == 0 || _nativeAttributeModifiers.Count == 0)
+            if (sourceEntityId == 0 || _attributeModifiers.Count == 0)
                 return 0;
             int removed = 0;
-            for (int i = _nativeAttributeModifiers.Count - 1; i >= 0; i--)
+            for (int modifierIndex = _attributeModifiers.Count - 1; modifierIndex >= 0; modifierIndex--)
             {
-                var mod = _nativeAttributeModifiers[i];
+                var mod = _attributeModifiers[modifierIndex];
                 if (mod.SourceEntityId != sourceEntityId)
                     continue;
-                Debug.LogError($"[PLAYER-MODIFIER] remove-source type={mod.ModifierType} key={mod.ModifierKey ?? mod.ModifierType} sourceEntity={sourceEntityId} source={source ?? "unknown"} native=Modifier::update@0x004FF1B0 Modifiers::processRemoveModifier@0x00502390");
-                EmitNativeAttributeModifierRemoved(mod, source ?? "source-unit-removed", "Modifier::update@0x004FF1B0 Modifiers::processRemoveModifier@0x00502390");
-                _nativeAttributeModifiers.RemoveAt(i);
+                Debug.LogError($"[PLAYER-MODIFIER] remove-source type={mod.ModifierType} key={mod.ModifierKey ?? mod.ModifierType} sourceEntity={sourceEntityId} source={source ?? "unknown"} sourceFunction=Modifier::update@0x004FF1B0 Modifiers::processRemoveModifier@0x00502390");
+                EmitAttributeModifierRemoved(mod, source ?? "source-unit-removed", "Modifier::update@0x004FF1B0 Modifiers::processRemoveModifier@0x00502390");
+                _attributeModifiers.RemoveAt(modifierIndex);
                 removed++;
             }
             return removed;
         }
-        public void RefreshNativeRegenFactors(string source = null)
+        public void RefreshRegenFactors(string source = null)
         {
-            _regenFactor = Mathf.RoundToInt(ResolveClientSyncHPRegenPerSecond());
-            _manaRegenFactor = Mathf.RoundToInt(ResolveClientSyncManaRegenPerSecond());
-            Debug.LogError($"[REGEN] source={source ?? "RefreshNativeRegenFactors"} hpRegenFactor={_regenFactor} manaRegenFactor={_manaRegenFactor}");
+            _regenFactor = Mathf.RoundToInt(ResolveHitPointRegenBase());
+            _manaRegenFactor = Mathf.RoundToInt(ResolveClientManaRegenPerSecond());
+            Debug.LogError($"[REGEN] source={source ?? "RefreshRegenFactors"} hpRegenFactor={_regenFactor} manaRegenFactor={_manaRegenFactor}");
         }
 
         public void SetRegenFactor(int hitPointRegen, int hitPointRegenMod = 0, int hitPointRegenBonus = 0)
         {
             _regenFactor = (hitPointRegenMod + 100) * hitPointRegen / 100 + hitPointRegenBonus;
-            _manaRegenFactor = Mathf.RoundToInt(ResolveClientSyncManaRegenPerSecond());
+            _manaRegenFactor = Mathf.RoundToInt(ResolveClientManaRegenPerSecond());
             Debug.LogError($"[REGEN] hpRegenFactor={_regenFactor} manaRegenFactor={_manaRegenFactor}");
         }
 
@@ -1115,24 +1137,24 @@ namespace DungeonRunners.Networking
             _regenCooldown = ticks;
         }
 
-        public void ApplyNativeDamageRegenCooldown(float? nativeDamageTime = null)
+        public void ApplyDamageRegenCooldown(float? clientDamageTime = null)
         {
-            float cooldownStart = nativeDamageTime ?? (_clientSyncHPTime >= 0f ? _clientSyncHPTime : -NativeDamageRegenSuppressSeconds);
-            _clientSyncRegenSuppressUntil = cooldownStart + NativeDamageRegenSuppressSeconds;
-            _regenCooldown = NativeDamageRegenSuppressTicks;
-            Debug.LogError($"[PLAYER-REGEN-COOLDOWN] hpCooldown={_regenCooldown} suppressUntil={_clientSyncRegenSuppressUntil:F3} hp={_currentHPWire}/{MaxHPWire}");
+            float cooldownStart = clientDamageTime ?? (_entitySynchInfoHPTime >= 0f ? _entitySynchInfoHPTime : -DamageRegenSuppressSeconds);
+            _clientRegenSuppressUntil = cooldownStart + DamageRegenSuppressSeconds;
+            _regenCooldown = DamageRegenSuppressTicks;
+            Debug.LogError($"[PLAYER-REGEN-COOLDOWN] hpCooldown={_regenCooldown} suppressUntil={_clientRegenSuppressUntil:F3} hp={_currentHPWire}/{MaxHPWire}");
         }
 
         public void RunRegenTick()
         {
-            AdvanceClientSyncHP(Time.time, "RunRegenTick");
+            AdvanceEntitySynchInfoHP(Time.time, "RunRegenTick");
         }
 
         public bool IsRegenComplete => _currentHPWire >= MaxHPWire
             && (_currentManaWire >= MaxManaWire || _manaRegenFactor == 0);
         public void LogFullState(string context)
         {
-            Debug.LogError($"[PLAYERSTATE-{context}] {_className} L{_level} | Base:{_baseHPWire} + Alloc:{_allocatedHPBonusWire} + Equip:{_equipmentHPBonusWire} + Mod:{_modifierHPBonusWire} + Passive:{_passiveHPBonusWire} = {SynchHP}");
+            Debug.LogError($"[PLAYERSTATE-{context}] {_className} L{_level} | Base:{_baseHPWire} + Alloc:{_allocatedHPBonusWire} + Equip:{_equipmentHPBonusWire} + Mod:{_modifierHPBonusWire} + Passive:{_passiveHPBonusWire} = {EntitySynchInfoHP}");
         }
     }
 }

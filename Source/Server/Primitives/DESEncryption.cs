@@ -3,9 +3,6 @@ using System.Security.Cryptography;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Handles DES encryption/decryption for auth packets
-    /// </summary>
     public class DESEncryption
     {
         private readonly DESCryptoServiceProvider _des;
@@ -17,12 +14,10 @@ namespace DungeonRunners.Utilities
             if (string.IsNullOrEmpty(key))
                 throw new ArgumentNullException(nameof(key));
 
-            // Ensure key is 8 bytes
             _key = new byte[8];
             byte[] keyBytes = System.Text.Encoding.ASCII.GetBytes(key);
             Array.Copy(keyBytes, _key, Math.Min(keyBytes.Length, 8));
 
-            // IV is all zeros
             _iv = new byte[8];
 
             _des = new DESCryptoServiceProvider

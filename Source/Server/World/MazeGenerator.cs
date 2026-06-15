@@ -2,8 +2,9 @@ using System;
 using System.Collections.Generic;
 using DungeonRunners.Engine;
 using DungeonRunners.Combat;
+using CombatRandom = DungeonRunners.Combat.MersenneTwister;
 
-namespace DungeonRunners.Managers
+namespace DungeonRunners.Gameplay
 {
     public class MazeGenerator
     {
@@ -46,7 +47,7 @@ namespace DungeonRunners.Managers
         public int DeadEndRemovalChance { get; private set; }
 
         private HashSet<int>[][] _openings;
-        private MersenneTwister _rng;
+        private CombatRandom _rng;
         private byte[,] _cells;
         private bool[,] _occupied;
         private byte[,] _forcedExits;
@@ -93,7 +94,7 @@ namespace DungeonRunners.Managers
         public MazeGenerator(int width, int height, uint seed,
                              int randomness = 90, int sparseness = 5,
                              int deadEndRemovalChance = 100,
-                             MersenneTwister rng = null)
+                             CombatRandom rng = null)
         {
             Width = width;
             Height = height;
@@ -101,7 +102,7 @@ namespace DungeonRunners.Managers
             Randomness = randomness;
             Sparseness = sparseness;
             DeadEndRemovalChance = deadEndRemovalChance;
-            _rng = rng ?? new MersenneTwister(seed);
+            _rng = rng ?? new CombatRandom(seed);
 
             _openings = new HashSet<int>[height][];
             _cells = new byte[height, width];
@@ -150,14 +151,14 @@ namespace DungeonRunners.Managers
             });
         }
 
-        public List<MazeCell> Generate(string tileSetPrefix = "elmforest_tileset_")
+        public List<MazeCell> BuildWorld(string tileSetPrefix = "elmforest_tileset_")
         {
             PlaceRoomNodes();
-            GenerateCorridors();
+            GenerateCooridors();
             ApplyForcedRoomExits();
             Sparsify();
             RemoveDeadEnds();
-            SyncOpeningsFromNativeBits();
+            ApplyOpeningsFromBits();
             return BuildResult(tileSetPrefix);
         }
 
@@ -194,13 +195,13 @@ namespace DungeonRunners.Managers
                         GridX = cell.x,
                         GridY = cell.y
                     });
-                    Debug.LogError($"[MazeGenerator] Placed room node src={spec.SourceIndex} tileSet='{spec.TileSet}' tile='{tileType}' grid=({cell.x},{cell.y})");
+                    Debug.LogError($"[MAZE-GENERATOR] roomNode src={spec.SourceIndex} tileSet='{spec.TileSet}' tile='{tileType}' grid=({cell.x},{cell.y})");
                     break;
                 }
             }
         }
 
-        private void GenerateCorridors()
+        private void GenerateCooridors()
         {
             int emptyRemaining = Width * Height - 1;
             for (int y = 0; y < Height; y++)
@@ -329,7 +330,7 @@ namespace DungeonRunners.Managers
             if (Sparseness <= 0)
                 return;
 
-            for (int i = 0; i < Sparseness; i++)
+            for (int sparsenessStep = 0; sparsenessStep < Sparseness; sparsenessStep++)
             {
                 var cell = GetRandomDeadEndCell();
                 if (!cell.HasValue)
@@ -418,7 +419,6 @@ namespace DungeonRunners.Managers
             byte bits = 0;
             if (suffix.Contains("1n")) bits |= DIR_NORTH;
             if (suffix.Contains("1s")) bits |= DIR_SOUTH;
-            // Native TileLibrary::char2Direction mirrors tile-name e/w against maze bits.
             if (suffix.Contains("1e")) bits |= DIR_WEST;
             if (suffix.Contains("1w")) bits |= DIR_EAST;
             return bits;
@@ -569,7 +569,7 @@ namespace DungeonRunners.Managers
                     if ((bits & 0x0F) == 0)
                         continue;
 
-                    byte emptyMask = EmptyNeighborMask(x, y);
+                    byte emptyMask = GetEmptyNeighborCellMask(x, y);
                     if (emptyMask == 0)
                         continue;
 
@@ -607,7 +607,7 @@ namespace DungeonRunners.Managers
             return candidates[NextInt(0, candidates.Count)];
         }
 
-        private byte EmptyNeighborMask(int x, int y)
+        private byte GetEmptyNeighborCellMask(int x, int y)
         {
             byte mask = 0;
             foreach (byte dir in EmptyNeighborDirs)
@@ -726,7 +726,7 @@ namespace DungeonRunners.Managers
             return y * Width + x;
         }
 
-        private void SyncOpeningsFromNativeBits()
+        private void ApplyOpeningsFromBits()
         {
             for (int y = 0; y < Height; y++)
             {
@@ -746,9 +746,9 @@ namespace DungeonRunners.Managers
         {
             int halfGridX = Width / 2;
             int halfGridY = Height / 2;
-            float nativeRootX = 0f;
-            float nativeRootY = 0f;
-            Debug.LogError($"[DUNGEON-TRANSFORM] nativeRoot=({nativeRootX:F1},{nativeRootY:F1}) tileSize={TILE_SIZE} grid={Width}x{Height} halfGrid=({halfGridX},{halfGridY}) centerOverrideIgnored=({CenterOverrideX:F1},{CenterOverrideY:F1}) yTransform=worldGridY=gridY/native-BuildWorld");
+            float clientRootX = 0f;
+            float clientRootY = 0f;
+            Debug.LogError($"[DUNGEON-TRANSFORM] clientRoot=({clientRootX:F1},{clientRootY:F1}) tileSize={TILE_SIZE} grid={Width}x{Height} halfGrid=({halfGridX},{halfGridY}) centerOverrideIgnored=({CenterOverrideX:F1},{CenterOverrideY:F1}) yTransform=worldGridY=gridY/BuildWorld");
 
             var cells = new List<MazeCell>();
 
@@ -766,8 +766,8 @@ namespace DungeonRunners.Managers
                         conns = "0n";
 
                     int worldGridY = y;
-                    float cellOX = nativeRootX + (x - halfGridX) * TILE_SIZE;
-                    float cellOY = nativeRootY + (worldGridY - halfGridY) * TILE_SIZE;
+                    float cellOX = clientRootX + (x - halfGridX) * TILE_SIZE;
+                    float cellOY = clientRootY + (worldGridY - halfGridY) * TILE_SIZE;
 
                     string tileType = _roomTileTypes[y, x];
                     if (string.IsNullOrEmpty(tileType))
@@ -806,7 +806,7 @@ namespace DungeonRunners.Managers
         {
             if (maxExclusive <= minInclusive)
                 return minInclusive;
-            return (int)NativeRngLedger.Generate(
+            return (int)RngLedger.Generate(
                 _rng,
                 "layout",
                 phase ?? "MazeGenerator::NextInt",
@@ -826,7 +826,7 @@ namespace DungeonRunners.Managers
 
         private uint GenerateLayoutRaw(string phase)
         {
-            return NativeRngLedger.Generate(_rng, "layout", phase, $"seed=0x{Seed:X8}");
+            return RngLedger.Generate(_rng, "layout", phase, $"seed=0x{Seed:X8}");
         }
 
         public void PrintMaze()

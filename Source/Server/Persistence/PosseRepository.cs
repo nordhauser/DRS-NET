@@ -21,16 +21,16 @@ namespace DungeonRunners.Database
         {
             try
             {
-                using (var conn = GameDatabase.GetConnection())
+                using (var connection = GameDatabase.GetConnection())
                 {
-                    object count = GameDatabase.ExecuteScalar(conn,
+                    object posseCount = GameDatabase.ExecuteScalar(connection,
                         "SELECT COUNT(*) FROM posses WHERE name = @n", ("@n", name));
-                    return Convert.ToInt32(count) > 0;
+                    return Convert.ToInt32(posseCount) > 0;
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] PosseNameExists error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=PosseNameExists state=failed message='{ex.Message}'");
                 return false;
             }
         }
@@ -39,21 +39,21 @@ namespace DungeonRunners.Database
         {
             try
             {
-                using (var conn = GameDatabase.GetConnection())
-                using (var tx = conn.BeginTransaction())
+                using (var connection = GameDatabase.GetConnection())
+                using (var transaction = connection.BeginTransaction())
                 {
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         @"INSERT INTO posses (name, founder_character_id, gold_paid)
                           VALUES (@n, @fid, @g)",
                         ("@n", name), ("@fid", (int)founderCharacterId), ("@g", (int)goldPaid));
 
-                    int posseId = Convert.ToInt32(GameDatabase.ExecuteScalar(conn, "SELECT last_insert_rowid()"));
+                    int posseId = Convert.ToInt32(GameDatabase.ExecuteScalar(connection, "SELECT last_insert_rowid()"));
 
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "UPDATE characters SET posse_id = @pid WHERE id = @cid",
                         ("@pid", posseId), ("@cid", (int)founderCharacterId));
 
-                    tx.Commit();
+                    transaction.Commit();
                     Debug.LogError($"[POSSE-DB] Created posse '{name}' id={posseId} founder={founderCharacterId} gold={goldPaid}");
                     return new PosseRecord
                     {
@@ -66,7 +66,7 @@ namespace DungeonRunners.Database
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] CreatePosse error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=CreatePosse state=failed message='{ex.Message}'");
                 return null;
             }
         }
@@ -76,27 +76,27 @@ namespace DungeonRunners.Database
             if (posseId == 0) return null;
             try
             {
-                using (var conn = GameDatabase.GetConnection())
-                using (var r = GameDatabase.ExecuteReader(conn,
+                using (var connection = GameDatabase.GetConnection())
+                using (var reader = GameDatabase.ExecuteReader(connection,
                     "SELECT id, name, founder_character_id, gold_paid, founded_at, COALESCE(motd,''), COALESCE(description,'') FROM posses WHERE id = @id",
                     ("@id", (int)posseId)))
                 {
-                    if (!r.Read()) return null;
+                    if (!reader.Read()) return null;
                     return new PosseRecord
                     {
-                        Id = (uint)r.GetInt32(0),
-                        Name = r.GetString(1),
-                        FounderCharacterId = (uint)r.GetInt32(2),
-                        GoldPaid = (uint)r.GetInt32(3),
-                        FoundedAt = r.IsDBNull(4) ? "" : r.GetString(4),
-                        Motd = r.GetString(5),
-                        Description = r.GetString(6),
+                        Id = (uint)reader.GetInt32(0),
+                        Name = reader.GetString(1),
+                        FounderCharacterId = (uint)reader.GetInt32(2),
+                        GoldPaid = (uint)reader.GetInt32(3),
+                        FoundedAt = reader.IsDBNull(4) ? "" : reader.GetString(4),
+                        Motd = reader.GetString(5),
+                        Description = reader.GetString(6),
                     };
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] GetPosse error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=GetPosse state=failed message='{ex.Message}'");
                 return null;
             }
         }
@@ -106,9 +106,9 @@ namespace DungeonRunners.Database
             if (posseId == 0 || string.IsNullOrEmpty(newName)) return false;
             try
             {
-                using (var conn = GameDatabase.GetConnection())
+                using (var connection = GameDatabase.GetConnection())
                 {
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "UPDATE posses SET name = @n WHERE id = @id",
                         ("@id", (int)posseId), ("@n", newName));
                     return true;
@@ -116,7 +116,7 @@ namespace DungeonRunners.Database
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] Rename error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=Rename state=failed message='{ex.Message}'");
                 return false;
             }
         }
@@ -126,9 +126,9 @@ namespace DungeonRunners.Database
             if (posseId == 0) return false;
             try
             {
-                using (var conn = GameDatabase.GetConnection())
+                using (var connection = GameDatabase.GetConnection())
                 {
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "UPDATE posses SET motd = @m WHERE id = @id",
                         ("@id", (int)posseId), ("@m", motd ?? ""));
                     return true;
@@ -136,7 +136,7 @@ namespace DungeonRunners.Database
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] SetMotd error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=SetMotd state=failed message='{ex.Message}'");
                 return false;
             }
         }
@@ -146,9 +146,9 @@ namespace DungeonRunners.Database
             if (posseId == 0) return false;
             try
             {
-                using (var conn = GameDatabase.GetConnection())
+                using (var connection = GameDatabase.GetConnection())
                 {
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "UPDATE posses SET description = @d WHERE id = @id",
                         ("@id", (int)posseId), ("@d", desc ?? ""));
                     return true;
@@ -156,7 +156,7 @@ namespace DungeonRunners.Database
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] SetDescription error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=SetDescription state=failed message='{ex.Message}'");
                 return false;
             }
         }
@@ -166,87 +166,82 @@ namespace DungeonRunners.Database
             if (posseId == 0) return 0;
             try
             {
-                using (var conn = GameDatabase.GetConnection())
+                using (var connection = GameDatabase.GetConnection())
                 {
-                    object n = GameDatabase.ExecuteScalar(conn,
+                    object memberCount = GameDatabase.ExecuteScalar(connection,
                         "SELECT COUNT(*) FROM characters WHERE posse_id = @pid", ("@pid", (int)posseId));
-                    return Convert.ToInt32(n);
+                    return Convert.ToInt32(memberCount);
                 }
             }
             catch { return 0; }
         }
 
-        // List member character names for a posse. Used by /posse members chat echo.
         public static System.Collections.Generic.List<string> MemberNames(uint posseId)
         {
             var result = new System.Collections.Generic.List<string>();
             if (posseId == 0) return result;
             try
             {
-                using (var conn = GameDatabase.GetConnection())
-                using (var r = GameDatabase.ExecuteReader(conn,
+                using (var connection = GameDatabase.GetConnection())
+                using (var reader = GameDatabase.ExecuteReader(connection,
                     "SELECT name FROM characters WHERE posse_id = @pid ORDER BY id",
                     ("@pid", (int)posseId)))
                 {
-                    while (r.Read())
-                        result.Add(r.GetString(0));
+                    while (reader.Read())
+                        result.Add(reader.GetString(0));
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] MemberNames error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=MemberNames state=failed message='{ex.Message}'");
             }
             return result;
         }
 
-        // Clears a single character's posse_id (used by /posse leave for non-last-member exit).
         public static void ClearCharacterMembership(uint characterId, int cooldownExpiresUnix)
         {
             try
             {
-                using (var conn = GameDatabase.GetConnection())
+                using (var connection = GameDatabase.GetConnection())
                 {
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "UPDATE characters SET posse_id = 0, posse_join_cooldown = @cd WHERE id = @cid",
                         ("@cid", (int)characterId), ("@cd", cooldownExpiresUnix));
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] ClearCharacterMembership error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=ClearCharacterMembership state=failed message='{ex.Message}'");
             }
         }
 
-        // Deletes a posse row + clears posse_id from every member, transactionally.
-        // Used by /posse disband and by the last-member-leaves path. Returns the
-        // names of the affected characters so callers can notify them.
         public static System.Collections.Generic.List<string> DisbandPosse(uint posseId, int cooldownExpiresUnix)
         {
             var memberNames = new System.Collections.Generic.List<string>();
             if (posseId == 0) return memberNames;
             try
             {
-                using (var conn = GameDatabase.GetConnection())
-                using (var tx = conn.BeginTransaction())
+                using (var connection = GameDatabase.GetConnection())
+                using (var transaction = connection.BeginTransaction())
                 {
-                    using (var r = GameDatabase.ExecuteReader(conn,
+                    using (var reader = GameDatabase.ExecuteReader(connection,
                         "SELECT name FROM characters WHERE posse_id = @pid",
                         ("@pid", (int)posseId)))
                     {
-                        while (r.Read()) memberNames.Add(r.GetString(0));
+                        while (reader.Read()) memberNames.Add(reader.GetString(0));
                     }
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "UPDATE characters SET posse_id = 0, posse_join_cooldown = @cd WHERE posse_id = @pid",
                         ("@pid", (int)posseId), ("@cd", cooldownExpiresUnix));
-                    GameDatabase.ExecuteNonQuery(conn,
+                    GameDatabase.ExecuteNonQuery(connection,
                         "DELETE FROM posses WHERE id = @pid", ("@pid", (int)posseId));
-                    tx.Commit();
+                    transaction.Commit();
                     Debug.LogError($"[POSSE-DB] Disbanded posse id={posseId} (members affected={memberNames.Count})");
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[POSSE-DB] DisbandPosse error: {ex.Message}");
+                Debug.LogError($"[POSSE-DB] operation=DisbandPosse state=failed message='{ex.Message}'");
             }
             return memberNames;
         }

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using DungeonRunners.Core;
 using DungeonRunners.Engine;
@@ -22,10 +22,10 @@ namespace DungeonRunners.Combat
         public string CreatureType;
         public string Element;
         public string Tier;
-        public byte Level = 10;  // CRITICAL - must not be 0 or client crashes!
-        public float Difficulty = 1.0f;  // From Tables.gc — XP multiplier (RECRUIT=1.0, VETERAN=2.0, etc)
+        public byte Level = 10;
+        public float Difficulty = 1.0f;
         public float ExperienceDifficulty = 1.0f;
-        public string SpawnGCType;  // dungeon-specific GC path for spawn packet
+        public string SpawnGCType;
         public List<string> AuthoredArchetypeAncestry = new List<string>();
         public string InstanceKey;
         public uint MaxHPWire;
@@ -34,11 +34,11 @@ namespace DungeonRunners.Combat
         public uint LastClientHPReportWire;
         public bool DeathPendingClientConfirmation;
         public float DeathPendingSince;
-        public byte NativeDeathState;
-        public ushort NativeCorpseTicksRemaining;
-        public ushort NativeFadeTicksRemaining;
-        public bool NativeDeathLifecycleActive;
-        public bool NativeDeathRemoveSent;
+        public byte DeathState;
+        public ushort CorpseTicksRemaining;
+        public ushort FadeTicksRemaining;
+        public bool DeathLifecycleActive;
+        public bool DeathRemoveSent;
         public uint MaxManaWire;
         public uint CurrentManaWire;
         public int BaseDamage;
@@ -53,8 +53,8 @@ namespace DungeonRunners.Combat
         public float WeaponProjectileSpeed = 0f;
         public float WeaponProjectileSize = 0f;
         public float WeaponRange = 0f;
-        public int NativeWeaponClassId = 1;
-        public int NativeDamageTypeId = 0;
+        public int WeaponClassId = 1;
+        public int DamageTypeId = 0;
         public float HealthRegen = 0f;
         public bool HasAuthoredHealthRegen;
         public float ManaRegen = 0f;
@@ -84,6 +84,13 @@ namespace DungeonRunners.Combat
         public float ClientVisiblePosX, ClientVisiblePosY;
         public float ClientVisibleMoveTargetX, ClientVisibleMoveTargetY;
         public float ClientVisibleMoveLastTime;
+        public int ClientVisibleFixedX, ClientVisibleFixedY;
+        public bool ClientVisibleFixedInit;
+        public int ClientVisibleHeadingFixed;
+        public bool ClientVisibleHeadingInit;
+        public int ChaseHeadingFixed;
+        public bool ChaseHeadingInit;
+        public int TurnRateDegrees = 360;
         public byte SessionId;
         public float Heading;
 
@@ -109,6 +116,7 @@ namespace DungeonRunners.Combat
         public int CollisionPriority;
         public float ScanFrequency;
         public short ProximityScanCountdownTicks = 30;
+        public short UpdateSkillsTimerTicks = 30;
         public float FleeRange;
         public float RetreatRangeSquared;
         public float TeleportFrequency;
@@ -128,15 +136,12 @@ namespace DungeonRunners.Combat
 
         public uint RngSeed;
         public MersenneTwister Rng;
-        public NativeUnitSlotState NativeSlots = new NativeUnitSlotState();
-        public NativeMonsterAiRuntime NativeAi = new NativeMonsterAiRuntime();
+        public UnitSlotState Slots = new UnitSlotState();
+        public MonsterAiRuntime Ai = new MonsterAiRuntime();
 
-        // Manipulators from creature database
         public Dictionary<string, ManipulatorData> Manipulators;
         public bool AggroSent { get; set; }
 
-        // UpdateNumber tracking for HP synch - client counts every synch update
-        // and expects this counter packed into low byte of HP value
         public byte UpdateNumber = 0;
 
         private volatile int _stateInt = (int)MonsterState.Idle;
@@ -165,12 +170,26 @@ namespace DungeonRunners.Combat
         public byte AttackSessionId;
         public byte AttackAnimationIndex;
         public uint AttackUseRaw;
-        public uint AttackSearchTargetId;
-        public uint AttackSearchRaw;
-        public uint AttackSearchTieRaw;
+        public float SpellKnockDownEndTime;
+        public int SpellKnockDownStrength;
+        public uint SpellKnockDownSourceEntityId;
+        public float KnockBackStartX, KnockBackStartY;
+        public float KnockBackDestX, KnockBackDestY;
+        public float KnockBackStartTime;
+        public bool KnockBackActive;
+        public int MeleeSmClock;
+        public uint MeleeScanTargetId;
+        public bool FollowMsgArmed;
+        public int FollowMsgNextTick;
+        public int ScanSubstate;
+        public int ScanCountdown;
+        public int ScanMsgNextTick;
+        public float ScanRepositionStartDist;
+        public int ScanRepositionCount;
+        public Behavior.MonsterBehavior2 Behavior;
         public bool AttackClientVisible;
         public float AttackClientVisibleTime;
-        public bool AttackNativeContactOnly;
+        public bool AttackContactOnly;
         public bool AttackHitResolved;
         public bool UsePrimaryActiveSkillThisAttack;
         public bool HasMultiAttackStateDraw;
@@ -204,14 +223,14 @@ namespace DungeonRunners.Combat
         public int[] AttackHitFrames = new int[] { 0, 0, 0 };
         public int[] AttackSoundFrames = new int[] { 0, 0, 0 };
         public bool[] AttackFrameResolved = new bool[] { false, false, false };
-        public NativeResolutionSource AttackTimingSource = NativeResolutionSource.Blocked;
+        public ResolutionSource AttackTimingSource = ResolutionSource.Blocked;
         public string AttackTimingReason = "unresolved";
         public float AttackCommitTargetX;
         public float AttackCommitTargetY;
         public uint CombatContactTargetId;
         public float CombatContactUntil;
         public uint AlertSourceEntityId;
-        public float SpawnTime;  // Time.time when spawned - skip first move packet
+        public float SpawnTime;
         private volatile bool _aggroTriggered = false;
         public bool AggroTriggered
         {
@@ -221,13 +240,14 @@ namespace DungeonRunners.Combat
         private Dictionary<uint, int> _threatTable = new Dictionary<uint, int>();
         public string ZoneName;
         public string EncounterGroupKey;
-        public NativeEncounterRuntime NativeEncounter;
-        public byte NativeEncounterObjectState;
-        public byte NativeEncounterLiveUnitCount;
-        public byte NativeEncounterReturningUnitCount;
-        public ushort NativeEncounterActiveTimer;
-        public ushort NativeEncounterScanTimer = 0x1E;
-        public bool NativeEncounterScanEnabled = true;
+        public EncounterRuntime Encounter;
+        public uint EncounterObjectEntityId;
+        public byte EncounterObjectState;
+        public byte EncounterLiveUnitCount;
+        public byte EncounterReturningUnitCount;
+        public ushort EncounterActiveTimer;
+        public ushort EncounterScanTimer = 0x1E;
+        public bool EncounterScanEnabled = true;
         public int HP => (int)(CurrentHPWire / 256);
         public int MaxHP => (int)(MaxHPWire / 256);
         public void AddThreat(uint playerId, int amount)
@@ -248,12 +268,12 @@ namespace DungeonRunners.Combat
 
     public enum MonsterState
     {
-        Idle,       // Binary state 0 — wandering, fidgeting
-        Chase,      // Moving toward target
-        Combat,     // Binary state 5 — engaged in combat
-        Attacking,  // Binary state 6 — actively executing attack
-        Return,     // Binary state 7 — returning to spawn
-        Dead        // Monster died
+        Idle,
+        Chase,
+        Combat,
+        Attacking,
+        Return,
+        Dead
     }
 
     public class MonsterActiveSkillRuntime

@@ -43,11 +43,11 @@ namespace DungeonRunners.Core
             string fileName = collisionObjectName.Trim();
             string[] roots = { DungeonRunners.Core.DataPaths.CobjDir };
 
-            for (int i = 0; i < roots.Length; i++)
+            for (int rootIndex = 0; rootIndex < roots.Length; rootIndex++)
             {
-                string path = Path.Combine(roots[i], fileName + ".cobj");
+                string path = Path.Combine(roots[rootIndex], fileName + ".cobj");
                 if (!File.Exists(path))
-                    path = Path.Combine(roots[i], fileName + ".cobj.bytes");
+                    path = Path.Combine(roots[rootIndex], fileName + ".cobj.bytes");
                 if (!File.Exists(path))
                     continue;
 
@@ -58,7 +58,7 @@ namespace DungeonRunners.Core
                     return true;
                 }
 
-                Debug.LogError($"[COBJ] parse-failed name='{fileName}' path='{path}' error='{error}' native=HybridCollisionObject::readObject");
+                Debug.LogError($"[COBJ] parse-failed name='{fileName}' path='{path}' error='{error}' sourceFunction=HybridCollisionObject::readObject");
                 return false;
             }
 
@@ -98,8 +98,8 @@ namespace DungeonRunners.Core
 
                 int walkCount = parsed.WalkGridX * parsed.WalkGridY;
                 parsed._walkHeights = new short[walkCount];
-                for (int i = 0; i < walkCount; i++)
-                    parsed._walkHeights[i] = reader.ReadInt16();
+                for (int walkIndex = 0; walkIndex < walkCount; walkIndex++)
+                    parsed._walkHeights[walkIndex] = reader.ReadInt16();
 
                 parsed.BlockCellSize = reader.ReadInt32();
                 parsed.BlockOriginX = reader.ReadInt32();
@@ -117,14 +117,14 @@ namespace DungeonRunners.Core
 
                 int bucketCount = parsed.BlockGridX * parsed.BlockGridY;
                 parsed._blockBuckets = new List<VerticalRange>[bucketCount];
-                for (int i = 0; i < bucketCount; i++)
+                for (int bucketIndex = 0; bucketIndex < bucketCount; bucketIndex++)
                 {
                     ushort count = reader.ReadUInt16();
                     if (count == 0)
                         continue;
 
                     var ranges = new List<VerticalRange>(count);
-                    for (int j = 0; j < count; j++)
+                    for (int rangeIndex = 0; rangeIndex < count; rangeIndex++)
                     {
                         var range = new VerticalRange
                         {
@@ -134,7 +134,7 @@ namespace DungeonRunners.Core
                         ranges.Add(range);
                         parsed.RangeCount++;
                     }
-                    parsed._blockBuckets[i] = ranges;
+                    parsed._blockBuckets[bucketIndex] = ranges;
                     parsed.NonEmptyBuckets++;
                 }
 
@@ -214,8 +214,8 @@ namespace DungeonRunners.Core
             int dy = endY - startY;
             int dz = endZ - startZ;
             int maxAbs = Math.Max(Math.Abs(dx), Math.Max(Math.Abs(dy), Math.Abs(dz)));
-            int n = (maxAbs >> 8) / 3;
-            if (n <= 0)
+            int sampleCount = (maxAbs >> 8) / 3;
+            if (sampleCount <= 0)
             {
                 if (TestBoundingBoxFixed(endX, endY, endZ, radiusFixed))
                 {
@@ -225,18 +225,18 @@ namespace DungeonRunners.Core
                 return false;
             }
 
-            int denom = (n + 1) << 8;
-            int stepX = (int)(((long)dx << 8) / denom);
-            int stepY = (int)(((long)dy << 8) / denom);
-            int stepZ = (int)(((long)dz << 8) / denom);
-            for (int j = 1; j <= n; j++)
+            int denominator = (sampleCount + 1) << 8;
+            int stepX = (int)(((long)dx << 8) / denominator);
+            int stepY = (int)(((long)dy << 8) / denominator);
+            int stepZ = (int)(((long)dz << 8) / denominator);
+            for (int sampleIndex = 1; sampleIndex <= sampleCount; sampleIndex++)
             {
-                int sampleX = startX + (stepX * j);
-                int sampleY = startY + (stepY * j);
-                int sampleZ = startZ + (stepZ * j);
+                int sampleX = startX + (stepX * sampleIndex);
+                int sampleY = startY + (stepY * sampleIndex);
+                int sampleZ = startZ + (stepZ * sampleIndex);
                 if (!TestBoundingBoxFixed(sampleX, sampleY, sampleZ, radiusFixed))
                     continue;
-                tHit = j / (float)(n + 1);
+                tHit = sampleIndex / (float)(sampleCount + 1);
                 return true;
             }
             return false;
@@ -281,9 +281,9 @@ namespace DungeonRunners.Core
                     var ranges = _blockBuckets[gy * BlockGridX + gx];
                     if (ranges == null)
                         continue;
-                    for (int i = 0; i < ranges.Count; i++)
+                    for (int rangeIndex = 0; rangeIndex < ranges.Count; rangeIndex++)
                     {
-                        var range = ranges[i];
+                        var range = ranges[rangeIndex];
                         float low = BlockOriginZ + range.LowZ;
                         float high = BlockOriginZ + range.HighZ;
                         if (maxZ >= low && minZ <= high)
@@ -318,26 +318,26 @@ namespace DungeonRunners.Core
             if (gx >= gridW - 1 || gy >= gridH - 1)
                 return false;
 
-            int idx = gridW * gy + gx;
-            if (idx < 0 || idx + gridW + 1 >= _walkHeights.Length)
+            int heightIndex = gridW * gy + gx;
+            if (heightIndex < 0 || heightIndex + gridW + 1 >= _walkHeights.Length)
                 return false;
 
-            int s1 = _walkHeights[idx];
-            int s2 = _walkHeights[idx + 1];
-            int s3 = _walkHeights[idx + gridW];
-            int s4 = _walkHeights[idx + gridW + 1];
+            int sample1 = _walkHeights[heightIndex];
+            int sample2 = _walkHeights[heightIndex + 1];
+            int sample3 = _walkHeights[heightIndex + gridW];
+            int sample4 = _walkHeights[heightIndex + gridW + 1];
             const int Sentinel = -0x7fff;
-            if (s1 == Sentinel || s2 == Sentinel || s3 == Sentinel || s4 == Sentinel)
+            if (sample1 == Sentinel || sample2 == Sentinel || sample3 == Sentinel || sample4 == Sentinel)
                 return false;
-            if (Math.Abs(s1 - s2) >= 0x33 || Math.Abs(s1 - s3) >= 0x33 || Math.Abs(s1 - s4) >= 0x33)
+            if (Math.Abs(sample1 - sample2) >= 0x33 || Math.Abs(sample1 - sample3) >= 0x33 || Math.Abs(sample1 - sample4) >= 0x33)
                 return false;
 
             int cell8 = cellSize * 0x100;
             int fracX = ((x - ((gx * 0x100 * cell8) >> 8)) * 0x100) / cell8;
             int fracY = ((y - ((gy * 0x100 * cell8) >> 8)) * 0x100) / cell8;
 
-            int topRow = ((s3 * 0x100 * (0x100 - fracX)) >> 8) + ((s4 * 0x100 * fracX) >> 8);
-            int botRow = ((s1 * 0x100 * (0x100 - fracX)) >> 8) + ((s2 * 0x100 * fracX) >> 8);
+            int topRow = ((sample3 * 0x100 * (0x100 - fracX)) >> 8) + ((sample4 * 0x100 * fracX) >> 8);
+            int botRow = ((sample1 * 0x100 * (0x100 - fracX)) >> 8) + ((sample2 * 0x100 * fracX) >> 8);
             heightFixed8 = ((((topRow * fracY) >> 8) + (((0x100 - fracY) * botRow) >> 8)) * 0x100) / 0xa00;
             return true;
         }

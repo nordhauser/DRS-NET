@@ -5,108 +5,80 @@ using DungeonRunners.Engine;
 using DB = DungeonRunners.Database.GameDatabase;
 using DungeonRunners.Utilities;
 
-namespace DungeonRunners.Managers
+namespace DungeonRunners.Gameplay
 {
-    // ═══════════════════════════════════════════════════════════════════════════
-    // WORLD ENTITY SPAWNER — Spawns static world entities from zone_world_entities DB
-    //
-    // Handles: Chests, Shrines, Gates, Teleporters, NPC Portraits, and any
-    // other NonCombatInteractive entities defined in .world files.
-    //
-    // All entities use the same spawn format as portals/checkpoints:
-    //   0x01 (Create) + entityId + GCType
-    //   0x02 (Init)   + entityId + flags + pos + heading + initFlags
-    //
-    // Activation is routed by entity_type:
-    //   chest      → open, drop loot, despawn
-    //   teleporter → zone player to target
-    //   shrine     -> BLOCKED(native-action-buff)
-    //   gate       -> BLOCKED(native-action-unlock)
-    //   npc        -> BLOCKED(native-dialog-flow)
-    // ═══════════════════════════════════════════════════════════════════════════
-
     public class WorldEntitySpawner
     {
         private static WorldEntitySpawner _instance;
         public static WorldEntitySpawner Instance => _instance ??= new WorldEntitySpawner();
 
-        // DB data keyed by zone name (lowercase)
         private Dictionary<string, List<WorldEntityData>> _entitiesByZone
             = new Dictionary<string, List<WorldEntityData>>(StringComparer.OrdinalIgnoreCase);
 
-        // Live spawned entities keyed by entityId → data (for activation lookup)
         private Dictionary<ushort, WorldEntityData> _spawnedEntities
             = new Dictionary<ushort, WorldEntityData>();
 
-        // ═══════════════════════════════════════════════════════════════
-        // INITIALIZATION — Load from DB
-        // ═══════════════════════════════════════════════════════════════
 
         public void Initialize()
         {
             _entitiesByZone.Clear();
             int count = 0;
 
-            using (var c = DB.GetConnection())
+            using (var connection = DB.GetConnection())
             {
-                // Check if table exists
                 try
                 {
-                    using (var r = DB.ExecuteReader(c, "SELECT * FROM zone_world_entities"))
+                    using (var reader = DB.ExecuteReader(connection, "SELECT * FROM zone_world_entities"))
                     {
-                        while (r.Read())
+                        while (reader.Read())
                         {
-                            var e = new WorldEntityData
+                            var entityData = new WorldEntityData
                             {
-                                Id = DB.GetInt(r, "id"),
-                                Zone = DB.GetString(r, "zone"),
-                                Name = DB.GetString(r, "name"),
-                                GCType = DB.GetString(r, "gc_type"),
-                                EntityType = DB.GetString(r, "entity_type"),
-                                PosX = DB.GetFloat(r, "pos_x"),
-                                PosY = DB.GetFloat(r, "pos_y"),
-                                PosZ = DB.GetFloat(r, "pos_z"),
-                                Heading = DB.GetFloat(r, "heading"),
-                                Flags = (uint)DB.GetInt(r, "flags"),
-                                ItemGenerator = DB.GetString(r, "item_generator"),
-                                ItemCount = DB.GetInt(r, "item_count"),
-                                ItemGenerator2 = DB.GetString(r, "item_generator2"),
-                                ItemCount2 = DB.GetInt(r, "item_count2"),
-                                ItemGenerator3 = DB.GetString(r, "item_generator3"),
-                                ItemCount3 = DB.GetInt(r, "item_count3"),
-                                ItemGenerator4 = DB.GetString(r, "item_generator4"),
-                                ItemCount4 = DB.GetInt(r, "item_count4"),
-                                ItemGenerator5 = DB.GetString(r, "item_generator5"),
-                                ItemCount5 = DB.GetInt(r, "item_count5"),
-                                TargetZone = DB.GetString(r, "target_zone"),
-                                TargetSpawn = DB.GetString(r, "target_spawn"),
-                                Label = DB.GetString(r, "label"),
-                                AllowMultiple = DB.GetInt(r, "allow_multiple") != 0
+                                Id = DB.GetInt(reader, "id"),
+                                Zone = DB.GetString(reader, "zone"),
+                                Name = DB.GetString(reader, "name"),
+                                GCType = DB.GetString(reader, "gc_type"),
+                                EntityType = DB.GetString(reader, "entity_type"),
+                                PosX = DB.GetFloat(reader, "pos_x"),
+                                PosY = DB.GetFloat(reader, "pos_y"),
+                                PosZ = DB.GetFloat(reader, "pos_z"),
+                                Heading = DB.GetFloat(reader, "heading"),
+                                Flags = (uint)DB.GetInt(reader, "flags"),
+                                ItemGenerator = DB.GetString(reader, "item_generator"),
+                                ItemCount = DB.GetInt(reader, "item_count"),
+                                ItemGenerator2 = DB.GetString(reader, "item_generator2"),
+                                ItemCount2 = DB.GetInt(reader, "item_count2"),
+                                ItemGenerator3 = DB.GetString(reader, "item_generator3"),
+                                ItemCount3 = DB.GetInt(reader, "item_count3"),
+                                ItemGenerator4 = DB.GetString(reader, "item_generator4"),
+                                ItemCount4 = DB.GetInt(reader, "item_count4"),
+                                ItemGenerator5 = DB.GetString(reader, "item_generator5"),
+                                ItemCount5 = DB.GetInt(reader, "item_count5"),
+                                TargetZone = DB.GetString(reader, "target_zone"),
+                                TargetSpawn = DB.GetString(reader, "target_spawn"),
+                                Label = DB.GetString(reader, "label"),
+                                AllowMultiple = DB.GetInt(reader, "allow_multiple") != 0
                             };
 
-                            string key = e.Zone.ToLower();
+                            string key = entityData.Zone.ToLower();
                             if (!_entitiesByZone.ContainsKey(key))
                                 _entitiesByZone[key] = new List<WorldEntityData>();
-                            _entitiesByZone[key].Add(e);
+                            _entitiesByZone[key].Add(entityData);
                             count++;
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogError($"[WorldEntitySpawner] zone_world_entities table not found or error: {ex.Message}");
-                    Debug.LogError($"[WorldEntitySpawner] Run zone_world_entities.sql to create the table.");
+                    Debug.LogError($"[WORLD-ENTITY-SPAWNER] table=zone_world_entities state=error message='{ex.Message}'");
+                    Debug.LogError($"[WORLD-ENTITY-SPAWNER] table=zone_world_entities state=missing");
                     return;
                 }
             }
 
-            Debug.LogError($"[WorldEntitySpawner] Loaded {count} world entities across {_entitiesByZone.Count} zones");
+            Debug.LogError($"[WORLD-ENTITY-SPAWNER] loaded={count} zones={_entitiesByZone.Count}");
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // SPAWN — Generate entity packets for a zone
-        // Returns list of (entityId, data) for tracking by UGS
-        // ═══════════════════════════════════════════════════════════════
 
         public List<SpawnedWorldEntity> GetEntitiesForZone(string zoneName)
         {
@@ -123,114 +95,62 @@ namespace DungeonRunners.Managers
             return result;
         }
 
-        /// <summary>
-        /// Write entity spawn bytes into a LEWriter stream.
-        /// Caller manages entityId assignment and BeginStream/EndStream.
-        /// </summary>
         public static void WriteEntitySpawn(LEWriter writer, ushort entityId, ushort behaviorId, WorldEntityData data)
         {
-            // 0x01 Create entity
             writer.WriteByte(0x01);
             writer.WriteUInt16(entityId);
             WriteGCType(writer, data.GCType);
 
-            // 0x02 Init entity
             writer.WriteByte(0x02);
             writer.WriteUInt16(entityId);
-            writer.WriteUInt32(data.Flags);  // flags from DB (default 0x07)
+            writer.WriteUInt32(data.Flags);
 
-            // Position (Fixed32)
             writer.WriteInt32((int)(data.PosX * 256));
             writer.WriteInt32((int)(data.PosY * 256));
             writer.WriteInt32((int)(data.PosZ * 256));
             writer.WriteInt32((int)(data.Heading * 256));
 
-            // initFlags — no additional data for NCIs
             writer.WriteByte(0x00);
-
-            // ═══════════════════════════════════════════════════════════
-            // NCI/Door extra init bytes — binary proven:
-            //
-            // NCI::readInit @ 0x5A8E20 reads AFTER WorldEntity::readInit:
-            //   byte  → +0x31D (activation flags: bit0=activated, bit1=multiActivate)
-            //   byte  → +0x326 (state)
-            //   uint16 → +0x324 (counter)
-            //   Then conditional linked list if GC flag bit 0x80 at +0x1B3
-            //
-            // Door::readInit @ 0x5A6A10 reads AFTER WorldEntity::readInit:
-            //   byte  → door state bits at +0xC8
-            //   byte  → more door state bits at +0xC8
-            //   (Door does NOT go through NCI::readInit)
-            // ═══════════════════════════════════════════════════════════
 
             if (data.IsGate)
             {
-                // Door::readInit @ 0x5A6A10 — calls WorldEntity directly, 2 bytes:
-                writer.WriteByte(0x00);  // door open/closed state
-                writer.WriteByte(0x00);  // additional door flags
+                writer.WriteByte(0x00);
+                writer.WriteByte(0x00);
             }
             else
             {
-                // Intermediate parent::readInit @ 0x50A580 — 6 bytes:
-                //   byte  → flags (0x00 = no conditional data)
-                //   byte  → +0x314 (level/mode)
-                //   uint16 → +0x316
-                //   uint16 → +0x318
-                writer.WriteByte(0x00);  // intermediate flags (no conditionals)
-                writer.WriteByte(0x00);  // level/mode
-                writer.WriteUInt16(0);   // +0x316
-                writer.WriteUInt16(0);   // +0x318
+                writer.WriteByte(0x00);
+                writer.WriteByte(0x00);
+                writer.WriteUInt16(0);
+                writer.WriteUInt16(0);
 
-                // NCI::readInit @ 0x5A8E20 — 4 bytes:
-                //   byte  → +0x31D (activation flags)
-                //   byte  → +0x326 (state)
-                //   uint16 → +0x324 (counter)
-                writer.WriteByte(0x00);  // activation flags (0 = not activated)
-                writer.WriteByte(0x00);  // state (0 = default)
-                writer.WriteUInt16(0);   // counter (0 = none)
+                writer.WriteByte(0x00);
+                writer.WriteByte(0x00);
+                writer.WriteUInt16(0);
 
-                // 0x32 CreateChild: Behavior
-                // TTD-PROVEN: processComponentCreate@0x5DB30D reads 1 flag byte,
-                // then ALWAYS calls readInit@0x5DB379 (vtable+0xC0).
-                // There is NO "hasInit" byte — readInit always runs.
-                // UnitBehavior::readInit = Behavior(4) + UnitMover(23) + own(3) = 30 bytes
                 writer.WriteByte(0x32);
                 writer.WriteUInt16(entityId);
                 writer.WriteUInt16(behaviorId);
                 WriteGCType(writer, "base.noncombatinteractive.behavior");
 
-                // Flag byte — consumed by processComponentCreate, stored in [child+0x60]
                 writer.WriteByte(0x01);
 
-                // ── Behavior::readInit (4 bytes) ──
-                // Byte 1: flags (XOR'd with [behavior+0x7C])
                 writer.WriteByte(0xFF);
-                // Byte 2: action class ID — 0x00 = NO action (skips createAction)
                 writer.WriteByte(0x00);
-                // Byte 3: second action class ID — 0x00 = skip
                 writer.WriteByte(0x00);
-                // Byte 4: end byte
                 writer.WriteByte(0x01);
 
-                // ── UnitMover::readInit (10 bytes, flags=0x08) ──
-                // flags=0x08 (bit 3) → mover+0x60 bit 3 set. Combined with GC default
-                // bit 0, enables UnitMover::Update@0x535839 scene heading application.
-                writer.WriteByte(0x08);  // mover flags
-                writer.WriteInt32((int)(data.Heading * 256));  // mover+0x64
-                writer.WriteInt32((int)(data.Heading * 256));  // mover+0x68
-                writer.WriteByte(0x00);  // waypoint
+                writer.WriteByte(0x08);
+                writer.WriteInt32((int)(data.Heading * 256));
+                writer.WriteInt32((int)(data.Heading * 256));
+                writer.WriteByte(0x00);
 
-                // ── UnitBehavior::readInit own (3 bytes) ──
-                writer.WriteByte(0xFF);  // flags
-                writer.WriteByte(0x00);  // extra
-                writer.WriteByte(0x00);  // extra2
+                writer.WriteByte(0xFF);
+                writer.WriteByte(0x00);
+                writer.WriteByte(0x00);
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // ACTIVATION — Route entity activation by type
-        // Returns the entity type so UGS can handle it appropriately
-        // ═══════════════════════════════════════════════════════════════
 
         public void TrackSpawnedEntity(ushort entityId, WorldEntityData data)
         {
@@ -244,19 +164,18 @@ namespace DungeonRunners.Managers
 
         public bool FindEntityByName(string name, string zoneName, out ushort entityId, out WorldEntityData data)
         {
-            // Strip instance suffix: "dungeon00_level03_boss_inst2147483649" → "dungeon00_level03_boss"
             string baseZone = zoneName;
             int instIdx = zoneName.IndexOf("_inst", StringComparison.OrdinalIgnoreCase);
             if (instIdx > 0) baseZone = zoneName.Substring(0, instIdx);
 
-            foreach (var kvp in _spawnedEntities)
+            foreach (var entityEntry in _spawnedEntities)
             {
-                var e = kvp.Value;
-                if (string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(e.Zone, baseZone, StringComparison.OrdinalIgnoreCase))
+                var entity = entityEntry.Value;
+                if (string.Equals(entity.Name, name, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(entity.Zone, baseZone, StringComparison.OrdinalIgnoreCase))
                 {
-                    entityId = kvp.Key;
-                    data = e;
+                    entityId = entityEntry.Key;
+                    data = entity;
                     return true;
                 }
             }
@@ -280,9 +199,6 @@ namespace DungeonRunners.Managers
             _spawnedEntities.Clear();
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // HELPERS
-        // ═══════════════════════════════════════════════════════════════
 
         private static void WriteGCType(LEWriter writer, string typeName)
         {
@@ -291,9 +207,6 @@ namespace DungeonRunners.Managers
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // DATA CLASSES
-    // ═══════════════════════════════════════════════════════════════════════════
 
     [Serializable]
     public class WorldEntityData
@@ -302,12 +215,11 @@ namespace DungeonRunners.Managers
         public string Zone;
         public string Name;
         public string GCType;
-        public string EntityType;       // chest, gate, shrine, teleporter, npc, nci
+        public string EntityType;
         public float PosX, PosY, PosZ;
         public float Heading;
-        public uint Flags;              // Default 0x07 = visible|activatable|blocking
+        public uint Flags;
 
-        // Chest fields
         public string ItemGenerator;
         public int ItemCount;
         public string ItemGenerator2;
@@ -319,11 +231,9 @@ namespace DungeonRunners.Managers
         public string ItemGenerator5;
         public int ItemCount5;
 
-        // Teleporter fields
         public string TargetZone;
         public string TargetSpawn;
 
-        // General
         public string Label;
         public bool AllowMultiple;
 
@@ -333,21 +243,24 @@ namespace DungeonRunners.Managers
         public bool IsGate => EntityType == "gate";
         public bool IsNPC => EntityType == "npc";
 
-        public IEnumerable<(string Generator, int Count, int Slot)> GetNativeChestGenerators(string fallbackGenerator, int fallbackCount)
+        public IEnumerable<(string Generator, int Count, int Slot)> GetChestGenerators(string fallbackGenerator, int fallbackCount)
         {
-            string gen1 = !string.IsNullOrWhiteSpace(ItemGenerator) ? ItemGenerator : fallbackGenerator;
-            int count1 = ItemCount > 0 ? ItemCount : fallbackCount;
-            if (!string.IsNullOrWhiteSpace(gen1) && count1 > 0) yield return (gen1, count1, 1);
-            if (!string.IsNullOrWhiteSpace(ItemGenerator2) && ItemCount2 > 0) yield return (ItemGenerator2, ItemCount2, 2);
-            if (!string.IsNullOrWhiteSpace(ItemGenerator3) && ItemCount3 > 0) yield return (ItemGenerator3, ItemCount3, 3);
-            if (!string.IsNullOrWhiteSpace(ItemGenerator4) && ItemCount4 > 0) yield return (ItemGenerator4, ItemCount4, 4);
-            if (!string.IsNullOrWhiteSpace(ItemGenerator5) && ItemCount5 > 0) yield return (ItemGenerator5, ItemCount5, 5);
+            var storedGenerators = new (string Generator, int Count)[]
+            {
+                (ItemGenerator, ItemCount),
+                (ItemGenerator2, ItemCount2),
+                (ItemGenerator3, ItemCount3),
+                (ItemGenerator4, ItemCount4),
+                (ItemGenerator5, ItemCount5)
+            };
+            foreach (var generator in WorldEntityLoot.GetNonCombatInteractiveItemGenerators(GCType, storedGenerators, fallbackGenerator, fallbackCount))
+                yield return generator;
         }
     }
 
     public class SpawnedWorldEntity
     {
         public WorldEntityData Data;
-        public ushort EntityId;         // Assigned by UGS during spawn
+        public ushort EntityId;
     }
 }

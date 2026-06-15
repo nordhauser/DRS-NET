@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -8,7 +8,7 @@ using DungeonRunners.Utilities;
 using DungeonRunners.Networking;
 using DungeonRunners.Data;
 
-namespace DungeonRunners.Managers
+namespace DungeonRunners.Gameplay
 {
     public class QuestManager
     {
@@ -18,8 +18,6 @@ namespace DungeonRunners.Managers
         private Dictionary<string, PlayerQuestState> _playerQuests = new Dictionary<string, PlayerQuestState>();
         private Action<RRConnection, byte, byte, byte[]> _sendPacket;
         private Func<RRConnection, LEWriter, bool> _writeEntitySynch;
-        private static readonly object _autoCompleteOnAcceptLock = new object();
-        private static HashSet<string> _autoCompleteOnAcceptQuestIds;
         private static readonly object _killGCByLabelLock = new object();
         private static Dictionary<string, HashSet<string>> _packageBackedKillGCByLabel;
         private static readonly Regex _lineCommentRegex = new Regex(@"//.*?$", RegexOptions.Multiline | RegexOptions.Compiled);
@@ -27,20 +25,6 @@ namespace DungeonRunners.Managers
         private static readonly Regex _questLabelRegex = new Regex(@"\bLabel\s*=\s*""(?<label>[^""]+)""", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex _questMonsterTypeRegex = new Regex(@"\bMonsterType\d*\s*=\s*(?<monster>[^;\s]+)\s*;", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Quest kill-objective monster-type lookup, parsed from Q*.gc files
-        // (plus manual entries for hand-authored DB quests).
-        //
-        // USED ONLY when quest_objective_templates.target is empty in the DB.
-        // Empty target = the original GC stored multiple MonsterTypeN values
-        // and the DB import didn't unfold them into a target column.
-        //
-        // Without this dict, empty-target objectives matched EVERY kill in
-        // the game (the IsNullOrEmpty branch was an unintentional wildcard,
-        // which is why killing a blademaster ticked the snowman quest).
-        //
-        // 131 labels.
-        // ═══════════════════════════════════════════════════════════════════
         private static readonly Dictionary<string, HashSet<string>> _killGCByLabel =
             new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase)
         {
@@ -194,8 +178,8 @@ namespace DungeonRunners.Managers
         private static Dictionary<string, HashSet<string>> LoadKillGCByLabel()
         {
             var result = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var kvp in _killGCByLabel)
-                result[kvp.Key] = new HashSet<string>(kvp.Value, StringComparer.OrdinalIgnoreCase);
+            foreach (var killLabelEntry in _killGCByLabel)
+                result[killLabelEntry.Key] = new HashSet<string>(killLabelEntry.Value, StringComparer.OrdinalIgnoreCase);
 
             int docsScanned = 0;
             int authoredLabels = 0;
@@ -211,7 +195,7 @@ namespace DungeonRunners.Managers
                     }
                 }
 
-                var packageCatalog = NativePackageCatalog.Instance;
+                var packageCatalog = PackageCatalog.Instance;
                 if (!packageCatalog.IsLoaded)
                     packageCatalog.LoadFromAssets();
                 if (packageCatalog.IsLoaded)
@@ -227,10 +211,10 @@ namespace DungeonRunners.Managers
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[QUEST-KILL-CATALOG] Failed to scan package-backed KillObjective monster map: {ex.Message}");
+                Debug.LogError($"[QUEST-KILL-CATALOG] state=failed source=packageCatalog message='{ex.Message}'");
             }
 
-            Debug.LogError($"[QUEST-KILL-CATALOG] source=flat+NativePackageCatalog labels={result.Count} authoredLabels={authoredLabels} docsScanned={docsScanned} native=Quest::readObjectives@0x005BD560 Quest::processUpdate@0x005BD170 pkg=Q*.gc:quests.base.KillObjective");
+            Debug.LogError($"[QUEST-KILL-CATALOG] source=flat+PackageCatalog labels={result.Count} authoredLabels={authoredLabels} docsScanned={docsScanned} sourceFunction=Quest::readObjectives@0x005BD560 Quest::processUpdate@0x005BD170 pkg=Q*.gc:quests.base.KillObjective");
             return result;
         }
 
@@ -280,7 +264,7 @@ namespace DungeonRunners.Managers
 
         private QuestManager()
         {
-            Debug.Log("[QuestManager] Initialized");
+            Debug.Log("[QUEST-MANAGER] state=initialized");
         }
 
         public void SetSendCallback(Action<RRConnection, byte, byte, byte[]> sendCallback)
@@ -297,93 +281,40 @@ namespace DungeonRunners.Managers
         {
             if (_writeEntitySynch == null)
             {
-                Debug.LogError($"[{packetName}] Missing EntitySynch callback");
+                Debug.LogError($"[{packetName}] state=missing target=entitySynchCallback");
                 return false;
             }
             if (!_writeEntitySynch(conn, writer))
             {
-                Debug.LogError($"[{packetName}] EntitySynch write blocked");
+                Debug.LogError($"[{packetName}] state=unavailable target=entitySynchWrite");
                 return false;
             }
             writer.WriteByte(0x06);
             return true;
         }
 
-        private static HashSet<string> GetAutoCompleteOnAcceptQuestIds()
+        private static bool IsAutoAcceptOnQuery(QuestData questData)
         {
-            if (_autoCompleteOnAcceptQuestIds != null)
-                return _autoCompleteOnAcceptQuestIds;
+            if (questData == null || string.IsNullOrWhiteSpace(questData.id))
+                return false;
 
-            lock (_autoCompleteOnAcceptLock)
-            {
-                if (_autoCompleteOnAcceptQuestIds == null)
-                    _autoCompleteOnAcceptQuestIds = LoadAutoCompleteOnAcceptQuestIds();
-                return _autoCompleteOnAcceptQuestIds;
-            }
+            GCNode questNode = GCDatabase.Instance?.ResolveWithInheritance(questData.id);
+            GCNode description = questNode?.GetChild("Description");
+            return description != null && description.GetBool("AutoAcceptOnQuery");
         }
 
-        private static HashSet<string> LoadAutoCompleteOnAcceptQuestIds()
+        public bool CanQueryComplete(ActiveQuest activeQuest)
         {
-            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            string gcDir = DungeonRunners.Core.DataPaths.GcDir;
-            try
-            {
-                var packageCatalog = NativePackageCatalog.Instance;
-                if (!packageCatalog.IsLoaded)
-                    packageCatalog.LoadFromAssets();
-                if (!Directory.Exists(gcDir) && !packageCatalog.IsLoaded)
-                {
-                    Debug.LogError($"[QUEST-AUTO-COMPLETE] GC directory missing and NativePackageCatalog unavailable: {gcDir}");
-                    return result;
-                }
+            if (activeQuest == null)
+                return false;
 
-                var autoAcceptRegex = new Regex(@"AutoAcceptOnQuery\s*=\s*true", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-                var temporaryRegex = new Regex(@"Temporary\s*=\s*true", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-                var objectiveRegex = new Regex(@"AddObjective\s*\(", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var objectives = activeQuest.Objectives;
+            if (objectives != null && objectives.Count > 0)
+                return objectives.All(o => o.IsComplete);
 
-                void ScanQuestText(string questId, string text)
-                {
-                    if (!autoAcceptRegex.IsMatch(text) || !temporaryRegex.IsMatch(text) || objectiveRegex.IsMatch(text))
-                        return;
-                    var quest = DatabaseLoader.Quests.FirstOrDefault(q =>
-                        q.id.Equals(questId, StringComparison.OrdinalIgnoreCase));
-                    if (quest == null)
-                        return;
-                    if (quest.objectives != null && quest.objectives.Count > 0)
-                        return;
-
-                    result.Add(quest.id);
-                }
-
-                if (Directory.Exists(gcDir))
-                {
-                    foreach (string path in Directory.EnumerateFiles(gcDir, "Q*.gc", SearchOption.AllDirectories))
-                    {
-                        string questId = Path.GetFileNameWithoutExtension(path);
-                        seen.Add(questId);
-                        ScanQuestText(questId, File.ReadAllText(path));
-                    }
-                }
-
-                if (packageCatalog.IsLoaded)
-                {
-                    foreach (var doc in packageCatalog.EnumerateGcTextDocuments("Q*.gc"))
-                    {
-                        if (doc == null || string.IsNullOrWhiteSpace(doc.Stem) || seen.Contains(doc.Stem))
-                            continue;
-                        seen.Add(doc.Stem);
-                        ScanQuestText(doc.Stem, doc.Text);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[QUEST-AUTO-COMPLETE] Failed to scan zero-objective temporary quests: {ex.Message}");
-            }
-
-            Debug.LogError($"[QUEST-AUTO-COMPLETE] Loaded {result.Count} Temporary+AutoAccept zero-objective quests");
-            return result;
+            var questData = DatabaseLoader.Quests.FirstOrDefault(q =>
+                q.id.Equals(activeQuest.QuestId, StringComparison.OrdinalIgnoreCase));
+            return IsAutoAcceptOnQuery(questData);
         }
 
         public void InitializePlayer(string connId, List<ActiveQuest> activeQuests,
@@ -399,7 +330,7 @@ namespace DungeonRunners.Managers
                 UnlockedCheckpoints = unlockedCheckpoints ?? new List<string>()
             };
             _playerQuests[connId] = state;
-            Debug.Log($"[QuestManager] Player {connId} initialized: Level {playerLevel}, {state.ActiveQuests.Count} active, {state.CompletedQuests.Count} completed");
+            Debug.Log($"[QUEST-MANAGER] conn={connId} level={playerLevel} active={state.ActiveQuests.Count} completed={state.CompletedQuests.Count}");
         }
 
         public PlayerQuestState GetPlayerState(string connId)
@@ -427,16 +358,14 @@ namespace DungeonRunners.Managers
             return state.ActiveQuests.RemoveAll(q => q.InstanceId == instanceId) > 0;
         }
 
-        // ==================== QUEST ACCEPT ====================
         public QuestAcceptResult AcceptQuest(string connId, string questId, string npcId)
         {
-            Debug.LogError($"[QuestManager] AcceptQuest: {questId}");
+            Debug.LogError($"[QUEST-MANAGER] action=accept quest={questId}");
             var result = new QuestAcceptResult { Success = false };
 
             var playerState = GetPlayerState(connId);
             if (playerState == null) return result;
 
-            // Block re-accepting a quest that is already active
             if (playerState.ActiveQuests.Any(q => q.QuestId.Equals(questId, StringComparison.OrdinalIgnoreCase)))
                 return result;
 
@@ -444,9 +373,6 @@ namespace DungeonRunners.Managers
                 q.id.Equals(questId, StringComparison.OrdinalIgnoreCase));
             if (questData == null) return result;
 
-            // Block re-accepting a completed quest unless it is flagged repeatable.
-            // Repeatable quests (e.g. world.town.quest.well.base_r — Toss a King's Coin)
-            // are removed from CompletedQuests on turn-in elsewhere, but defend here too.
             bool alreadyCompleted = playerState.CompletedQuests.Any(q =>
                 q.Equals(questId, StringComparison.OrdinalIgnoreCase));
             if (alreadyCompleted && !questData.repeatable) return result;
@@ -491,28 +417,24 @@ namespace DungeonRunners.Managers
                 uint npcEntityId = reader.ReadUInt32();
                 byte gcTypeIndicator = reader.ReadByte();
                 uint questHash = reader.ReadUInt32();
-                Debug.LogError($"[QUEST-ACCEPT] NPC={npcEntityId}, Hash=0x{questHash:X8}");
+                Debug.LogError($"[QUEST-ACCEPT] npc={npcEntityId} hash=0x{questHash:X8}");
 
                 HandleAcceptConfirmed(conn, npcEntityId, questHash);
 
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[QUEST-ACCEPT] Error: {ex.Message}");
+                Debug.LogError($"[QUEST-ACCEPT] state=failed message='{ex.Message}'");
             }
         }
 
-        // ==================== QUEST QUERY (Preview) ====================
-        /// <summary>
-        /// Handles client query request (0x04) - sends quest details for preview dialog
-        /// </summary>
         public void HandleQuery(RRConnection conn, LEReader reader)
         {
             try
             {
                 if (reader.Remaining < 9)
                 {
-                    Debug.LogError($"[QUEST-QUERY] Packet too short ({reader.Remaining} bytes)");
+                    Debug.LogError($"[QUEST-QUERY] state=short remaining={reader.Remaining}");
                     return;
                 }
 
@@ -520,7 +442,7 @@ namespace DungeonRunners.Managers
                 byte gcTypeIndicator = reader.ReadByte();
                 uint questHash = reader.ReadUInt32();
 
-                Debug.LogError($"[QUEST-QUERY] NPC={npcEntityId}, Hash=0x{questHash:X8}");
+                Debug.LogError($"[QUEST-QUERY] npc={npcEntityId} hash=0x{questHash:X8}");
 
                 if (DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var quest))
                 {
@@ -529,123 +451,77 @@ namespace DungeonRunners.Managers
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[QUEST-QUERY] Error: {ex.Message}");
+                Debug.LogError($"[QUEST-QUERY] state=failed message='{ex.Message}'");
             }
         }
 
-        /// <summary>
-        /// Sends quest query response (0x04) - triggers client to show Quest Offer dialog
-        /// </summary>
-        /* private void SendQueryResponse(RRConnection conn, QuestData questData, uint npcEntityId)
-         {
-             var writer = new LEWriter();
-             writer.WriteByte(0x07); // BeginStream
-             writer.WriteByte(0x35); // ComponentUpdate
-             writer.WriteUInt16(conn.QuestManagerId);
-             writer.WriteByte(0x04); // SubMessage
-             writer.WriteUInt32(DatabaseLoader.ComputeDJB2Hash(questData.id));
-             writer.WriteByte(0x06); // EndStream
 
-             byte[] packet = writer.ToArray();
-             Debug.LogError($"[QUEST-QUERY-RESPONSE] SENDING: {BitConverter.ToString(packet)}");
-
-             _sendPacket?.Invoke(conn, 0x01, 0x0F, packet);
-         }*/
-
-        // ==================== QUEST ABANDON ====================
-        // ==================== QUEST ABANDON ====================
-        /// <summary>
-        /// Handles subMessage 0x03 - ABANDON QUEST
-        /// Client sends 4 bytes (instanceId only) for view/click, 5 bytes (instanceId + 0x01 flag) for actual abandon
-        /// </summary>
         public void Handle0x03(RRConnection conn, LEReader reader)
         {
             uint instanceId = reader.ReadUInt32();
-            Debug.LogError($"[QUEST-0x03] instanceId={instanceId} - ABANDONING");
+            Debug.LogError($"[QUEST-0x03] instanceId={instanceId} action=abandon");
 
             var quest = GetQuestByInstanceId(conn.ConnId.ToString(), instanceId);
             if (quest != null)
             {
                 RemoveQuestByInstanceId(conn.ConnId.ToString(), instanceId);
-                Debug.LogError($"[QUEST-ABANDON] ✅ Removed: {quest.QuestId}");
+                Debug.LogError($"[QUEST-ABANDON] quest={quest.QuestId} state=removed");
             }
             SendRemovePacket(conn, instanceId);
         }
 
-        // ==================== QUEST COMPLETE ====================
         public void HandleComplete(RRConnection conn, LEReader reader)
         {
             try
             {
                 uint instanceId = reader.ReadUInt32();
-                Debug.LogError($"[QUEST-COMPLETE] InstanceId={instanceId}");
+            Debug.LogError($"[QUEST-COMPLETE] instanceId={instanceId}");
                 var activeQuest = GetQuestByInstanceId(conn.ConnId.ToString(), instanceId);
                 if (activeQuest == null)
                 {
-                    Debug.LogError($"[QUEST-COMPLETE] ❌ Quest not found");
+                    Debug.LogError("[QUEST-COMPLETE] state=notFound");
                     return;
                 }
-                // Check all objectives complete
                 if (!activeQuest.Objectives.All(o => o.IsComplete))
                 {
-                    Debug.LogError($"[QUEST-COMPLETE] ❌ Objectives not complete");
+                    Debug.LogError("[QUEST-COMPLETE] state=objectivesIncomplete");
                     return;
                 }
                 var questData = DatabaseLoader.Quests.FirstOrDefault(q =>
                     q.id.Equals(activeQuest.QuestId, StringComparison.OrdinalIgnoreCase));
-                // Award rewards
                 int xp = questData?.rewards?.experience ?? 0;
                 int gold = questData?.rewards?.gold ?? 0;
-                Debug.LogError($"[QUEST-COMPLETE] ✅ Rewards: {xp} XP, {gold} gold");
-                // Remove from active, add to completed
+                Debug.LogError($"[QUEST-COMPLETE] rewardXp={xp} rewardGold={gold}");
                 var playerState = GetPlayerState(conn.ConnId.ToString());
                 playerState.ActiveQuests.Remove(activeQuest);
                 playerState.CompletedQuests.Add(activeQuest.QuestId);
-                // Send packets
                 SendCompletePacket(conn, instanceId);
                 SendFinalizePacket(conn, instanceId);
                 SendRemovePacket(conn, instanceId);
-                // Legacy packet wrapper only; GameServer.ApplyQuestRewards owns active reward application.
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[QUEST-COMPLETE] Error: {ex.Message}");
+                Debug.LogError($"[QUEST-COMPLETE] state=failed message='{ex.Message}'");
             }
         }
 
-        // ==================== PACKET SENDERS ====================
 
-        // 0x01 - Add quest to client
         public void SendAddPacket(RRConnection conn, QuestData questData, ActiveQuest activeQuest)
         {
             var writer = new LEWriter();
             writer.WriteByte(0x07);
             writer.WriteByte(0x35);
             writer.WriteUInt16(conn.QuestManagerId);
-            writer.WriteByte(0x01);  // SubMessage: AddQuest
+            writer.WriteByte(0x01);
 
-            // Quest type reference
             writer.WriteByte(0x04);
             writer.WriteUInt32(DatabaseLoader.ComputeDJB2Hash(questData.id));
 
-            // Instance ID directly after type reference
             writer.WriteUInt32(activeQuest.InstanceId);
 
-            // Objectives - client crashes with 0 objectives, so add default if empty
             var objectives = activeQuest.Objectives ?? new List<QuestProgress>();
-            if (objectives.Count == 0)
-            {
-                objectives = new List<QuestProgress> {
-            new QuestProgress {
-                Label = "Read",
-                Required = 1,
-                Current = 1
-            }
-        };
-            }
 
-            // Calculate allComplete AFTER default objectives are set up
-            bool allComplete = objectives.All(o => o.IsComplete);
+            bool allComplete = objectives.Count > 0 && objectives.All(o => o.IsComplete);
             writer.WriteByte(allComplete ? (byte)0x01 : (byte)0x00);
 
             writer.WriteByte((byte)objectives.Count);
@@ -654,19 +530,17 @@ namespace DungeonRunners.Managers
             {
                 byte flags = (byte)(0x02 | (obj.IsComplete ? 0x01 : 0x00));
                 writer.WriteByte(flags);
-                // Format matches original game HUD: "Slay Dew Valley Pups: 0 / 12"
                 string addLabel = $"{obj.Label ?? "Objective"}: {obj.Current} / {(obj.Required > 0 ? obj.Required : 1)}";
                 writer.WriteCString(addLabel);
                 writer.WriteUInt16((ushort)(obj.Required > 0 ? obj.Required : 1));
             }
 
             if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-ADD")) return;
-            Debug.LogError($"[QUEST-ADD] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
+            Debug.LogError($"[QUEST-ADD] hex={BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             Debug.LogError($"[QUEST-ADD] Sending {questData.id} InstanceId={activeQuest.InstanceId} allComplete={allComplete}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
         }
 
-        // 0x02 - Remove quest from client
         public void SendRemovePacket(RRConnection conn, uint instanceId)
         {
             var writer = new LEWriter();
@@ -679,34 +553,25 @@ namespace DungeonRunners.Managers
             writer.WriteUInt32(instanceId);
 
             if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-REMOVE")) return;
-            Debug.LogError($"[QUEST-ADD] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
+            Debug.LogError($"[QUEST-ADD] hex={BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             Debug.LogError($"[QUEST-REMOVE] InstanceId={instanceId}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
         }
 
-        // 0x03 - Update quest progress
-        // Binary RE: processUpdateQuest reads [instanceId:u32] [questSubmsg:u8]
-        // Quest::processUpdate dispatches on questSubmsg:
-        //   0 → read 1 byte → set Quest+0x6C (complete flag)
-        //   1 → call readObjectives → update objective data
-        //   ≥2 → read 1 byte → set Quest+0x6C
-        // readObjectives format: [count:u8] foreach: [flags:u8] [label:cstr] [if flags&0x02: required:u16]
         public void SendProgressPacket(RRConnection conn, uint instanceId, ActiveQuest quest)
         {
             var objectives = quest.Objectives ?? new System.Collections.Generic.List<QuestProgress>();
             bool allComplete = objectives.Count > 0 && objectives.All(o => o.IsComplete);
 
-            // Packet 1: Update objectives (questSubmsg=1 → readObjectives)
             var writer = new LEWriter();
             writer.WriteByte(0x07);
             writer.WriteByte(0x35);
             writer.WriteUInt16(conn.QuestManagerId);
-            writer.WriteByte(0x03);  // QM submessage: processUpdateQuest
+            writer.WriteByte(0x03);
 
             writer.WriteUInt32(instanceId);
-            writer.WriteByte(0x01);  // Quest submessage 1 = readObjectives
+            writer.WriteByte(0x01);
 
-            // readObjectives format
             writer.WriteByte((byte)objectives.Count);
             foreach (var obj in objectives)
             {
@@ -721,17 +586,15 @@ namespace DungeonRunners.Managers
             Debug.LogError($"[QUEST-PROGRESS] Objectives packet: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
 
-            // Packet 2: Set complete flag (questSubmsg=0 → read 1 byte → Quest+0x6C)
-            // This tells the client the quest is done so NPC icon turns yellow ?
             var flagWriter = new LEWriter();
             flagWriter.WriteByte(0x07);
             flagWriter.WriteByte(0x35);
             flagWriter.WriteUInt16(conn.QuestManagerId);
-            flagWriter.WriteByte(0x03);  // QM submessage: processUpdateQuest
+            flagWriter.WriteByte(0x03);
 
             flagWriter.WriteUInt32(instanceId);
-            flagWriter.WriteByte(0x00);  // Quest submessage 0 = set complete flag
-            flagWriter.WriteByte(allComplete ? (byte)0x01 : (byte)0x00);  // the flag value
+            flagWriter.WriteByte(0x00);
+            flagWriter.WriteByte(allComplete ? (byte)0x01 : (byte)0x00);
 
             if (!WriteEntitySynchAndEnd(conn, flagWriter, "QUEST-PROGRESS-FLAG")) return;
             Debug.LogError($"[QUEST-PROGRESS] Complete flag packet: allComplete={allComplete}");
@@ -740,7 +603,6 @@ namespace DungeonRunners.Managers
             Debug.LogError($"[QUEST-PROGRESS] InstanceId={instanceId} allComplete={allComplete}");
         }
 
-        // 0x06 - Quest complete notification
         public void SendCompletePacket(RRConnection conn, uint instanceId)
         {
             var writer = new LEWriter();
@@ -753,16 +615,14 @@ namespace DungeonRunners.Managers
             writer.WriteUInt32(instanceId);
 
             if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-COMPLETE-PKT")) return;
-            Debug.LogError($"[QUEST-ADD] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
+            Debug.LogError($"[QUEST-ADD] hex={BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             Debug.LogError($"[QUEST-COMPLETE-PKT] InstanceId={instanceId}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
         }
 
-        // 0x07 - Update available quests for NPC
-        // Helper: Gets zone prefix from NPC gcType (e.g., "world.town" from "world.town.npc.TownCommander")
         public void SendAvailableQuestUpdateForZone(RRConnection conn)
         {
-            Debug.LogError($"[QUEST-AVAILABLE] ====== CALLED! Zone={conn.CurrentZoneGcType} ======");
+            Debug.LogError($"[QUEST-AVAILABLE] zone={conn.CurrentZoneGcType} state=called");
 
             var playerState = GetPlayerState(conn.ConnId.ToString());
             if (playerState == null)
@@ -774,20 +634,17 @@ namespace DungeonRunners.Managers
             string currentZonePrefix = conn.CurrentZoneGcType?.ToLowerInvariant() ?? "world.town";
             Debug.LogError($"[QUEST-AVAILABLE] Zone prefix: {currentZonePrefix}");
             Debug.LogError($"[QUEST-AVAILABLE] Active quests: {playerState.ActiveQuests.Count}");
-            // DEBUG: Log Q11_a1's npc value
             var q11a1 = DatabaseLoader.Quests.FirstOrDefault(q => q.id == "world.dungeon00.quest.Q11_a1");
             if (q11a1 != null)
             {
 
 
-                Debug.LogError($"[QUEST-DEBUG] Q11_a1 npc = '{q11a1.npc}', npc2 = '{q11a1.npc2}'");
+                Debug.LogError($"[QUEST-DETAIL] Q11_a1 npc='{q11a1.npc}' npc2='{q11a1.npc2}'");
 
-                // Check if Q11_a1 is in active quests
                 bool isActive = playerState.ActiveQuests.Any(a => a.QuestId.Equals("world.dungeon00.quest.Q11_a1", StringComparison.OrdinalIgnoreCase));
                 bool isCompleted = playerState.CompletedQuests.Contains("world.dungeon00.quest.Q11_a1");
-                Debug.LogError($"[QUEST-DEBUG] Q11_a1 isActive={isActive}, isCompleted={isCompleted}");
+                Debug.LogError($"[QUEST-DETAIL] Q11_a1 active={isActive} completed={isCompleted}");
             }
-            // NPCs with quests that can be ACCEPTED (shows !)
             var zoneQuestGivers = GetQuestGiversForCurrentZone(conn, currentZonePrefix);
             var availableByNpc = DatabaseLoader.Quests
              .Where(q => !playerState.ActiveQuests.Any(a => a.QuestId.Equals(q.id, StringComparison.OrdinalIgnoreCase)))
@@ -798,41 +655,37 @@ namespace DungeonRunners.Managers
              .GroupBy(q => q.Giver, StringComparer.OrdinalIgnoreCase)
              .ToDictionary(g => g.Key, g => g.Select(x => x.Quest).ToList(), StringComparer.OrdinalIgnoreCase);
 
-            // NOTE: The completion flag packet (questSubmsg=0) already tells the client to show
-            // yellow ? for the active quest. We do NOT need to add turn-in quests to the available
-            // list — doing so causes a duplicate entry (both ? and ! for the same quest).
 
             Debug.LogError($"[QUEST-AVAILABLE] {availableByNpc.Count} NPCs with available quests");
 
-            foreach (var kvp in availableByNpc)
+            foreach (var npcQuestEntry in availableByNpc)
             {
-                Debug.LogError($"[QUEST-AVAILABLE] NPC: {kvp.Key} has {kvp.Value.Count} available quests");
+                Debug.LogError($"[QUEST-AVAILABLE] NPC: {npcQuestEntry.Key} has {npcQuestEntry.Value.Count} available quests");
             }
 
-            // BUILD AND SEND THE PACKET
             var writer = new LEWriter();
-            writer.WriteByte(0x07);  // BeginStream
-            writer.WriteByte(0x35);  // ComponentUpdate
+            writer.WriteByte(0x07);
+            writer.WriteByte(0x35);
             writer.WriteUInt16(conn.QuestManagerId);
-            writer.WriteByte(0x07);  // Submessage: AvailableQuestUpdate
+            writer.WriteByte(0x07);
 
             writer.WriteByte((byte)availableByNpc.Count);
 
-            foreach (var kvp in availableByNpc)
+            foreach (var npcQuestEntry in availableByNpc)
             {
-                string npcGcType = kvp.Key;
-                var quests = kvp.Value;
+                string npcGcType = npcQuestEntry.Key;
+                var quests = npcQuestEntry.Value;
 
                 byte[] npcBytes = System.Text.Encoding.UTF8.GetBytes(npcGcType);
                 writer.WriteBytes(npcBytes);
-                writer.WriteByte(0x00);  // Null terminator
+                writer.WriteByte(0x00);
 
                 writer.WriteByte((byte)quests.Count);
 
                 foreach (var quest in quests)
                 {
                     uint hash = DatabaseLoader.ComputeDJB2Hash(quest.id);
-                    writer.WriteByte(0x04);  // GCType indicator
+                    writer.WriteByte(0x04);
                     writer.WriteUInt32(hash);
                     Debug.LogError($"[QUEST-AVAILABLE]   Quest: {quest.id} -> 0x{hash:X8}");
                 }
@@ -842,7 +695,7 @@ namespace DungeonRunners.Managers
 
             var packet = writer.ToArray();
             Debug.LogError($"[QUEST-AVAILABLE] Sending packet: {packet.Length} bytes");
-            Debug.LogError($"[QUEST-AVAILABLE] HEX: {BitConverter.ToString(packet).Replace("-", " ")}");
+            Debug.LogError($"[QUEST-AVAILABLE] hex={BitConverter.ToString(packet).Replace("-", " ")}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, packet);
         }
 
@@ -913,68 +766,58 @@ namespace DungeonRunners.Managers
         {
             if (!DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var quest))
             {
-                Debug.LogError($"[QUEST-QUERY] Unknown hash 0x{questHash:X8}");
+                Debug.LogError($"[QUEST-QUERY] hash=0x{questHash:X8} state=unknown");
                 return;
             }
 
             var playerState = GetPlayerState(conn.ConnId.ToString());
 
-            // Check if this is a TURN-IN situation:
-            // Player has this quest active AND all objectives complete
             var activeQuest = playerState?.ActiveQuests.FirstOrDefault(
                 aq => aq.QuestId.Equals(quest.id, StringComparison.OrdinalIgnoreCase));
 
             bool isTurnIn = false;
             if (activeQuest != null)
             {
-                // Check if all objectives are complete
                 var objectives = activeQuest.Objectives ?? new List<QuestProgress>();
-                bool allComplete = objectives.Count > 0 && objectives.All(o => o.IsComplete);
+                bool allComplete = CanQueryComplete(activeQuest);
                 isTurnIn = allComplete;
-                Debug.LogError($"[QUEST-QUERY] Active quest found! InstanceId={activeQuest.InstanceId}, objectives={objectives.Count}, allComplete={allComplete}, isTurnIn={isTurnIn}");
+                Debug.LogError($"[QUEST-QUERY] state=activeQuest instanceId={activeQuest.InstanceId} objectives={objectives.Count} allComplete={allComplete} isTurnIn={isTurnIn}");
             }
             else
             {
-                Debug.LogError($"[QUEST-QUERY] No active quest found for {quest.id}");
+                Debug.LogError($"[QUEST-QUERY] quest={quest.id} state=noActiveQuest");
             }
 
             var writer = new LEWriter();
-            writer.WriteByte(0x07); // BeginStream
-            writer.WriteByte(0x35); // ComponentUpdate
+            writer.WriteByte(0x07);
+            writer.WriteByte(0x35);
             writer.WriteUInt16(conn.QuestManagerId);
 
             if (isTurnIn)
             {
-                // Set pending turn-in so server handles the "Complete" click
                 conn.PendingTurnInInstanceId = activeQuest.InstanceId;
-                conn.PendingQuestHash = 0; // Prevent accept path
+                conn.PendingQuestHash = 0;
 
-                // Binary: processUpdateQueryComplete = processUpdate case 5 (submsg=0x06)
-                // via 0x35 ComponentUpdate. Reads 4 bytes = quest instanceId (NOT hash).
-                writer.WriteByte(0x06); // submessage 6 = processUpdateQueryComplete
-                writer.WriteUInt32(activeQuest.InstanceId); // quest instanceId (what client knows)
-                Debug.LogError($"[QUEST-QUERY] Sending TURN-IN (0x35/0x06) for {quest.id} instanceId={activeQuest.InstanceId}");
+                writer.WriteByte(0x06);
+                writer.WriteUInt32(activeQuest.InstanceId);
+                Debug.LogError($"[QUEST-QUERY] action=sendTurnIn quest={quest.id} instanceId={activeQuest.InstanceId}");
             }
             else if (activeQuest != null)
             {
-                // Player already has this quest but hasn't completed objectives yet.
-                // Do NOT send the accept dialog — that causes re-acceptance bugs.
-                // Return early with no packet so the NPC dialog just closes.
-                Debug.LogError($"[QUEST-QUERY] Quest {quest.id} already active, objectives incomplete — suppressing accept dialog");
+                Debug.LogError($"[QUEST-QUERY] quest={quest.id} state=activeIncomplete action=suppressAcceptDialog");
                 return;
             }
             else
             {
-                // Quest is truly new — send ACCEPT dialog (submessage 0x04)
-                writer.WriteByte(0x04); // SubMessage: QueryQuest (shows accept dialog)
-                writer.WriteByte(0x04); // GCType indicator: hash follows
+                writer.WriteByte(0x04);
+                writer.WriteByte(0x04);
                 writer.WriteUInt32(questHash);
-                Debug.LogError($"[QUEST-QUERY] Sending ACCEPT dialog for {quest.id} hash=0x{questHash:X8}");
+                Debug.LogError($"[QUEST-QUERY] action=sendAcceptDialog quest={quest.id} hash=0x{questHash:X8}");
             }
 
             if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-QUERY")) return;
 
-            Debug.LogError($"[QUEST-QUERY] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
+            Debug.LogError($"[QUEST-QUERY] hex={BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
         }
 
@@ -982,11 +825,11 @@ namespace DungeonRunners.Managers
         {
             if (!DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var quest))
             {
-                Debug.LogError($"[QUEST-ACCEPT] Unknown hash 0x{questHash:X8}");
+                Debug.LogError($"[QUEST-ACCEPT] hash=0x{questHash:X8} state=unknown");
                 return;
             }
 
-            Debug.LogError($"[QUEST-ACCEPT] ✅ Accepting: {quest.id}");
+            Debug.LogError($"[QUEST-ACCEPT] action=accept quest={quest.id}");
             string npcId = conn.CurrentDialogNpcId ?? $"npc_{npcEntityId}";
             var result = AcceptQuest(conn.ConnId.ToString(), quest.id, npcId);
 
@@ -994,35 +837,22 @@ namespace DungeonRunners.Managers
             {
                 result.Quest.InstanceId = conn.NextQuestInstanceId++;
 
-                // Give onAcceptItem if specified
                 if (!string.IsNullOrEmpty(quest.onAcceptItem))
                 {
-                    Debug.LogError($"[QUEST-ACCEPT] Giving onAcceptItem: {quest.onAcceptItem}");
-                    // GameServer.GiveOnAcceptItem owns the active inventory grant after accept.
+                    Debug.LogError($"[QUEST-ACCEPT] action=giveOnAcceptItem item={quest.onAcceptItem}");
 
-                    // Auto-complete any item objective that matches onAcceptItem
                     foreach (var obj in result.Quest.Objectives)
                     {
                         if (obj.Type == "item" && obj.Target.Equals(quest.onAcceptItem, StringComparison.OrdinalIgnoreCase))
                         {
-                            obj.Current = obj.Required;  // Mark complete!
-                            Debug.LogError($"[QUEST-ACCEPT] Auto-completed objective: {obj.Label}");
+                            obj.Current = obj.Required;
+                            Debug.LogError($"[QUEST-ACCEPT] action=autoComplete objective='{obj.Label}'");
                         }
                     }
                 }
 
                 SendAddPacket(conn, quest, result.Quest);
-                bool autoCompleteOnAccept = GetAutoCompleteOnAcceptQuestIds().Contains(quest.id);
                 SendAvailableQuestUpdateForZone(conn);
-                if (autoCompleteOnAccept)
-                {
-                    var playerState = GetPlayerState(conn.ConnId.ToString());
-                    playerState?.ActiveQuests.Remove(result.Quest);
-                    SendFinalizePacket(conn, result.Quest.InstanceId);
-                    SendRemovePacket(conn, result.Quest.InstanceId);
-                    Debug.LogError($"[QUEST-AUTO-COMPLETE] finalized Temporary+AutoAccept zero-objective quest {quest.id} instance={result.Quest.InstanceId}");
-                    SendAvailableQuestUpdateForZone(conn);
-                }
             }
         }
 
@@ -1030,7 +860,6 @@ namespace DungeonRunners.Managers
 
 
 
-        // 0x08 - Finalize quest
         public void SendFinalizePacket(RRConnection conn, uint instanceId)
         {
             var writer = new LEWriter();
@@ -1043,29 +872,20 @@ namespace DungeonRunners.Managers
             writer.WriteUInt32(instanceId);
 
             if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-FINALIZE")) return;
-            Debug.LogError($"[QUEST-ADD] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
+            Debug.LogError($"[QUEST-ADD] hex={BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             Debug.LogError($"[QUEST-FINALIZE] InstanceId={instanceId}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
         }
 
-        // ==================== PROGRESS TRACKING ====================
-        /// <summary>Single-candidate overload — delegates to the multi-candidate version.</summary>
         public List<QuestProgressUpdate> OnCreatureKilled(RRConnection conn, string creatureGcType)
         {
             return OnCreatureKilled(conn, new List<string> { creatureGcType });
         }
 
-        /// <summary>
-        /// Multi-candidate kill event. Pass BOTH the creature's SpawnGCType (e.g.
-        /// "world.dungeon00.mob.melee03.rank1") AND its raw GCType (e.g.
-        /// "creatures.whiskers.broodling.basic.grunt"), so quests authored in either
-        /// namespace can match. Per-objective dedup ensures one tick per kill.
-        /// </summary>
         public List<QuestProgressUpdate> OnCreatureKilled(RRConnection conn, List<string> candidateGcTypes)
         {
             var updates = UpdateProgress(conn.ConnId.ToString(), "kill", candidateGcTypes);
 
-            // Send ONE progress packet per quest (not one per objective update).
             var sentQuestIds = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var update in updates)
             {
@@ -1096,24 +916,11 @@ namespace DungeonRunners.Managers
             return updates;
         }
 
-        /// <summary>Single-target overload — delegates to the list version.</summary>
         private List<QuestProgressUpdate> UpdateProgress(string connId, string eventType, string target)
         {
             return UpdateProgress(connId, eventType, new List<string> { target });
         }
 
-        /// <summary>
-        /// Multi-candidate progress update.
-        ///
-        /// Match rules:
-        ///   1. objective.Target POPULATED → exact-equals against ANY candidate.
-        ///   2. objective.Target EMPTY → look up objective.Label in _killGCByLabel and
-        ///      check if ANY candidate is in that label's monster-type set.
-        ///   3. Empty target AND label not in dict → NO match. (Prevents the wildcard
-        ///      bug where killing anything completes every empty-target objective.)
-        ///
-        /// Each objective advances by exactly 1 per call even if multiple candidates match.
-        /// </summary>
         private List<QuestProgressUpdate> UpdateProgress(string connId, string eventType, List<string> candidateTargets)
         {
             var updates = new List<QuestProgressUpdate>();
@@ -1133,7 +940,6 @@ namespace DungeonRunners.Managers
 
                     if (!string.IsNullOrEmpty(objective.Target))
                     {
-                        // Rule 1: target is populated → exact authored/archetype match.
                         foreach (var candidate in candidateTargets)
                         {
                             if (string.IsNullOrEmpty(candidate)) continue;
@@ -1146,9 +952,6 @@ namespace DungeonRunners.Managers
                     }
                     else if (isKillEvent && !string.IsNullOrEmpty(objective.Label))
                     {
-                        // Rule 2: empty target on a kill objective → look up the label
-                        // in the GC-derived monster-type dict. Only the listed monster
-                        // types satisfy this objective.
                         if (GetKillGCByLabel().TryGetValue(objective.Label, out var allowedMonsters))
                         {
                             foreach (var candidate in candidateTargets)
@@ -1161,7 +964,6 @@ namespace DungeonRunners.Managers
                                 }
                             }
                         }
-                        // else: rule 3 — no dict entry, no match (intentional, prevents wildcard bug)
                     }
 
                     if (!anyMatch) continue;
@@ -1176,7 +978,7 @@ namespace DungeonRunners.Managers
                         IsComplete = objective.IsComplete,
                         Label = objective.Label
                     });
-                    Debug.LogError($"[QuestManager] Progress: {objective.Label}: {objective.Current}/{objective.Required}");
+                    Debug.LogError($"[QUEST-MANAGER] action=progress label='{objective.Label}' current={objective.Current} required={objective.Required}");
                 }
             }
             return updates;
@@ -1189,27 +991,26 @@ namespace DungeonRunners.Managers
 
             if (activeQuest == null)
             {
-                Debug.LogError($"[QUEST-TURNIN] No active quest with instanceId={instanceId}");
+                Debug.LogError($"[QUEST-TURNIN] instanceId={instanceId} state=notFound");
                 return;
             }
 
             uint questHash = DatabaseLoader.ComputeDJB2Hash(activeQuest.QuestId);
-            Debug.LogError($"[QUEST-TURNIN] Sending dialog for {activeQuest.QuestId} hash=0x{questHash:X8}");
+            Debug.LogError($"[QUEST-TURNIN] action=dialog quest={activeQuest.QuestId} hash=0x{questHash:X8}");
 
             conn.PendingTurnInInstanceId = instanceId;
             conn.PendingQuestHash = 0;
 
             var writer = new LEWriter();
             writer.WriteByte(0x07);
-            // Binary: processUpdateQueryComplete = processUpdate case 5 (submsg 0x06) via 0x35
-            writer.WriteByte(0x35);  // ComponentUpdate
+            writer.WriteByte(0x35);
             writer.WriteUInt16(conn.QuestManagerId);
-            writer.WriteByte(0x06);  // submessage 6 = processUpdateQueryComplete
-            writer.WriteUInt32(instanceId);  // quest instanceId (NOT hash)
+            writer.WriteByte(0x06);
+            writer.WriteUInt32(instanceId);
             if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-TURNIN")) return;
 
             var packet = writer.ToArray();
-            Debug.LogError($"[QUEST-TURNIN] HEX: {BitConverter.ToString(packet).Replace("-", " ")}");
+            Debug.LogError($"[QUEST-TURNIN] hex={BitConverter.ToString(packet).Replace("-", " ")}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, packet);
         }
 
@@ -1220,11 +1021,11 @@ namespace DungeonRunners.Managers
 
             if (activeQuest == null)
             {
-                Debug.LogError($"[QUEST-TURNIN] No active quest with instanceId={instanceId}");
+                Debug.LogError($"[QUEST-TURNIN] instanceId={instanceId} state=notFound");
                 return;
             }
 
-            Debug.LogError($"[QUEST-TURNIN] ✅ COMPLETING: {activeQuest.QuestId}");
+            Debug.LogError($"[QUEST-TURNIN] action=complete quest={activeQuest.QuestId}");
 
             var questData = DatabaseLoader.Quests.FirstOrDefault(q =>
                 q.id.Equals(activeQuest.QuestId, StringComparison.OrdinalIgnoreCase));
@@ -1233,7 +1034,7 @@ namespace DungeonRunners.Managers
             {
                 int xp = questData.rewards?.experience ?? 0;
                 int gold = questData.rewards?.gold ?? 0;
-                Debug.LogError($"[QUEST-TURNIN] Rewards: {gold} gold, {xp} XP");
+                Debug.LogError($"[QUEST-TURNIN] rewardGold={gold} rewardXp={xp}");
             }
 
             playerState.ActiveQuests.Remove(activeQuest);
@@ -1243,33 +1044,17 @@ namespace DungeonRunners.Managers
             SendRemovePacket(conn, instanceId);
             SendAvailableQuestUpdateForZone(conn);
 
-            Debug.LogError($"[QUEST-TURNIN] ✅ Quest completed! Active={playerState.ActiveQuests.Count}, Completed={playerState.CompletedQuests.Count}");
+            Debug.LogError($"[QUEST-TURNIN] state=complete active={playerState.ActiveQuests.Count} completed={playerState.CompletedQuests.Count}");
         }
 
-        /* public void SendRemovePacket(RRConnection conn, uint instanceId)
-         {
-             var writer = new LEWriter();
-             writer.WriteByte(0x07);
-             writer.WriteByte(0x35);
-             writer.WriteUInt16(conn.QuestManagerId);
-             writer.WriteByte(0x03);  // Remove quest submessage
-             writer.WriteUInt32(instanceId);
-             writer.WriteByte(0x00);
-             writer.WriteByte(0x06);
-
-             var packet = writer.ToArray();
-             Debug.LogError($"[QUEST-REMOVE] HEX: {BitConverter.ToString(packet).Replace("-", " ")}");
-             _sendPacket?.Invoke(conn, 0x01, 0x0F, packet);
-         }*/
 
 
 
 
 
-        // ==================== TURN IN ====================
         public QuestTurnInResult TurnInQuest(string connId, string questId)
         {
-            Debug.LogError($"[QuestManager] TurnInQuest: {questId}");
+            Debug.LogError($"[QUEST-MANAGER] action=turnIn quest={questId}");
             var result = new QuestTurnInResult { Success = false };
 
             var playerState = GetPlayerState(connId);
@@ -1322,10 +1107,9 @@ namespace DungeonRunners.Managers
 
             writer.WriteUInt32(0x01);
 
-            // HasTownPortal + zone data — obelisk reads these for "Saved Places"
             if (conn != null && conn.HasSavedTownPortal)
             {
-                writer.WriteByte(0x01);  // HasTownPortal = TRUE
+                writer.WriteByte(0x01);
                 writer.WriteCString(conn.TownPortalZoneName);
                 writer.WriteCString("");
                 writer.WriteUInt32(conn.TownPortalZoneId);
@@ -1333,13 +1117,13 @@ namespace DungeonRunners.Managers
             }
             else
             {
-                writer.WriteByte(0x00);  // HasTownPortal = FALSE
+                writer.WriteByte(0x00);
                 writer.WriteCString("Hello");
                 writer.WriteCString("HelloAgain");
                 writer.WriteUInt32(0x00);
             }
 
-            writer.WriteByte(0x00);  // bit 1 of QM+0x6D — 0 = no alternate zone
+            writer.WriteByte(0x00);
             writer.WriteCString("");
             writer.WriteCString("");
             writer.WriteUInt32(0x00);
@@ -1355,7 +1139,7 @@ namespace DungeonRunners.Managers
             foreach (var quest in activeQuests)
             {
                 writeGcType(writer, quest.QuestId, true);
-                writer.WriteUInt32(quest.InstanceId);        // actual instanceId, not hardcoded 0
+                writer.WriteUInt32(quest.InstanceId);
                 bool allDone = quest.Objectives.Count > 0 && quest.Objectives.All(o => o.IsComplete);
                 writer.WriteByte(allDone ? (byte)0x01 : (byte)0x00);
                 writer.WriteByte((byte)quest.Objectives.Count);
@@ -1381,7 +1165,7 @@ namespace DungeonRunners.Managers
     public class PlayerQuestState
     {
         public string ConnId;
-        public int Level = 1;  // Player level for quest filtering
+        public int Level = 1;
         public List<ActiveQuest> ActiveQuests = new List<ActiveQuest>();
         public List<string> CompletedQuests = new List<string>();
         public List<string> UnlockedCheckpoints = new List<string>();

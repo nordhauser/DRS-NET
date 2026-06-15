@@ -1,33 +1,3 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// DRLog.cs — Centralized logging with per-category toggles
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Usage:
-//   DRLog.Social("Sent roster");           // [SOCIAL] Sent roster
-//   DRLog.Chat("Relayed to 3 players");    // [CHAT] Relayed to 3 players
-//   DRLog.Net("Compressed 128 bytes");     // [NET] Compressed 128 bytes
-//
-// Toggle in chat:
-//   @log                — show all category states
-//   @log all on         — enable everything
-//   @log all off        — disable everything (production mode)
-//   @log social on      — enable social only
-//   @log combat off     — disable combat
-//   @log social combat  — toggle social and combat
-//
-// Toggle in code:
-//   DRLog.Enable(DRLog.Cat.Social);
-//   DRLog.Disable(DRLog.Cat.Combat);
-//   DRLog.SetAll(false);  // production mode
-//
-// server.cfg:
-//   enableDebugLog = false              — kill ALL logging (production)
-//   logCategories = combat,inventory    — only these categories
-//   logCategories = all                 — everything (default)
-//   logCategories = none                — DRLog off, Unity errors still show
-//
-// ═══════════════════════════════════════════════════════════════════════════════
-
 using System;
 using System.Collections.Generic;
 using DungeonRunners.Engine;
@@ -40,26 +10,24 @@ namespace DungeonRunners.Networking
         public enum Cat
         {
             None = 0,
-            Social = 1 << 0,   // Channel 0x0C, friends, ignore, who
-            Chat = 1 << 1,   // Chat relay, messages
-            Combat = 1 << 2,   // Damage, kills, XP, aggro
-            Zone = 1 << 3,   // Zone transitions, spawns, mob spawning
-            Net = 1 << 4,   // Packet hex dumps, compression, channels
-            Entity = 1 << 5,   // Entity spawn/despawn, multiplayer sync
-            Group = 1 << 6,   // Group/party system
-            Quest = 1 << 7,   // Quest system
-            Inventory = 1 << 8,   // Items, equipment, merchants
-            Skill = 1 << 9,   // Skills, hotbar, trainer
-            Admin = 1 << 10,  // Admin commands
-            Auth = 1 << 11,  // Auth server, login
+            Social = 1 << 0,
+            Chat = 1 << 1,
+            Combat = 1 << 2,
+            Zone = 1 << 3,
+            Net = 1 << 4,
+            Entity = 1 << 5,
+            Group = 1 << 6,
+            Quest = 1 << 7,
+            Inventory = 1 << 8,
+            Skill = 1 << 9,
+            Admin = 1 << 10,
+            Auth = 1 << 11,
             All = ~0
         }
 
-        // Default: everything on for development
         private static Cat _enabled = Cat.All;
         private static bool _initializedFromConfig = false;
 
-        // Category name lookup for @log command
         private static readonly Dictionary<string, Cat> _nameMap = new Dictionary<string, Cat>(StringComparer.OrdinalIgnoreCase)
         {
             { "social",    Cat.Social },
@@ -78,59 +46,54 @@ namespace DungeonRunners.Networking
             { "all",       Cat.All },
         };
 
-        // ═══ Core log methods ═══
-        // These bypass Debug.logger.logEnabled so they work even when master is off.
-        // This lets @log off silence all old code while @log social on still works.
 
-        public static void Log(Cat cat, string tag, string msg)
+        public static void Log(Cat cat, string tag, string message)
         {
             if ((_enabled & cat) != 0)
             {
                 bool wasEnabled = Debug.logger.logEnabled;
                 Debug.logger.logEnabled = true;
-                Debug.Log($"[{tag}] {msg}");
+                Debug.Log($"[{tag}] {message}");
                 Debug.logger.logEnabled = wasEnabled;
             }
         }
 
-        public static void Warn(Cat cat, string tag, string msg)
+        public static void Warn(Cat cat, string tag, string message)
         {
             if ((_enabled & cat) != 0)
             {
                 bool wasEnabled = Debug.logger.logEnabled;
                 Debug.logger.logEnabled = true;
-                Debug.LogWarning($"[{tag}] {msg}");
+                Debug.LogWarning($"[{tag}] {message}");
                 Debug.logger.logEnabled = wasEnabled;
             }
         }
 
-        public static void Error(Cat cat, string tag, string msg)
+        public static void Error(Cat cat, string tag, string message)
         {
             if ((_enabled & cat) != 0)
             {
                 bool wasEnabled = Debug.logger.logEnabled;
                 Debug.logger.logEnabled = true;
-                Debug.LogError($"[{tag}] {msg}");
+                Debug.LogError($"[{tag}] {message}");
                 Debug.logger.logEnabled = wasEnabled;
             }
         }
 
-        // ═══ Convenience methods — one per category ═══
 
-        public static void Social(string msg) => Warn(Cat.Social, "SOCIAL", msg);
-        public static void Chat(string msg) => Log(Cat.Chat, "CHAT", msg);
-        public static void Combat(string msg) => Log(Cat.Combat, "COMBAT", msg);
-        public static void Zone(string msg) => Log(Cat.Zone, "ZONE", msg);
-        public static void Net(string msg) => Log(Cat.Net, "NET", msg);
-        public static void Entity(string msg) => Log(Cat.Entity, "ENTITY", msg);
-        public static void Group(string msg) => Log(Cat.Group, "GROUP", msg);
-        public static void Quest(string msg) => Log(Cat.Quest, "QUEST", msg);
-        public static void Inv(string msg) => Log(Cat.Inventory, "INV", msg);
-        public static void Skill(string msg) => Log(Cat.Skill, "SKILL", msg);
-        public static void Admin(string msg) => Log(Cat.Admin, "ADMIN", msg);
-        public static void Auth(string msg) => Log(Cat.Auth, "AUTH", msg);
+        public static void Social(string message) => Warn(Cat.Social, "SOCIAL", message);
+        public static void Chat(string message) => Log(Cat.Chat, "CHAT", message);
+        public static void Combat(string message) => Log(Cat.Combat, "COMBAT", message);
+        public static void Zone(string message) => Log(Cat.Zone, "ZONE", message);
+        public static void Net(string message) => Log(Cat.Net, "NET", message);
+        public static void Entity(string message) => Log(Cat.Entity, "ENTITY", message);
+        public static void Group(string message) => Log(Cat.Group, "GROUP", message);
+        public static void Quest(string message) => Log(Cat.Quest, "QUEST", message);
+        public static void Inv(string message) => Log(Cat.Inventory, "INV", message);
+        public static void Skill(string message) => Log(Cat.Skill, "SKILL", message);
+        public static void Admin(string message) => Log(Cat.Admin, "ADMIN", message);
+        public static void Auth(string message) => Log(Cat.Auth, "AUTH", message);
 
-        // ═══ Toggle API ═══
 
         public static void Enable(Cat cat) => _enabled |= cat;
         public static void Disable(Cat cat) => _enabled &= ~cat;
@@ -142,31 +105,11 @@ namespace DungeonRunners.Networking
             _enabled = on ? Cat.All : Cat.None;
         }
 
-        /// <summary>
-        /// Master kill switch — disables ALL Unity Debug output (Debug.Log, LogWarning, LogError).
-        /// Affects everything, not just DRLog calls. Use for production.
-        /// </summary>
         public static void SetMasterLog(bool on)
         {
             Debug.logger.logEnabled = on;
         }
 
-        /// <summary>
-        /// Initialize logging state from server.cfg / ServerSettings.
-        /// Call once at startup AFTER ServerSettings.Load().
-        /// @reload re-calls this to pick up changes.
-        ///
-        /// server.cfg keys:
-        ///   enableDebugLog = true/false       (master switch — matches your existing cfg key)
-        ///   logCategories = all               (comma-separated: social,chat,combat,zone,net,entity,group,quest,inventory,skill,admin,auth,all,none)
-        ///
-        /// Examples:
-        ///   enableDebugLog = false                         → all logging off (production)
-        ///   enableDebugLog = true                          → all logging on (default)
-        ///   logCategories = combat,inventory,zone          → only those three
-        ///   logCategories = none                           → DRLog categories off, Unity still active
-        ///   logCategories = all                            → everything on (default)
-        /// </summary>
         public static void InitFromConfig()
         {
             _initializedFromConfig = true;
@@ -176,28 +119,27 @@ namespace DungeonRunners.Networking
             {
                 SetMasterLog(false);
                 SetAll(false);
-                Debug.LogError("[DRLog] Logging DISABLED by server.cfg (enableDebugLog=false)");
+                Debug.LogError("[DR-LOG] enabled=false source=server.cfg key=enableDebugLog");
                 return;
             }
 
             SetMasterLog(true);
-            DungeonRunners.Core.RuntimeEvidenceManager.SetFocusedLogFilter(
+            DungeonRunners.Core.RuntimeEvidence.SetFocusedLogFilter(
                 DungeonRunners.Core.ServerSettings.GetBool("focusedDebugLog", true));
 
             string categories = DungeonRunners.Core.ServerSettings.GetString("logCategories", "all").Trim().ToLower();
             if (string.IsNullOrEmpty(categories) || categories == "all")
             {
                 SetAll(true);
-                Debug.LogError("[DRLog] Logging: ALL categories ON");
+                Debug.LogError("[DR-LOG] categories=all enabled=true");
             }
             else if (categories == "none")
             {
                 SetAll(false);
-                Debug.LogError("[DRLog] Logging: ALL DRLog categories OFF");
+                Debug.LogError("[DR-LOG] categories=all enabled=false");
             }
             else
             {
-                // Parse comma-separated category list
                 SetAll(false);
                 string[] parts = categories.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 foreach (string part in parts)
@@ -208,52 +150,45 @@ namespace DungeonRunners.Networking
                         Enable(cat);
                     }
                 }
-                Debug.LogError($"[DRLog] Logging categories from config: {categories}");
+                Debug.LogError($"[DR-LOG] categories={categories} source=server.cfg");
             }
         }
 
-        // ═══ @log chat command handler ═══
-        // Returns response string to send back to player
         public static string HandleLogCommand(string args)
         {
             if (string.IsNullOrWhiteSpace(args))
             {
-                // Show current state
                 return GetStatusString();
             }
 
             string[] parts = args.Trim().ToLower().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
 
-            // @log off / @log on — master kill switch for ALL Unity logging
             if (parts.Length == 1 && parts[0] == "off")
             {
                 SetMasterLog(false);
                 SetAll(false);
-                return "ALL logging DISABLED (master off)";
+                return "log master=false categories=false";
             }
             if (parts.Length == 1 && parts[0] == "on")
             {
                 SetMasterLog(true);
                 SetAll(true);
-                return "ALL logging ENABLED (master on)";
+                return "log master=true categories=all";
             }
 
-            // @log all on / @log all off — DRLog categories only
             if (parts.Length == 2 && parts[0] == "all")
             {
-                if (parts[1] == "on") { SetAll(true); SetMasterLog(true); return "Logging: ALL ON"; }
-                if (parts[1] == "off") { SetAll(false); return "DRLog categories OFF (Unity logging still active)"; }
+                if (parts[1] == "on") { SetAll(true); SetMasterLog(true); return "log master=true categories=all"; }
+                if (parts[1] == "off") { SetAll(false); return "log categories=false master=unchanged"; }
             }
 
-            // @log social on / @log combat off
             if (parts.Length == 2 && _nameMap.ContainsKey(parts[0]))
             {
                 Cat cat = _nameMap[parts[0]];
-                if (parts[1] == "on") { Enable(cat); return $"Logging: {parts[0]} ON"; }
-                if (parts[1] == "off") { Disable(cat); return $"Logging: {parts[0]} OFF"; }
+                if (parts[1] == "on") { Enable(cat); return $"log category={parts[0]} enabled=true"; }
+                if (parts[1] == "off") { Disable(cat); return $"log category={parts[0]} enabled=false"; }
             }
 
-            // @log social combat — toggle listed categories
             string result = "";
             foreach (var part in parts)
             {
@@ -268,27 +203,27 @@ namespace DungeonRunners.Networking
                 }
             }
 
-            return string.IsNullOrEmpty(result) ? GetStatusString() : $"Logging: {result.Trim()}";
+            return string.IsNullOrEmpty(result) ? GetStatusString() : $"log {result.Trim()}";
         }
 
         private static string GetStatusString()
         {
             bool master = Debug.logger.logEnabled;
-            if (!master) return "Logging: MASTER OFF (type @log on to enable)";
-            if (_enabled == Cat.All) return "Logging: ALL ON";
-            if (_enabled == Cat.None) return "Logging: DRLog categories OFF (Unity still active — @log off to kill all)";
+            if (!master) return "log master=false command=@log on";
+            if (_enabled == Cat.All) return "log master=true categories=all";
+            if (_enabled == Cat.None) return "log categories=false master=true command=@log off";
 
             var on = new List<string>();
             var off = new List<string>();
-            foreach (var kvp in _nameMap)
+            foreach (var categoryEntry in _nameMap)
             {
-                if (kvp.Key == "all" || kvp.Key == "inv") continue; // skip aliases
-                if ((_enabled & kvp.Value) != 0)
-                    on.Add(kvp.Key);
+                if (categoryEntry.Key == "all" || categoryEntry.Key == "inv") continue;
+                if ((_enabled & categoryEntry.Value) != 0)
+                    on.Add(categoryEntry.Key);
                 else
-                    off.Add(kvp.Key);
+                    off.Add(categoryEntry.Key);
             }
-            return $"ON: {string.Join(", ", on)} | OFF: {string.Join(", ", off)}";
+            return $"enabled={string.Join(",", on)} disabled={string.Join(",", off)}";
         }
     }
 }

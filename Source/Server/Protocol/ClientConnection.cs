@@ -6,9 +6,6 @@ using DungeonRunners.Utilities;
 
 namespace DungeonRunners.Networking
 {
-    /// <summary>
-    /// Represents a client connection with Unity-compatible async operations
-    /// </summary>
     public class ClientConnection
     {
         public TcpClient Client { get; private set; }
@@ -40,7 +37,6 @@ namespace DungeonRunners.Networking
         {
             while (_isReading && IsConnected)
             {
-                // Read on background thread
                 bool dataAvailable = false;
                 byte[] receivedData = null;
 
@@ -61,25 +57,21 @@ namespace DungeonRunners.Networking
                     }
                     catch (Exception ex)
                     {
-                        Debug.LogError($"Error reading from client: {ex}");
+                        Debug.LogError($"[CLIENT-CONNECTION] read state=failed message='{ex}'");
                         _isReading = false;
                     }
                 });
 
-                // Wait a frame
                 yield return null;
 
-                // Process received data on main thread
                 if (dataAvailable && receivedData != null)
                 {
                     OnDataReceived?.Invoke(receivedData);
                 }
 
-                // Small delay to prevent tight loop
                 yield return new WaitForSeconds(0.01f);
             }
 
-            // Connection closed
             OnDisconnected?.Invoke();
         }
 
@@ -95,7 +87,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Error sending data: {ex}");
+                Debug.LogError($"[CLIENT-CONNECTION] send state=failed message='{ex}'");
                 Disconnect();
             }
         }
@@ -111,7 +103,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Error disconnecting: {ex}");
+                Debug.LogError($"[CLIENT-CONNECTION] disconnect state=failed message='{ex}'");
             }
         }
     }

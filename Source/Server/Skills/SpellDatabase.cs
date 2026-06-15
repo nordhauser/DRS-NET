@@ -1,983 +1,862 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using DungeonRunners.Data;
 using DungeonRunners.Engine;
+using DungeonRunners.Networking;
 
 namespace DungeonRunners.Combat
 {
-    /// <summary>
-    /// Complete skill/spell database — ALL 65 skills from skillsALL.json.
-    /// Damage data extracted from decompressed finalconf.json (149MB GC database).
-    /// 
-    /// Spell damage formula (mirrors melee but uses different knobs):
-    ///   baseDamage = (SkillDamagePerLevel(15) * level) + (SkillDamagePerIntellect(1.5) * Intellect(10))
-    ///   scaled = baseDamage * spell.DamageMod
-    ///   spread = scaled * spell.DamageVolatility
-    ///   damage = RNG in [scaled - spread, scaled + spread]
-    ///
-    /// Weapon skills (Butcher, Cleave) use the MELEE formula instead:
-    ///   baseDamage = (WeaponDamagePerLevel(10) * level) + (MeleeDamagePerStrength(2.3364) * Strength)
-    ///
-    /// Ranged skills use RangedDamagePerAgility(2.124) scaling.
-    ///
-    /// Base damage effect inheritance from GC:
-    ///   skills.generic.base.Shadow.DamageEffect  -> AT=MAGIC, DT=SHADOW, DMod=0.50, DVol=0.25
-    ///   skills.generic.base.Fire.DamageEffect    -> AT=MAGIC, DT=FIRE,   DMod=0.50, DVol=0.25
-    ///   skills.generic.base.Divine.DamageEffect   -> AT=MAGIC, DT=DIVINE, DMod=0.50, DVol=0.25
-    ///   skills.generic.base.Ice.DamageEffect      -> AT=MAGIC, DT=ICE,    DMod=0.50, DVol=0.25
-    ///   skills.generic.base.Poison.DamageEffect   -> AT=MAGIC, DT=POISON, DMod=0.50, DVol=0.25
-    ///   skills.generic.base.Poison.RangedDamageEffect -> AT=RANGED, DT=POISON (ranger arrows)
-    /// </summary>
     public static class SpellDatabase
     {
         private static Dictionary<string, SpellData> _spells;
         private static bool _initialized;
+        private static bool _authoredLoaded;
+        private static readonly string[] PLAYER_ANIMATION_LIST_PATHS =
+        {
+            "avatar.races.humanmale.HumanMaleAnimations",
+            "avatar.races.humanfemale.HumanFemaleAnimations",
+            "HumanMaleAnimations",
+            "HumanFemaleAnimations"
+        };
 
         public static void Initialize()
         {
+            EnsureStorage();
+            EnsureAuthoredLoaded();
+        }
+
+        private static void EnsureStorage()
+        {
             if (_initialized) return;
             _spells = new Dictionary<string, SpellData>(StringComparer.OrdinalIgnoreCase);
-
-            // =====================================================================
-            // SHADOW SCHOOL -- Warlock/Mage offensive spells
-            // =====================================================================
-
-            Register("ShadowLightning", new SpellData
-            {
-                SkillId = "skills.generic.ShadowLightning",
-                DisplayName = "Shadow Lightning",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.SHADOW,
-                DamageMod = 0.80f,
-                DamageVolatility = 0.75f,
-                CriticalChance = 0.25f,
-                Cooldown = 1.5f,
-                Range = 50,
-                ManaCostMod = 7.0f,
-                IsChainSpell = true,
-                NumChains = 5,
-                ChainRange = 75,
-                MaxSkillLevel = 20,
-                RequiredLevel = 3,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("ShadowLightningKnockdown", new SpellData
-            {
-                SkillId = "skills.generic.ShadowLightningKnockdown",
-                DisplayName = "Shadow Word: Smackdown",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.SHADOW,
-                DamageMod = 0.10f,
-                DamageVolatility = 0.10f,
-                CriticalChance = 0.50f,
-                Cooldown = 15.0f,
-                Range = 50,
-                ManaCostMod = 4.0f,
-                HasKnockdown = true,
-                MaxSkillLevel = 20,
-                RequiredLevel = 3,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("ShadowBolt", new SpellData
-            {
-                SkillId = "skills.generic.ShadowBolt",
-                DisplayName = "Shadow Bolt",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.SHADOW,
-                DamageMod = 0.30f,
-                DamageVolatility = 0.15f,
-                Cooldown = 0f,
-                Range = 60,
-                ManaCostMod = 5.75f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("ShadowBlossom", new SpellData
-            {
-                SkillId = "skills.generic.ShadowBlossom",
-                DisplayName = "Shadow Blossom",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.SHADOW,
-                DamageMod = 0.50f,
-                DamageVolatility = 0.30f,
-                Cooldown = 3.0f,
-                Range = 70,
-                ManaCostMod = 1.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("ShadowRage", new SpellData
-            {
-                SkillId = "skills.generic.ShadowRage",
-                DisplayName = "Shadow Rage",
-                AttackType = AttackType.MELEE,
-                DamageType = DamageElement.SHADOW,
-                DamageMod = 0.12f,
-                DamageVolatility = 0.10f,
-                CriticalChance = 0.25f,
-                Cooldown = 50.0f,
-                ManaCostMod = 4.35f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("ShadowTendrils", new SpellData
-            {
-                SkillId = "skills.generic.ShadowTendrils",
-                DisplayName = "Shadow Tendrils",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.SHADOW,
-                DamageMod = 0.20f,
-                DamageVolatility = 0.25f,
-                Cooldown = 20.0f,
-                ManaCostMod = 9.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            // =====================================================================
-            // FIRE SCHOOL -- Mage offensive spells
-            // =====================================================================
-
-            Register("FireBolt", new SpellData
-            {
-                SkillId = "skills.generic.FireBolt",
-                DisplayName = "Fire Bolt",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.FIRE,
-                DamageMod = 0.75f,
-                DamageVolatility = 0.60f,
-                CriticalChance = 1.0f,
-                Cooldown = 0f,
-                Range = 300,
-                ProjectileSpeed = 200f,
-                ProjectileSize = 8f,
-                ProjectileLifespan = 30.5f,
-                RepeatCount = 1,
-                AnimationLengthFrames = 30,
-                ManaCostMod = 3.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("FireCone", new SpellData
-            {
-                SkillId = "skills.generic.FireCone",
-                DisplayName = "Fire Cone",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.FIRE,
-                DamageMod = 0.16f,
-                DamageVolatility = 0.70f,
-                CriticalChance = 0.10f,
-                Cooldown = 0f,
-                Range = 23,
-                ManaCostMod = 8.45f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("FireCurseShot", new SpellData
-            {
-                SkillId = "skills.generic.FireCurseShot",
-                DisplayName = "Fire Curse Shot",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.FIRE,
-                DamageMod = 0.35f,
-                DamageVolatility = 0.50f,
-                Cooldown = 7.0f,
-                Range = 176,
-                ManaCostMod = 3.75f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("FireMeleeSummon", new SpellData
-            {
-                SkillId = "skills.generic.FireMeleeSummon",
-                DisplayName = "Fire Melee Summon",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.FIRE,
-                DamageMod = 0.80f,
-                DamageVolatility = 0.50f,
-                CriticalChance = 1.0f,
-                Cooldown = 1.5f,
-                Range = 12,
-                ManaCostMod = 1.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("FireRing", new SpellData
-            {
-                SkillId = "skills.generic.FireRing",
-                DisplayName = "Fire Ring",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.FIRE,
-                DamageMod = 0.55f,
-                DamageVolatility = 0.75f,
-                Cooldown = 8.0f,
-                Range = 60,
-                ManaCostMod = 10.0f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("FireShot", new SpellData
-            {
-                SkillId = "skills.generic.FireShot",
-                DisplayName = "Fire Shot",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.FIRE,
-                DamageMod = 0.80f,
-                DamageVolatility = 0.65f,
-                Cooldown = 1.0f,
-                Range = 176,
-                ManaCostMod = 1.85f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("FireTrail", new SpellData
-            {
-                // Extends PoisonTrail -- fire DoT trail, dual-element
-                SkillId = "skills.generic.FireTrail",
-                DisplayName = "Fire Trail",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.FIRE,
-                DamageMod = 0.09f,
-                DamageVolatility = 0.10f,
-                CriticalChance = 0.01f,
-                Cooldown = 18.0f,
-                ManaCostMod = 8.6f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("HellFire", new SpellData
-            {
-                SkillId = "skills.generic.HellFire",
-                DisplayName = "Hellfire",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.FIRE,
-                DamageMod = 1.0f,
-                DamageVolatility = 0.25f,
-                Cooldown = 0f,
-                Range = 100,
-                ManaCostMod = 15.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-            // Alias -- skillsALL.json uses "HellFire" but code may reference "Hellfire"
-            if (_spells.TryGetValue("HellFire", out var hf)) _spells["Hellfire"] = hf;
-
-            // =====================================================================
-            // ICE SCHOOL -- Mage offensive spells
-            // =====================================================================
-
-            Register("IceBolt", new SpellData
-            {
-                SkillId = "skills.generic.IceBolt",
-                DisplayName = "Ice Bolt",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.ICE,
-                DamageMod = 0.70f,
-                DamageVolatility = 0.40f,
-                Cooldown = 0f,
-                Range = 30,
-                ManaCostMod = 4.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("IceMultibolt", new SpellData
-            {
-                // Inherits base Ice.DamageEffect -- no overrides in GC
-                SkillId = "skills.generic.IceMultibolt",
-                DisplayName = "Ice Multi-Bolt",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.ICE,
-                DamageMod = 0.50f,
-                DamageVolatility = 0.25f,
-                Cooldown = 0f,
-                Range = 30,
-                ManaCostMod = 6.2f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-            if (_spells.TryGetValue("IceMultibolt", out var imb)) _spells["IceMultiBolt"] = imb;
-
-            Register("IceShot", new SpellData
-            {
-                SkillId = "skills.generic.IceShot",
-                DisplayName = "Ice Shot",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.ICE,
-                DamageMod = 0.50f,
-                DamageVolatility = 0.40f,
-                CriticalChance = 0.25f,
-                Cooldown = 1.0f,
-                Range = 176,
-                ManaCostMod = 1.8f,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("IceTargetedBurst", new SpellData
-            {
-                SkillId = "skills.generic.IceTargetedBurst",
-                DisplayName = "Ice Targeted Burst",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.ICE,
-                DamageMod = 0.25f,
-                DamageVolatility = 0.75f,
-                Cooldown = 12.0f,
-                Range = 90,
-                ManaCostMod = 10.0f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            // =====================================================================
-            // DIVINE SCHOOL -- Fighter offensive spells
-            // =====================================================================
-
-            Register("Charge", new SpellData
-            {
-                SkillId = "skills.generic.Charge",
-                DisplayName = "Charge",
-                AttackType = AttackType.MELEE,
-                DamageType = DamageElement.DIVINE,
-                DamageMod = 1.15f,
-                DamageVolatility = 0.25f,
-                Cooldown = 7.0f,
-                Range = 20,
-                ManaCostMod = 1.5f,
-                MaxSkillLevel = 20,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("DivineIntervention", new SpellData
-            {
-                SkillId = "skills.generic.DivineIntervention",
-                DisplayName = "Divine Intervention",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.DIVINE,
-                DamageMod = 0.65f,
-                DamageVolatility = 0.65f,
-                Cooldown = 17.0f,
-                ManaCostMod = 14.8f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("DivineMeleeAttack", new SpellData
-            {
-                SkillId = "skills.generic.DivineMeleeAttack",
-                DisplayName = "Divine Melee Attack",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.DIVINE,
-                DamageMod = 0.65f,
-                DamageVolatility = 0.40f,
-                CriticalChance = 0.25f,
-                Cooldown = 5.0f,
-                Range = 12,
-                ManaCostMod = 1.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("DivineRay", new SpellData
-            {
-                SkillId = "skills.generic.DivineRay",
-                DisplayName = "Divine Ray",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.DIVINE,
-                DamageMod = 0.425f,
-                DamageVolatility = 0.40f,
-                CriticalChance = 0.50f,
-                Cooldown = 1.0f,
-                Range = 130,
-                ManaCostMod = 4.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("FearMeleeAttack", new SpellData
-            {
-                SkillId = "skills.generic.FearMeleeAttack",
-                DisplayName = "Fear Melee Attack",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.DIVINE,
-                DamageMod = 0.10f,
-                DamageVolatility = 0.30f,
-                CriticalChance = 0.25f,
-                Cooldown = 5.0f,
-                Range = 12,
-                ManaCostMod = 1.25f,
-                HasFear = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("Stomp", new SpellData
-            {
-                SkillId = "skills.generic.Stomp",
-                DisplayName = "Stomp",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.DIVINE,
-                DamageMod = 0.15f,
-                DamageVolatility = 0.40f,
-                CriticalChance = 0.75f,
-                Cooldown = 20.0f,
-                ManaCostMod = 1.5f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Offensive,
-                NumTargetsMin = 6f,
-                NumTargetsMax = 22f,
-                NumTargetsInc = 0.8f,
-                AoERadius = 50f
-            });
-
-            // =====================================================================
-            // POISON SCHOOL -- Ranger offensive spells
-            // =====================================================================
-
-            Register("PoisonShot", new SpellData
-            {
-                SkillId = "skills.generic.PoisonShot",
-                DisplayName = "Poison Shot",
-                AttackType = AttackType.RANGED,
-                DamageType = DamageElement.POISON,
-                DamageMod = 0f,
-                DamageVolatility = 0f,
-                CriticalChance = 0f,
-                Cooldown = 1.0f,
-                Range = 176,
-                ProjectileSpeed = 200f,
-                ProjectileSize = 8f,
-                ProjectileLifespan = 23f,
-                ManaCostMod = 1.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Offensive,
-                AdjustCooldownByWeapon = true,
-                HasImmediateWeaponDamageEffect = true,
-                ARModMin = 300,
-                ARModMax = 300,
-                WeaponEffectDamageModMin = 0,
-                WeaponEffectDamageModMax = 0,
-                ProjectileEffectId = "skills.generic.PoisonShot.ProjectileEffect",
-                ProjectileModifierId = "skills.generic.PoisonShot.PoisonModifier",
-                ProjectileModifierEffectId = "skills.generic.PoisonShot.PoisonModifierEffect",
-                ProjectileModifierAttackType = AttackType.MAGIC,
-                ProjectileModifierDamageType = DamageElement.POISON,
-                ProjectileModifierDuration = 4f,
-                ProjectileModifierFrequency = 1f,
-                ProjectileModifierStackRule = "UNIQUEBYSOURCE",
-                ProjectileModifierDamageMod = 0.43f,
-                ProjectileModifierDamageVolatility = 0.30f,
-                ProjectileModifierCriticalChance = 0.25f
-            });
-
-            Register("PlagueShot", new SpellData
-            {
-                SkillId = "skills.generic.PlagueShot",
-                DisplayName = "Plague Shot",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.POISON,
-                DamageMod = 0.30f,
-                DamageVolatility = 0.30f,
-                Cooldown = 5.0f,
-                Range = 90,
-                ManaCostMod = 5.0f,
-                IsChainSpell = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("NoxiousShot", new SpellData
-            {
-                SkillId = "skills.generic.NoxiousShot",
-                DisplayName = "Noxious Shot",
-                AttackType = AttackType.RANGED,
-                DamageType = DamageElement.POISON,
-                DamageMod = 0.33f,
-                DamageVolatility = 0.30f,
-                CriticalChance = 0.33f,
-                Cooldown = 3.0f,
-                Range = 176,
-                ManaCostMod = 2.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("PenetrateKnockdownShot", new SpellData
-            {
-                SkillId = "skills.generic.PenetrateKnockdownShot",
-                DisplayName = "Penetrate Knockdown Shot",
-                AttackType = AttackType.RANGED,
-                DamageType = DamageElement.POISON,
-                DamageMod = 0.10f,
-                DamageVolatility = 0.20f,
-                CriticalChance = 0.25f,
-                Cooldown = 15.0f,
-                Range = 176,
-                ManaCostMod = 3.0f,
-                HasKnockdown = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("PoisonBlastRadius", new SpellData
-            {
-                SkillId = "skills.generic.PoisonBlastRadius",
-                DisplayName = "Poison Blast Radius",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.POISON,
-                DamageMod = 0.30f,
-                DamageVolatility = 0.30f,
-                CriticalChance = 0.25f,
-                Cooldown = 10.0f,
-                ManaCostMod = 1.4f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Offensive,
-                NumTargetsMin = 4f,
-                NumTargetsMax = 20f,
-                NumTargetsInc = 0.8f,
-                AoERadius = 30f
-            });
-
-            Register("PoisonTrail", new SpellData
-            {
-                SkillId = "skills.generic.PoisonTrail",
-                DisplayName = "Poison Trail",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.POISON,
-                DamageMod = 0.30f,
-                DamageVolatility = 0.45f,
-                CriticalChance = 0.25f,
-                Cooldown = 18.0f,
-                ManaCostMod = 8.6f,
-                IsAoE = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Offensive
-            });
-
-            Register("FearShot", new SpellData
-            {
-                // CC skill -- no direct damage in GC, applies Fear debuff
-                SkillId = "skills.generic.FearShot",
-                DisplayName = "Fear Shot",
-                AttackType = AttackType.RANGED,
-                DamageType = DamageElement.PHYSICAL,
-                DamageMod = 0f,
-                Cooldown = 7.0f,
-                Range = 176,
-                ManaCostMod = 2.0f,
-                HasFear = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.CrowdControl
-            });
-
-            // =====================================================================
-            // WEAPON SKILLS -- Use melee/weapon damage formula, not spell formula
-            // These extend SpellWeaponDamageEffect in GC
-            // =====================================================================
-
-            Register("Butcher", new SpellData
-            {
-                SkillId = "skills.generic.Butcher",
-                DisplayName = "Butcher",
-                AttackType = AttackType.MELEE,
-                DamageType = DamageElement.PHYSICAL,
-                DamageMod = 1.0f,
-                Cooldown = 5.0f,
-                Range = 12,
-                ManaCostMod = 0.75f,
-                IsWeaponSkill = true,
-                MaxSkillLevel = 20,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.WeaponSkill,
-                AdjustCooldownByWeapon = true,
-                SkillDamageModMin = -60,
-                SkillDamageModMax = 300,
-                SkillDamageModInc = 5,
-                ARModMin = 20,
-                ARModMax = 250,
-                ARModInc = 5
-            });
-
-            Register("Cleave", new SpellData
-            {
-                SkillId = "skills.generic.Cleave",
-                DisplayName = "Cleave",
-                AttackType = AttackType.MELEE,
-                DamageType = DamageElement.PHYSICAL,
-                DamageMod = 1.0f,
-                Cooldown = 5.0f,
-                Range = 5,
-                ManaCostMod = 1.8f,
-                IsWeaponSkill = true,
-                IsAoE = true,
-                MaxSkillLevel = 15,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.WeaponSkill,
-                AdjustCooldownByWeapon = true,
-                SkillDamageModMin = -75,
-                SkillDamageModMax = 0,
-                SkillDamageModInc = 10,
-                ARModMin = 20,
-                ARModMax = 100,
-                ARModInc = 5,
-                NumTargetsMin = 3.5f,
-                NumTargetsMax = 8f,
-                NumTargetsInc = 0.5f
-            });
-
-            // =====================================================================
-            // DEBUFFS -- Apply modifiers, no direct damage
-            // =====================================================================
-
-            Register("Blight", new SpellData
-            {
-                SkillId = "skills.generic.Blight",
-                DisplayName = "Blight",
-                AttackType = AttackType.MAGIC,
-                DamageType = DamageElement.POISON,
-                DamageMod = 0f,
-                Cooldown = 45.0f,
-                ManaCostMod = 2.0f,
-                MaxSkillLevel = 20,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Debuff
-            });
-
-            // =====================================================================
-            // HEALING / UTILITY -- Self-targeted support skills
-            // =====================================================================
-
-            Register("HealSelf", new SpellData
-            {
-                SkillId = "skills.generic.HealSelf",
-                DisplayName = "Heal Self",
-                Cooldown = 80.0f,
-                ManaCostMod = 4.52f,
-                MaxSkillLevel = 20,
-                SkillCategory = SkillCategory.Heal
-            });
-
-            Register("ManaSelf", new SpellData
-            {
-                SkillId = "skills.generic.ManaSelf",
-                DisplayName = "Mana Self",
-                Cooldown = 80.0f,
-                ManaCostMod = 0.52f,
-                MaxSkillLevel = 20,
-                SkillCategory = SkillCategory.Utility
-            });
-
-            Register("ManaShield", new SpellData
-            {
-                SkillId = "skills.generic.ManaShield",
-                DisplayName = "Mana Shield",
-                Cooldown = 30.0f,
-                ManaCostMod = 25.26f,
-                MaxSkillLevel = 20,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Utility
-            });
-
-            Register("Sprint", new SpellData
-            {
-                SkillId = "skills.generic.Sprint",
-                DisplayName = "Sprint",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Utility
-            });
-
-            Register("Teleport", new SpellData
-            {
-                SkillId = "skills.generic.Teleport",
-                DisplayName = "Teleport",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Utility
-            });
-
-            Register("TownPortal", new SpellData
-            {
-                SkillId = "skills.generic.TownPortal",
-                DisplayName = "Town Portal",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Utility
-            });
-
-            // =====================================================================
-            // SUMMON SKILLS -- Spawn companion entities
-            // =====================================================================
-
-            Register("SummonBlingGnome", new SpellData
-            {
-                SkillId = "skills.generic.SummonBlingGnome",
-                DisplayName = "Summon Bling Gnome",
-                Cooldown = 45.0f,
-                ManaCostMod = 0f,
-                MaxSkillLevel = 1,
-                SkillCategory = SkillCategory.Passive
-            });
-
-            Register("SummonMonsterBait", new SpellData
-            {
-                SkillId = "skills.generic.SummonMonsterBait",
-                DisplayName = "Summon Monster Bait",
-                Cooldown = 45.0f,
-                Range = 100,
-                ManaCostMod = 6.0f,
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Summon
-            });
-
-            Register("SummonSnowman", new SpellData
-            {
-                SkillId = "skills.generic.SummonSnowman",
-                DisplayName = "Summon Snowman",
-                Cooldown = 60.0f,
-                ManaCostMod = 10.25f,
-                DamageType = DamageElement.ICE,
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Summon
-            });
-
-            Register("SummonWolf", new SpellData
-            {
-                SkillId = "skills.generic.SummonWolf",
-                DisplayName = "Summon Wolf",
-                Cooldown = 1.0f,
-                ManaCostMod = 5.0f,
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Summon
-            });
-
-            // =====================================================================
-            // PASSIVE SKILLS -- Always active, no cast
-            // Resist passives, class passives
-            // =====================================================================
-
-            Register("DivineResistPassive", new SpellData
-            {
-                SkillId = "skills.generic.DivineResistPassive",
-                DisplayName = "Divine Resist",
-                MaxSkillLevel = 10,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("FearResistModPassive", new SpellData
-            {
-                SkillId = "skills.generic.FearResistModPassive",
-                DisplayName = "Fear Resist",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("FighterClassPassive", new SpellData
-            {
-                SkillId = "skills.generic.FighterClassPassive",
-                DisplayName = "Fighter Class Passive",
-                MaxSkillLevel = 10,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("FireResistPassive", new SpellData
-            {
-                SkillId = "skills.generic.FireResistPassive",
-                DisplayName = "Fire Resist",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("IceResistPassive", new SpellData
-            {
-                SkillId = "skills.generic.IceResistPassive",
-                DisplayName = "Ice Resist",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("MageClassPassive", new SpellData
-            {
-                SkillId = "skills.generic.MageClassPassive",
-                DisplayName = "Mage Class Passive",
-                MaxSkillLevel = 10,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("MagicDamageModPassive", new SpellData
-            {
-                SkillId = "skills.generic.MagicDamageModPassive",
-                DisplayName = "Magic Damage Mod",
-                MaxSkillLevel = 10,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("MeleeAttackRatingModPassive", new SpellData
-            {
-                SkillId = "skills.generic.MeleeAttackRatingModPassive",
-                DisplayName = "Melee Attack Rating",
-                MaxSkillLevel = 10,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("MeleeAttackSpeedModPassive", new SpellData
-            {
-                SkillId = "skills.generic.MeleeAttackSpeedModPassive",
-                DisplayName = "Melee Attack Speed",
-                MaxSkillLevel = 10,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("MonsterBaitHealthModPassive", new SpellData
-            {
-                SkillId = "skills.generic.MonsterBaitHealthModPassive",
-                DisplayName = "Monster Bait Health",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("PoisonResistPassive", new SpellData
-            {
-                SkillId = "skills.generic.PoisonResistPassive",
-                DisplayName = "Poison Resist",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("RangeAttackSpeedModPassive", new SpellData
-            {
-                SkillId = "skills.generic.RangeAttackSpeedModPassive",
-                DisplayName = "Ranged Attack Speed",
-                MaxSkillLevel = 10,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("RangerClassPassive", new SpellData
-            {
-                SkillId = "skills.generic.RangerClassPassive",
-                DisplayName = "Ranger Class Passive",
-                MaxSkillLevel = 10,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("ShadowResistPassive", new SpellData
-            {
-                SkillId = "skills.generic.ShadowResistPassive",
-                DisplayName = "Shadow Resist",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("SummonerClassPassive", new SpellData
-            {
-                SkillId = "skills.generic.SummonerClassPassive",
-                DisplayName = "Summoner Class Passive",
-                MaxSkillLevel = 10,
-                SkillCategory = SkillCategory.Passive
-            });
-
-            // =====================================================================
-            // TRAIT PASSIVES -- Class-specific attribute/speed traits
-            // =====================================================================
-
-            Register("RangerCoreAttributeTrait", new SpellData
-            {
-                SkillId = "skills.generic.RangerCoreAttributeTrait",
-                DisplayName = "Ranger Core Attribute",
-                MaxSkillLevel = 10,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("RangerRangedSpeedTrait", new SpellData
-            {
-                SkillId = "skills.generic.RangerRangedSpeedTrait",
-                DisplayName = "Ranger Ranged Speed",
-                MaxSkillLevel = 10,
-                ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("WarlockCoreAttributeTrait", new SpellData
-            {
-                SkillId = "skills.generic.WarlockCoreAttributeTrait",
-                DisplayName = "Warlock Core Attribute",
-                MaxSkillLevel = 10,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("WarlockSpellDamageTrait", new SpellData
-            {
-                SkillId = "skills.generic.WarlockSpellDamageTrait",
-                DisplayName = "Warlock Spell Damage",
-                MaxSkillLevel = 10,
-                ProfessionType = "MAGE",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("WarriorCoreAttributeTrait", new SpellData
-            {
-                SkillId = "skills.generic.WarriorCoreAttributeTrait",
-                DisplayName = "Warrior Core Attribute",
-                MaxSkillLevel = 10,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Passive
-            });
-            Register("WarriorMeleeSpeedTrait", new SpellData
-            {
-                SkillId = "skills.generic.WarriorMeleeSpeedTrait",
-                DisplayName = "Warrior Melee Speed",
-                MaxSkillLevel = 10,
-                ProfessionType = "FIGHTER",
-                SkillCategory = SkillCategory.Passive
-            });
-
             _initialized = true;
-            int offensive = 0, weapon = 0, utility = 0, passive = 0, summon = 0;
-            var seen = new HashSet<string>();
-            foreach (var kvp in _spells)
+        }
+
+        private static void EnsureAuthoredLoaded()
+        {
+            EnsureStorage();
+            if (_authoredLoaded) return;
+
+            var gc = GCDatabase.Instance;
+            if (gc == null || !gc.IsLoaded) return;
+
+            foreach (string path in gc.RegisteredPaths)
             {
-                if (!seen.Add(kvp.Value.ShortName)) continue;
-                switch (kvp.Value.SkillCategory)
+                if (!IsTopLevelGenericSkillPath(path)) continue;
+                if (TryBuildAuthoredSpell(path, out SpellData spell))
+                    Register(spell.ShortName, spell);
+            }
+
+            _authoredLoaded = true;
+            LogLoadSummary();
+        }
+
+        private static bool IsTopLevelGenericSkillPath(string path)
+        {
+            string normalized = NormalizePath(path);
+            const string prefix = "skills.generic.";
+            if (!normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return false;
+            string rest = normalized.Substring(prefix.Length);
+            return rest.Length > 0 && rest.IndexOf('.') < 0;
+        }
+
+        private static bool TryBuildAuthoredSpell(string nameOrPath, out SpellData spell)
+        {
+            spell = null;
+
+            var gc = GCDatabase.Instance;
+            if (gc == null || !gc.IsLoaded)
+                return false;
+
+            string path = NormalizeSkillCandidate(nameOrPath);
+            GCNode skill = gc.ResolveWithInheritance(path);
+            if (skill == null)
+            {
+                string shortName = LastSegment(path);
+                if (!string.IsNullOrWhiteSpace(shortName))
+                {
+                    path = "skills.generic." + shortName;
+                    skill = gc.ResolveWithInheritance(path);
+                }
+            }
+
+            if (skill == null)
+                return false;
+
+            GCNode desc = ResolveInheritedNode(skill.GetChild("Description") ?? skill);
+            if (desc == null || !HasSkillShape(desc))
+                return false;
+
+            string skillId = ResolveSkillId(path, skill);
+            string shortKey = LastSegment(skillId);
+            string label = desc.GetString("Label", shortKey);
+            string category = desc.GetString("Category", "");
+
+            spell = new SpellData
+            {
+                ShortName = shortKey,
+                SkillId = skillId,
+                DisplayName = string.IsNullOrWhiteSpace(label) ? shortKey : label,
+                AttackType = ParseAttackType(desc.GetString("WeaponType", null), AttackType.MAGIC),
+                DamageType = ParseDamageElement(desc.GetString("DamageType", null), DamageElement.PHYSICAL),
+                Cooldown = desc.GetFloat("CoolDown", desc.GetFloat("Cooldown", 0f)),
+                Range = desc.GetInt("Range", 0),
+                RepeatCount = Math.Max(1, desc.GetInt("RepeatCount", 1)),
+                AnimationId = desc.GetInt("AnimationID", 0),
+                ManaCostMod = desc.GetFloat("ManaCostMod", 0f),
+                GoldValueMod = desc.GetFloat("GoldValueMod", 0f),
+                MaxSkillLevel = desc.GetInt("MaxSkillLevel", 0),
+                RequiredLevel = desc.GetInt("RequiredLevel", 1),
+                RequiredLevelInc = desc.GetInt("RequiredLevelInc", 5),
+                ProfessionType = desc.GetString("ProfessionType", ""),
+                TargetType = desc.GetString("TargetType", ""),
+                AdjustCooldownByWeapon = desc.GetBool("AdjustCooldownByWeapon", false)
+            };
+
+            string effectPath = desc.GetString("Effect", null);
+            GCNode effectRoot = ResolveAuthoredNodeReference(effectPath, skill);
+            if (effectRoot != null)
+                ParseEffectTree(spell, effectRoot, skill);
+
+            if (TryResolvePlayerAnimationTimingKey(spell.AnimationId, out int frames, out int trigger))
+            {
+                spell.AnimationLengthFrames = frames;
+                spell.AnimationTriggerFrames = trigger;
+            }
+
+            spell.SkillCategory = ParseSkillCategory(category, spell);
+            return true;
+        }
+
+        private static bool HasSkillShape(GCNode desc)
+        {
+            return desc.HasProperty("Effect") ||
+                   desc.HasProperty("MaxSkillLevel") ||
+                   desc.HasProperty("CoolDown") ||
+                   desc.HasProperty("Cooldown") ||
+                   desc.HasProperty("ManaCostMod") ||
+                   desc.HasProperty("ProfessionType") ||
+                   desc.HasProperty("TargetType") ||
+                   desc.HasProperty("Category");
+        }
+
+        private static void ParseEffectTree(SpellData spell, GCNode effectRoot, GCNode skillContext)
+        {
+            GCNode aoe = FindFirstEffectNode(effectRoot, "SpellAOEEffect");
+            if (aoe != null)
+                ParseAoE(spell, aoe);
+
+            GCNode weaponDamage = FindFirstEffectNode(effectRoot, "SpellWeaponDamageEffect");
+            if (weaponDamage != null)
+            {
+                ParseWeaponDamage(spell, weaponDamage);
+                GCNode inheritedWeaponDamage = ResolveInheritedNode(weaponDamage);
+                string nestedEffectPath = inheritedWeaponDamage?.GetString("Effect", null);
+                if (!string.IsNullOrWhiteSpace(nestedEffectPath))
+                {
+                    GCNode nestedEffect = ResolveAuthoredNodeReference(nestedEffectPath, skillContext);
+                    if (nestedEffect != null)
+                    {
+                        if (spell.HasImmediateWeaponDamageEffect && string.IsNullOrWhiteSpace(spell.ProjectileEffectId))
+                            spell.ProjectileEffectId = nestedEffectPath;
+                        ParseModifier(spell, nestedEffect, skillContext);
+                        GCNode nestedDamage = FindFirstEffectNode(nestedEffect, "SpellDamageEffect");
+                        if (nestedDamage != null && spell.DamageMod <= 0f)
+                            ParseDamage(spell, nestedDamage);
+                        GCNode nestedKnockDown = FindFirstEffectNode(nestedEffect, "SpellKnockDownEffect");
+                        if (nestedKnockDown != null)
+                            ParseKnockDown(spell, nestedKnockDown);
+                    }
+                }
+            }
+
+            GCNode damage = FindFirstEffectNode(effectRoot, "SpellDamageEffect");
+            if (damage != null)
+                ParseDamage(spell, damage);
+
+            GCNode chain = FindFirstEffectNode(effectRoot, "SpellChainEffect");
+            if (chain != null)
+                ParseChain(spell, chain);
+
+            ParseProjectile(spell, effectRoot, skillContext);
+            ParseModifier(spell, effectRoot, skillContext);
+
+            GCNode knockDown = FindFirstEffectNode(effectRoot, "SpellKnockDownEffect");
+            if (knockDown != null)
+                ParseKnockDown(spell, knockDown);
+            spell.HasFear = FindFirstEffectNode(effectRoot, "SpellFearEffect") != null;
+            spell.HasSlow = FindFirstEffectNode(effectRoot, "SpellSlowEffect") != null;
+        }
+
+        private static void ParseAoE(SpellData spell, GCNode node)
+        {
+            node = ResolveInheritedNode(node);
+            spell.IsAoE = true;
+            spell.HasAoEEffect = true;
+            spell.AoERadiusMin = GetFloatAny(node, "RadiusMin", "Radius", 0f);
+            spell.AoERadiusMax = GetFloatAny(node, "RadiusMax", null, spell.AoERadiusMin);
+            spell.AoERadiusInc = GetFloatAny(node, "RadiusInc", null, 0f);
+            spell.AoERadius = spell.ResolveAoERadius(1);
+            ParseNumTargets(spell, node);
+        }
+
+        private static void ParseWeaponDamage(SpellData spell, GCNode node)
+        {
+            node = ResolveInheritedNode(node);
+            spell.IsWeaponSkill = true;
+            spell.AttackType = ParseAttackType(node.GetString("AttackType", null), spell.AttackType);
+            spell.DamageType = ParseDamageElement(node.GetString("DamageType", null), spell.DamageType);
+            spell.DamageMod = spell.DamageMod > 0f ? spell.DamageMod : 1f;
+            spell.SkillDamageModMin = node.GetInt("DamageModMin", spell.SkillDamageModMin);
+            spell.SkillDamageModMax = node.HasProperty("DamageModMax") ? node.GetInt("DamageModMax", 0) : spell.SkillDamageModMax;
+            spell.SkillDamageModInc = node.GetInt("DamageModInc", spell.SkillDamageModInc);
+            spell.WeaponEffectDamageModMin = spell.SkillDamageModMin;
+            spell.WeaponEffectDamageModMax = spell.SkillDamageModMax;
+            spell.WeaponEffectDamageModInc = spell.SkillDamageModInc;
+            spell.ARModMin = node.GetInt("ARModMin", spell.ARModMin);
+            spell.ARModMax = node.HasProperty("ARModMax") ? node.GetInt("ARModMax", 0) : spell.ARModMax;
+            spell.ARModInc = node.GetInt("ARModInc", spell.ARModInc);
+            spell.HasImmediateWeaponDamageEffect = true;
+            ParseNumTargets(spell, node);
+            if (spell.NumTargetsMax > 1f || spell.NumTargetsMin > 1f)
+                spell.IsAoE = true;
+        }
+
+        private static void ParseDamage(SpellData spell, GCNode node)
+        {
+            node = ResolveInheritedNode(node);
+            spell.HasSpellDamageEffect = true;
+            spell.AttackType = ParseAttackType(node.GetString("AttackType", null), spell.AttackType);
+            spell.DamageType = ParseDamageElement(node.GetString("DamageType", null), spell.DamageType);
+            spell.DamageMod = node.GetFloat("DamageMod", spell.DamageMod);
+            spell.DamageVolatility = node.GetFloat("DamageVolatility", spell.DamageVolatility);
+            spell.CriticalChance = node.GetFloat("CriticalChance", spell.CriticalChance);
+            spell.ChanceF32 = ResolveSpellEffectChanceWire(node);
+        }
+
+        private static void ParseKnockDown(SpellData spell, GCNode node)
+        {
+            node = ResolveInheritedNode(node);
+            spell.HasSpellKnockDownEffect = true;
+            spell.SpellKnockDownStrengthMin = node.GetInt("StrengthMin", spell.SpellKnockDownStrengthMin);
+            spell.SpellKnockDownStrengthMax = node.HasProperty("StrengthMax") ? node.GetInt("StrengthMax", spell.SpellKnockDownStrengthMin) : spell.SpellKnockDownStrengthMax;
+            spell.SpellKnockDownStrengthInc = node.GetInt("StrengthInc", spell.SpellKnockDownStrengthInc);
+            spell.SpellKnockDownChanceF32 = ResolveSpellEffectChanceWire(node);
+        }
+
+        private static void ParseChain(SpellData spell, GCNode node)
+        {
+            node = ResolveInheritedNode(node);
+            spell.IsChainSpell = true;
+            spell.NumChains = node.GetInt("NumChains", node.GetInt("NumTargets", spell.NumChains));
+            spell.ChainRange = node.GetInt("ChainRange", node.GetInt("Range", spell.ChainRange));
+        }
+
+        private static void ParseProjectile(SpellData spell, GCNode effectRoot, GCNode skillContext)
+        {
+            GCNode projectileEffect = FindFirstEffectNode(effectRoot, "SpellProjectileEffect");
+            if (projectileEffect == null)
+                return;
+
+            projectileEffect = ResolveInheritedNode(projectileEffect);
+            string projectilePath = projectileEffect.GetString("Projectile", null);
+            GCNode projectile = ResolveAuthoredNodeReference(projectilePath, skillContext);
+            GCNode projectileDesc = ResolveInheritedNode(projectile?.GetChild("Description") ?? projectile);
+            if (projectileDesc != null)
+            {
+                spell.ProjectileSpeed = projectileDesc.GetFloat("ProjectileSpeed", spell.ProjectileSpeed);
+                spell.ProjectileSize = projectileDesc.GetFloat("ProjectileSize", spell.ProjectileSize);
+                spell.ProjectileLifespan = projectileDesc.GetFloat("ProjectileLifespan", spell.ProjectileLifespan);
+                spell.ProjectileEffectId = projectileDesc.GetString("Effect", spell.ProjectileEffectId);
+            }
+
+            spell.RepeatCount = Math.Max(1, projectileEffect.GetInt("RepeatCount", spell.RepeatCount));
+            if (string.IsNullOrWhiteSpace(spell.ProjectileEffectId))
+                return;
+
+            GCNode projectileRuntimeEffect = ResolveAuthoredNodeReference(spell.ProjectileEffectId, projectile ?? skillContext);
+            if (projectileRuntimeEffect == null)
+                return;
+
+            GCNode damage = FindFirstEffectNode(projectileRuntimeEffect, "SpellDamageEffect");
+            if (damage != null)
+                ParseDamage(spell, damage);
+
+            ParseModifier(spell, projectileRuntimeEffect, projectile ?? skillContext);
+        }
+
+        private static void ParseModifier(SpellData spell, GCNode effectRoot, GCNode skillContext)
+        {
+            GCNode modEffect = FindFirstEffectNode(effectRoot, "SpellModEffect");
+            if (modEffect == null)
+                return;
+
+            modEffect = ResolveInheritedNode(modEffect);
+            string modifierPath = modEffect.GetString("Modifier", null);
+            if (string.IsNullOrWhiteSpace(modifierPath))
+                return;
+
+            spell.ProjectileModifierId = modifierPath;
+            spell.ProjectileModifierDuration = modEffect.GetFloat("Duration", spell.ProjectileModifierDuration);
+
+            GCNode modifier = ResolveAuthoredNodeReference(modifierPath, skillContext);
+            GCNode modifierDesc = ResolveInheritedNode(modifier?.GetChild("Description") ?? modifier);
+            if (modifierDesc == null)
+                return;
+
+            spell.ProjectileModifierFrequency = modifierDesc.GetFloat("Frequency", spell.ProjectileModifierFrequency);
+            spell.ProjectileModifierStackRule = modifierDesc.GetString("StackRule", spell.ProjectileModifierStackRule);
+            string modifierEffectPath = modifierDesc.GetString("Effect", null);
+            if (string.IsNullOrWhiteSpace(modifierEffectPath))
+                return;
+
+            spell.ProjectileModifierEffectId = modifierEffectPath;
+            GCNode modifierEffect = ResolveAuthoredNodeReference(modifierEffectPath, modifier ?? skillContext);
+            GCNode damage = FindFirstEffectNode(modifierEffect, "SpellDamageEffect");
+            if (damage == null)
+                return;
+
+            damage = ResolveInheritedNode(damage);
+            spell.ProjectileModifierAttackType = ParseAttackType(damage.GetString("AttackType", null), spell.AttackType);
+            spell.ProjectileModifierDamageType = ParseDamageElement(damage.GetString("DamageType", null), spell.DamageType);
+            spell.ProjectileModifierDamageMod = damage.GetFloat("DamageMod", spell.ProjectileModifierDamageMod);
+            spell.ProjectileModifierDamageVolatility = damage.GetFloat("DamageVolatility", spell.ProjectileModifierDamageVolatility);
+            spell.ProjectileModifierCriticalChance = damage.GetFloat("CriticalChance", spell.ProjectileModifierCriticalChance);
+        }
+
+        private static IEnumerable<GCNode> EnumerateDirectEffectChildren(GCNode node)
+        {
+            if (node == null)
+                yield break;
+
+            foreach (GCNode child in node.AnonymousChildren)
+                yield return child;
+
+            foreach (string childName in node.ChildOrder)
+                if (node.Children.TryGetValue(childName, out GCNode child))
+                    yield return child;
+
+            foreach (var childEntry in node.Children)
+            {
+                if (node.ChildOrder.Contains(childEntry.Key))
+                    continue;
+                yield return childEntry.Value;
+            }
+        }
+
+        private static void ParseNumTargets(SpellData spell, GCNode node)
+        {
+            spell.NumTargetsMin = GetFloatAny(node, "NumTargetsMin", "NumTargets", spell.NumTargetsMin);
+            spell.NumTargetsMax = GetFloatAny(node, "NumTargetsMax", null, spell.NumTargetsMax);
+            spell.NumTargetsInc = GetFloatAny(node, "NumTargetsInc", null, spell.NumTargetsInc);
+        }
+
+        private static SkillCategory ParseSkillCategory(string category, SpellData spell)
+        {
+            string value = CompactKey(category);
+            if (value.Equals("Offensive", StringComparison.OrdinalIgnoreCase)) return spell.IsWeaponSkill ? SkillCategory.WeaponSkill : SkillCategory.Offensive;
+            if (value.Equals("WeaponSkill", StringComparison.OrdinalIgnoreCase)) return SkillCategory.WeaponSkill;
+            if (value.Equals("CrowdControl", StringComparison.OrdinalIgnoreCase)) return SkillCategory.CrowdControl;
+            if (value.Equals("Debuff", StringComparison.OrdinalIgnoreCase) || value.Equals("Curse", StringComparison.OrdinalIgnoreCase) || value.Equals("Curses", StringComparison.OrdinalIgnoreCase)) return SkillCategory.Debuff;
+            if (value.Equals("Heal", StringComparison.OrdinalIgnoreCase) || value.Equals("Healing", StringComparison.OrdinalIgnoreCase)) return SkillCategory.Heal;
+            if (value.Equals("Summon", StringComparison.OrdinalIgnoreCase) || value.Equals("Summoning", StringComparison.OrdinalIgnoreCase)) return SkillCategory.Summon;
+            if (value.Equals("Passive", StringComparison.OrdinalIgnoreCase)) return SkillCategory.Passive;
+            if (spell.IsWeaponSkill) return SkillCategory.WeaponSkill;
+            if (spell.HasAnyDamage) return SkillCategory.Offensive;
+            string name = spell.ShortName ?? "";
+            if (name.IndexOf("Passive", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("Trait", StringComparison.OrdinalIgnoreCase) >= 0)
+                return SkillCategory.Passive;
+            return SkillCategory.Utility;
+        }
+
+        public static bool TryResolvePlayerAnimationTiming(int animationId, PlayerState state, out int frames, out int trigger)
+        {
+            int animationKey = ResolvePlayerAnimationKey(animationId, state);
+            return TryResolvePlayerAnimationTimingKey(animationKey, out frames, out trigger);
+        }
+
+        public static bool TryResolvePlayerAnimationSourceOffset(int animationId, PlayerState state, out Vector3 sourceOffset)
+        {
+            sourceOffset = Vector3.zero;
+            int animationKey = ResolvePlayerAnimationKey(animationId, state);
+            return TryResolvePlayerAnimationSourceOffsetKey(animationKey, out sourceOffset);
+        }
+
+        private static int ResolvePlayerAnimationKey(int animationId, PlayerState state)
+        {
+            if (animationId <= 0)
+                return animationId;
+            int weaponClassId = DamageResolver.ResolveWeaponClassId(state);
+            if (weaponClassId <= 0)
+                return animationId;
+            return animationId + weaponClassId * 100;
+        }
+
+        private static bool TryResolvePlayerAnimationTimingKey(int animationKey, out int frames, out int trigger)
+        {
+            frames = 0;
+            trigger = 0;
+            if (animationKey <= 0)
+                return false;
+
+            var gc = GCDatabase.Instance;
+            if (gc == null || !gc.IsLoaded)
+                return false;
+
+            var matches = new List<(int frames, int trigger)>();
+            var seen = new HashSet<GCNode>();
+            foreach (string path in PLAYER_ANIMATION_LIST_PATHS)
+            {
+                GCNode animations = gc.ResolveWithInheritance(path);
+                if (animations == null)
+                    continue;
+                if (!seen.Add(animations))
+                    continue;
+                AppendAnimationTimingMatches(animations, animationKey, matches);
+            }
+
+            if (matches.Count == 0)
+            {
+                foreach (string path in gc.RegisteredPaths)
+                {
+                    string normalized = NormalizePath(path);
+                    if (!normalized.StartsWith("avatar.races.", StringComparison.OrdinalIgnoreCase) ||
+                        !normalized.EndsWith("Animations", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    GCNode animations = gc.ResolveWithInheritance(path);
+                    if (animations == null)
+                        continue;
+                    if (!seen.Add(animations))
+                        continue;
+                    AppendAnimationTimingMatches(animations, animationKey, matches);
+                }
+            }
+
+            if (matches.Count == 0)
+                return false;
+
+            var first = matches[0];
+            if (matches.Any(m => m.frames != first.frames || m.trigger != first.trigger))
+                return false;
+
+            frames = first.frames;
+            trigger = first.trigger;
+            return true;
+        }
+
+        private static bool TryResolvePlayerAnimationSourceOffsetKey(int animationKey, out Vector3 sourceOffset)
+        {
+            sourceOffset = Vector3.zero;
+            if (animationKey <= 0)
+                return false;
+
+            var gc = GCDatabase.Instance;
+            if (gc == null || !gc.IsLoaded)
+                return false;
+
+            var matches = new List<Vector3>();
+            var seen = new HashSet<GCNode>();
+            foreach (string path in PLAYER_ANIMATION_LIST_PATHS)
+            {
+                GCNode animations = gc.ResolveWithInheritance(path);
+                if (animations == null)
+                    continue;
+                if (!seen.Add(animations))
+                    continue;
+                AppendAnimationSourceOffsetMatches(animations, animationKey, matches);
+            }
+
+            if (matches.Count == 0)
+            {
+                foreach (string path in gc.RegisteredPaths)
+                {
+                    string normalized = NormalizePath(path);
+                    if (!normalized.StartsWith("avatar.races.", StringComparison.OrdinalIgnoreCase) ||
+                        !normalized.EndsWith("Animations", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    GCNode animations = gc.ResolveWithInheritance(path);
+                    if (animations == null)
+                        continue;
+                    if (!seen.Add(animations))
+                        continue;
+                    AppendAnimationSourceOffsetMatches(animations, animationKey, matches);
+                }
+            }
+
+            if (matches.Count == 0)
+                return false;
+
+            Vector3 first = matches[0];
+            if (matches.Any(m => Math.Abs(m.x - first.x) > 0.001f || Math.Abs(m.y - first.y) > 0.001f || Math.Abs(m.z - first.z) > 0.001f))
+                return false;
+
+            sourceOffset = first;
+            return true;
+        }
+
+        private static void AppendAnimationTimingMatches(GCNode animations, int animationKey, List<(int frames, int trigger)> matches)
+        {
+            foreach (GCNode row in EnumerateAnimationRows(animations))
+            {
+                if (!row.HasProperty("ID"))
+                    continue;
+                int rowId = row.GetInt("ID", -1);
+                if (rowId < 0)
+                    continue;
+                if (!MatchesAnimationKey(rowId, animationKey))
+                    continue;
+                int rowFrames = row.GetInt("NumFrames", 0);
+                int rowTrigger = row.GetInt("TriggerTime", 0);
+                if (rowFrames > 0 && rowTrigger > 0)
+                    matches.Add((rowFrames, rowTrigger));
+            }
+        }
+
+        private static void AppendAnimationSourceOffsetMatches(GCNode animations, int animationKey, List<Vector3> matches)
+        {
+            foreach (GCNode row in EnumerateAnimationRows(animations))
+            {
+                if (!row.HasProperty("ID"))
+                    continue;
+                int rowId = row.GetInt("ID", -1);
+                if (rowId < 0)
+                    continue;
+                if (!MatchesAnimationKey(rowId, animationKey))
+                    continue;
+                if (TryParseSourceOffset(row, out Vector3 sourceOffset))
+                    matches.Add(sourceOffset);
+            }
+        }
+
+        private static bool TryParseSourceOffset(GCNode animation, out Vector3 sourceOffset)
+        {
+            sourceOffset = Vector3.zero;
+            string raw = animation?.GetString("SourceOffset", null);
+            if (string.IsNullOrWhiteSpace(raw))
+                return false;
+
+            int marker = raw.IndexOf("//", StringComparison.Ordinal);
+            if (marker >= 0)
+                raw = raw.Substring(0, marker);
+
+            string[] parts = raw.Split(',');
+            if (parts.Length < 3)
+                return false;
+
+            if (!float.TryParse(parts[0].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float x))
+                return false;
+            if (!float.TryParse(parts[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float y))
+                return false;
+            if (!float.TryParse(parts[2].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float z))
+                return false;
+
+            sourceOffset = new Vector3(x, y, z);
+            return true;
+        }
+
+        private static bool MatchesAnimationKey(int rowId, int animationKey)
+        {
+            if (rowId < 0 || animationKey <= 0)
+                return false;
+            return rowId == animationKey;
+        }
+
+        private static IEnumerable<GCNode> EnumerateAnimationRows(GCNode animations)
+        {
+            foreach (GCNode row in animations.AnonymousChildren)
+                yield return ResolveInheritedNode(row);
+            foreach (GCNode row in animations.Children.Values)
+                yield return ResolveInheritedNode(row);
+        }
+
+        private static GCNode ResolveAuthoredNodeReference(string path, GCNode contextRoot)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return null;
+
+            string normalized = NormalizePath(path);
+            var gc = GCDatabase.Instance;
+            GCNode node = gc?.ResolveWithInheritance(normalized);
+            if (node != null)
+                return node;
+
+            if (contextRoot == null)
+                return null;
+
+            string rootName = contextRoot.Name;
+            if (!string.IsNullOrWhiteSpace(rootName) &&
+                normalized.StartsWith(rootName + ".", StringComparison.OrdinalIgnoreCase))
+            {
+                string subPath = normalized.Substring(rootName.Length + 1);
+                return ResolveChildPath(contextRoot, subPath);
+            }
+
+            int dot = normalized.IndexOf('.');
+            while (dot >= 0 && dot + 1 < normalized.Length)
+            {
+                string suffix = normalized.Substring(dot + 1);
+                GCNode child = ResolveChildPath(contextRoot, suffix);
+                if (child != null)
+                    return child;
+                dot = normalized.IndexOf('.', dot + 1);
+            }
+
+            return null;
+        }
+
+        private static GCNode ResolveChildPath(GCNode root, string dottedPath)
+        {
+            if (root == null || string.IsNullOrWhiteSpace(dottedPath))
+                return root;
+
+            GCNode current = root;
+            foreach (string part in dottedPath.Split('.'))
+            {
+                if (current == null || string.IsNullOrWhiteSpace(part))
+                    return null;
+                current = current.GetChild(part);
+            }
+            return current;
+        }
+
+        private static GCNode FindFirstEffectNode(GCNode root, string clientExtends)
+        {
+            foreach (GCNode node in EnumerateEffectTree(root, 0, new HashSet<GCNode>()))
+                if (AuthoredExtends(node, clientExtends))
+                    return node;
+            return null;
+        }
+
+        private static IEnumerable<GCNode> EnumerateEffectTree(GCNode node, int depth, HashSet<GCNode> seen)
+        {
+            if (node == null || depth > 48)
+                yield break;
+            if (!seen.Add(node))
+                yield break;
+
+            GCNode resolved = ResolveInheritedNode(node);
+            yield return resolved;
+
+            foreach (GCNode child in resolved.AnonymousChildren)
+                foreach (GCNode inner in EnumerateEffectTree(child, depth + 1, seen))
+                    yield return inner;
+
+            foreach (string childName in resolved.ChildOrder)
+                if (resolved.Children.TryGetValue(childName, out GCNode child))
+                    foreach (GCNode inner in EnumerateEffectTree(child, depth + 1, seen))
+                        yield return inner;
+
+            foreach (var childEntry in resolved.Children)
+            {
+                if (resolved.ChildOrder.Contains(childEntry.Key))
+                    continue;
+                foreach (GCNode inner in EnumerateEffectTree(childEntry.Value, depth + 1, seen))
+                    yield return inner;
+            }
+        }
+
+        private static bool AuthoredExtends(GCNode node, string clientExtends)
+        {
+            return AuthoredExtends(node, clientExtends, 0);
+        }
+
+        private static bool AuthoredExtends(GCNode node, string clientExtends, int depth)
+        {
+            if (node == null || string.IsNullOrWhiteSpace(clientExtends) || depth > 32)
+                return false;
+            string ext = NormalizePath(node.Extends ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(ext))
+                return false;
+            if (string.Equals(ext, clientExtends, StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (ext.EndsWith("." + clientExtends, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            GCNode parent = GCDatabase.Instance?.ResolveWithInheritance(ext);
+            return parent != null && AuthoredExtends(parent, clientExtends, depth + 1);
+        }
+
+        private static GCNode ResolveInheritedNode(GCNode node)
+        {
+            if (node == null || string.IsNullOrWhiteSpace(node.Extends))
+                return node;
+
+            GCNode parent = GCDatabase.Instance?.ResolveWithInheritance(NormalizePath(node.Extends));
+            if (parent == null)
+                return node;
+
+            return MergeNodes(parent, node);
+        }
+
+        private static GCNode MergeNodes(GCNode parent, GCNode child)
+        {
+            var merged = new GCNode
+            {
+                Name = child.Name,
+                Extends = child.Extends ?? parent.Extends,
+                IsStatic = child.IsStatic || parent.IsStatic,
+                IsAnonymous = child.IsAnonymous || parent.IsAnonymous,
+                SourceFile = child.SourceFile
+            };
+
+            foreach (var propertyEntry in parent.Properties)
+                merged.Properties[propertyEntry.Key] = propertyEntry.Value;
+            foreach (var propertyEntry in child.Properties)
+                merged.Properties[propertyEntry.Key] = propertyEntry.Value;
+
+            foreach (var childEntry in parent.Children)
+                merged.Children[childEntry.Key] = childEntry.Value;
+            foreach (string childName in parent.ChildOrder)
+                if (!merged.ChildOrder.Contains(childName))
+                    merged.ChildOrder.Add(childName);
+
+            foreach (var childEntry in child.Children)
+            {
+                if (merged.Children.ContainsKey(childEntry.Key))
+                    merged.Children[childEntry.Key] = MergeNodes(merged.Children[childEntry.Key], childEntry.Value);
+                else
+                    merged.Children[childEntry.Key] = childEntry.Value;
+                if (!merged.ChildOrder.Contains(childEntry.Key))
+                    merged.ChildOrder.Add(childEntry.Key);
+            }
+
+            merged.AnonymousChildren.AddRange(parent.AnonymousChildren);
+            merged.AnonymousChildren.AddRange(child.AnonymousChildren);
+            return merged;
+        }
+
+        private static AttackType ParseAttackType(string value, AttackType fallback)
+        {
+            string key = CompactKey(value);
+            if (key.Equals("Melee", StringComparison.OrdinalIgnoreCase)) return AttackType.MELEE;
+            if (key.Equals("Magic", StringComparison.OrdinalIgnoreCase)) return AttackType.MAGIC;
+            if (key.Equals("Ranged", StringComparison.OrdinalIgnoreCase) || key.Equals("Range", StringComparison.OrdinalIgnoreCase)) return AttackType.RANGED;
+            return fallback;
+        }
+
+        private static DamageElement ParseDamageElement(string value, DamageElement fallback)
+        {
+            string key = CompactKey(value);
+            if (key.Equals("Divine", StringComparison.OrdinalIgnoreCase)) return DamageElement.DIVINE;
+            if (key.Equals("Fire", StringComparison.OrdinalIgnoreCase)) return DamageElement.FIRE;
+            if (key.Equals("Ice", StringComparison.OrdinalIgnoreCase) || key.Equals("Cold", StringComparison.OrdinalIgnoreCase)) return DamageElement.ICE;
+            if (key.Equals("Poison", StringComparison.OrdinalIgnoreCase)) return DamageElement.POISON;
+            if (key.Equals("Shadow", StringComparison.OrdinalIgnoreCase)) return DamageElement.SHADOW;
+            if (key.Equals("Physical", StringComparison.OrdinalIgnoreCase) ||
+                key.Equals("Crushing", StringComparison.OrdinalIgnoreCase) ||
+                key.Equals("Piercing", StringComparison.OrdinalIgnoreCase) ||
+                key.Equals("Slashing", StringComparison.OrdinalIgnoreCase))
+                return DamageElement.PHYSICAL;
+            return fallback;
+        }
+
+        private static int ResolveSpellEffectChanceWire(GCNode node)
+        {
+            if (node == null)
+                return 0x6400;
+            float chance = node.GetFloat("Chance", 100f);
+            if (float.IsNaN(chance) || float.IsInfinity(chance))
+                chance = 100f;
+            return Mathf.Clamp(Mathf.RoundToInt(chance * 256f), 0, 0x6400);
+        }
+
+        private static float GetFloatAny(GCNode node, string primary, string secondary, float fallback)
+        {
+            if (node == null)
+                return fallback;
+            if (!string.IsNullOrWhiteSpace(primary) && node.HasProperty(primary))
+                return node.GetFloat(primary, fallback);
+            if (!string.IsNullOrWhiteSpace(secondary) && node.HasProperty(secondary))
+                return node.GetFloat(secondary, fallback);
+            return fallback;
+        }
+
+        private static string ResolveSkillId(string path, GCNode skill)
+        {
+            string normalized = NormalizePath(path);
+            if (normalized.StartsWith("skills.generic.", StringComparison.OrdinalIgnoreCase))
+                return normalized;
+            string name = skill?.Name;
+            if (!string.IsNullOrWhiteSpace(name))
+                return "skills.generic." + name;
+            return normalized;
+        }
+
+        private static string NormalizeSkillCandidate(string nameOrPath)
+        {
+            string normalized = NormalizePath(nameOrPath);
+            if (string.IsNullOrWhiteSpace(normalized))
+                return normalized;
+            if (normalized.IndexOf('.') < 0)
+                return "skills.generic." + normalized;
+            return normalized;
+        }
+
+        private static string NormalizePath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return "";
+            string normalized = path.Trim().Trim('"').Replace('\\', '.').Replace('/', '.');
+            if (normalized.EndsWith(".gc", StringComparison.OrdinalIgnoreCase))
+                normalized = normalized.Substring(0, normalized.Length - 3);
+            while (normalized.Contains("..", StringComparison.Ordinal))
+                normalized = normalized.Replace("..", ".");
+            return normalized.Trim('.');
+        }
+
+        private static string LastSegment(string path)
+        {
+            string normalized = NormalizePath(path);
+            int dot = normalized.LastIndexOf('.');
+            return dot >= 0 && dot + 1 < normalized.Length ? normalized.Substring(dot + 1) : normalized;
+        }
+
+        private static string CompactKey(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+            char[] buffer = new char[value.Length];
+            int count = 0;
+            foreach (char ch in value)
+                if (char.IsLetterOrDigit(ch))
+                    buffer[count++] = ch;
+            return new string(buffer, 0, count);
+        }
+
+        private static void Register(string shortName, SpellData data)
+        {
+            if (data == null)
+                return;
+            if (string.IsNullOrWhiteSpace(data.ShortName))
+                data.ShortName = shortName;
+            RegisterKey(data.ShortName, data);
+            RegisterKey(data.SkillId, data);
+            RegisterKey(NormalizePath(data.SkillId), data);
+            RegisterKey((data.SkillId ?? "").Replace('.', '/'), data);
+            RegisterKey(CompactKey(data.DisplayName), data);
+        }
+
+        private static void RegisterKey(string key, SpellData data)
+        {
+            if (string.IsNullOrWhiteSpace(key) || data == null)
+                return;
+            _spells[key] = data;
+        }
+
+        private static void LogLoadSummary()
+        {
+            int offensive = 0, weapon = 0, utility = 0, passive = 0, summon = 0;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (SpellData spell in GetAllSpells())
+            {
+                if (!seen.Add(spell.SkillId ?? spell.ShortName)) continue;
+                switch (spell.SkillCategory)
                 {
                     case SkillCategory.Offensive: offensive++; break;
                     case SkillCategory.WeaponSkill: weapon++; break;
@@ -986,42 +865,48 @@ namespace DungeonRunners.Combat
                     default: utility++; break;
                 }
             }
-            Debug.LogError($"[SpellDB] Initialized: {seen.Count} skills total -- {offensive} offensive, {weapon} weapon, {utility} utility/heal/cc/debuff, {summon} summon, {passive} passive");
+            Debug.LogError($"[SPELLDB] source=gc loaded={seen.Count} offensive={offensive} weapon={weapon} utility={utility} summon={summon} passive={passive}");
         }
 
-        private static void Register(string shortName, SpellData data)
-        {
-            data.ShortName = shortName;
-            _spells[shortName] = data;
-            if (!string.IsNullOrEmpty(data.SkillId))
-                _spells[data.SkillId] = data;
-        }
-
-        /// <summary>Lookup spell by short name or full GC id.</summary>
         public static SpellData GetSpell(string name)
         {
-            if (!_initialized) Initialize();
-            if (string.IsNullOrEmpty(name)) return null;
-            _spells.TryGetValue(name, out var data);
-            return data;
+            EnsureAuthoredLoaded();
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            if (_spells.TryGetValue(name, out SpellData data))
+                return data;
+
+            string normalized = NormalizePath(name);
+            if (_spells.TryGetValue(normalized, out data))
+                return data;
+
+            string compact = CompactKey(name);
+            if (_spells.TryGetValue(compact, out data))
+                return data;
+
+            if (TryBuildAuthoredSpell(name, out data))
+            {
+                Register(data.ShortName, data);
+                return data;
+            }
+
+            return null;
         }
 
-        /// <summary>Get all registered spells (unique).</summary>
         public static IEnumerable<SpellData> GetAllSpells()
         {
-            if (!_initialized) Initialize();
-            var seen = new HashSet<string>();
-            foreach (var kvp in _spells)
+            EnsureAuthoredLoaded();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var spellEntry in _spells)
             {
-                if (seen.Add(kvp.Value.ShortName))
-                    yield return kvp.Value;
+                string key = spellEntry.Value.SkillId ?? spellEntry.Value.ShortName;
+                if (seen.Add(key))
+                    yield return spellEntry.Value;
             }
         }
 
-        /// <summary>Get all offensive spells that deal damage.</summary>
         public static IEnumerable<SpellData> GetOffensiveSpells()
         {
-            foreach (var spell in GetAllSpells())
+            foreach (SpellData spell in GetAllSpells())
             {
                 if ((spell.SkillCategory == SkillCategory.Offensive ||
                      spell.SkillCategory == SkillCategory.WeaponSkill) && spell.HasAnyDamage)
@@ -1029,36 +914,14 @@ namespace DungeonRunners.Combat
             }
         }
 
-        /// <summary>Check if a skill deals damage.</summary>
         public static bool IsDamageSkill(string name)
         {
-            var spell = GetSpell(name);
+            SpellData spell = GetSpell(name);
             if (spell == null) return false;
             return (spell.SkillCategory == SkillCategory.Offensive ||
                     spell.SkillCategory == SkillCategory.WeaponSkill) && spell.HasAnyDamage;
         }
 
-        /// <summary>Get first offensive spell for a class.</summary>
-        public static SpellData GetSpellForClass(string className)
-        {
-            if (!_initialized) Initialize();
-            string prof = className?.ToUpper() switch
-            {
-                "FIGHTER" => "FIGHTER",
-                "MAGE" => "MAGE",
-                "WARLOCK" => "MAGE",
-                "RANGER" => "RANGER",
-                _ => "MAGE"
-            };
-            foreach (var kvp in _spells)
-            {
-                if (kvp.Value.ProfessionType == prof &&
-                    kvp.Value.SkillCategory == SkillCategory.Offensive &&
-                    kvp.Value.HasAnyDamage)
-                    return kvp.Value;
-            }
-            return null;
-        }
     }
 
     public class SpellData
@@ -1078,18 +941,29 @@ namespace DungeonRunners.Combat
         public float ProjectileSize;
         public float ProjectileLifespan;
         public int RepeatCount = 1;
+        public int AnimationId;
         public int AnimationLengthFrames = 30;
+        public int AnimationTriggerFrames;
         public float ManaCostMod;
+        public float GoldValueMod;
         public int MaxSkillLevel;
         public int RequiredLevel;
+        public int RequiredLevelInc;
         public string ProfessionType;
+        public string TargetType;
         public SkillCategory SkillCategory;
         public bool IsAoE;
+        public bool HasAoEEffect;
         public bool IsChainSpell;
         public int NumChains;
         public int ChainRange;
         public bool IsWeaponSkill;
-        public bool HasKnockdown;
+        public bool HasSpellDamageEffect;
+        public bool HasSpellKnockDownEffect;
+        public int SpellKnockDownStrengthMin;
+        public int SpellKnockDownStrengthMax;
+        public int SpellKnockDownStrengthInc;
+        public int SpellKnockDownChanceF32 = 0x6400;
         public bool HasFear;
         public bool HasSlow;
         public bool AdjustCooldownByWeapon;
@@ -1111,24 +985,18 @@ namespace DungeonRunners.Combat
         public int WeaponEffectDamageModMin;
         public int WeaponEffectDamageModMax;
         public int WeaponEffectDamageModInc;
-
-        // ── Weapon skill level scaling (from GC SpellWeaponDamageEffect) ──
-        // skillMod = (100 + DamageModMin + skillLevel * DamageModInc) / 100
-        // capped so that (DamageModMin + skillLevel * DamageModInc) <= DamageModMax
-        // DamageModMax=0 means uncapped
-        public int SkillDamageModMin;   // e.g. -60 for Butcher
-        public int SkillDamageModMax;   // e.g. 300 for Butcher (0 = uncapped)
-        public int SkillDamageModInc;   // e.g. 5 for Butcher
-
-        // ── AoE target caps (from GC NumTargets fields) ──
-        // maxTargets = (int)(NumTargetsMin + skillLevel * NumTargetsInc), capped at NumTargetsMax
-        // 0 = unlimited
+        public int SkillDamageModMin;
+        public int SkillDamageModMax;
+        public int SkillDamageModInc;
         public float NumTargetsMin;
         public float NumTargetsMax;
         public float NumTargetsInc;
-        public float AoERadius;         // Override from GC RadiusMin (0 = use Range)
+        public float AoERadius;
+        public float AoERadiusMin;
+        public float AoERadiusMax;
+        public float AoERadiusInc;
 
-        public bool HasDirectDamageEffect => DamageMod > 0f || IsWeaponSkill;
+        public bool HasDirectDamageEffect => HasSpellDamageEffect;
 
         public bool HasDeferredProjectileModifierDamage =>
             !string.IsNullOrEmpty(ProjectileModifierEffectId) &&
@@ -1136,22 +1004,54 @@ namespace DungeonRunners.Combat
             ProjectileModifierFrequency > 0f;
 
         public bool HasProjectileModifierDamage => HasDeferredProjectileModifierDamage;
-        public bool HasAnyDamage => HasDirectDamageEffect || HasDeferredProjectileModifierDamage;
+        public bool HasAnyDamage => HasDirectDamageEffect || HasImmediateWeaponDamageEffect || HasDeferredProjectileModifierDamage;
         public AttackType EffectiveProjectileModifierAttackType => ProjectileModifierAttackType ?? AttackType;
         public DamageElement EffectiveProjectileModifierDamageType => ProjectileModifierDamageType ?? DamageType;
+
+        public float ResolveAoERadius(int skillLevel)
+        {
+            float min = AoERadiusMin > 0f ? AoERadiusMin : AoERadius;
+            if (min <= 0f)
+                return 0f;
+            float value = min + Math.Max(1, skillLevel) * AoERadiusInc;
+            float max = AoERadiusMax > 0f ? AoERadiusMax : 0f;
+            if (max > 0f && value > max)
+                value = max;
+            return value;
+        }
+
+        public int ResolveNumTargets(int skillLevel)
+        {
+            if (NumTargetsMin <= 0f && NumTargetsMax <= 0f)
+                return int.MaxValue;
+            float value = NumTargetsMin + Math.Max(1, skillLevel) * NumTargetsInc;
+            if (NumTargetsMax > 0f && value > NumTargetsMax)
+                value = NumTargetsMax;
+            int result = (int)value;
+            return result < 1 ? 1 : result;
+        }
+
+        public int ResolveSpellKnockDownStrength(int skillLevel)
+        {
+            int level = Math.Max(0, skillLevel);
+            int value = SpellKnockDownStrengthMin + SpellKnockDownStrengthInc * level;
+            if (SpellKnockDownStrengthMax > 0 && value > SpellKnockDownStrengthMax)
+                value = SpellKnockDownStrengthMax;
+            return value;
+        }
     }
 
     public enum AttackType { MELEE, MAGIC, RANGED }
     public enum DamageElement { PHYSICAL, DIVINE, FIRE, ICE, POISON, SHADOW }
     public enum SkillCategory
     {
-        Offensive,      // Direct damage spells (FireBolt, ShadowLightning, etc.)
-        WeaponSkill,    // Melee weapon abilities (Butcher, Cleave) -- use melee damage formula
-        CrowdControl,   // CC skills (FearShot) -- no direct damage
-        Debuff,         // Debuffs (Blight) -- apply modifiers
-        Heal,           // Healing (HealSelf)
-        Utility,        // Movement/portal/shield (Sprint, Teleport, TownPortal, ManaShield, ManaSelf)
-        Summon,         // Summon companion (SummonWolf, SummonSnowman, etc.)
-        Passive         // Always-on passives and traits
+        Offensive,
+        WeaponSkill,
+        CrowdControl,
+        Debuff,
+        Heal,
+        Utility,
+        Summon,
+        Passive
     }
 }

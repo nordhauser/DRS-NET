@@ -1,53 +1,44 @@
 using System;
 using System.Collections.Generic;
 using DungeonRunners.Core;
-using DungeonRunners.Managers;
+using DungeonRunners.Gameplay;
 using DungeonRunners.Engine;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Builds a per-instance <see cref="PathMap"/> from a list of <see cref="MazeGenerator.MazeCell"/>s
-    /// by composing the placed tiles' collision geometry. Phase 3 of Option 1-full.
-    ///
-    /// Pipeline per cell:
-    /// <list type="number">
-    ///   <item>Resolve the cell's <c>TileType</c> to a <c>.tile</c> file via <see cref="TileCobjResolver.ResolveTilePath"/>.</item>
-    ///   <item>Parse the <c>.tile</c> into placements (each = subasset path + Position + Heading) via <see cref="TileLayoutLoader.Load"/>.</item>
-    ///   <item>For each placement that resolves to a <c>.cobj</c>, parse the cobj heightmap, transform each blocked cell into world space (apply placement Position + Heading + cell.WorldOrigin), and mark the corresponding PathMap nodes blocked.</item>
-    /// </list>
-    /// The remaining nodes in the maze bounding box are filled as walkable.
-    ///
-    /// v1: only uses sub-shape 1 (heightmap) of <see cref="CobjData"/>; cells whose height exceeds
-    /// <see cref="WallHeightThreshold"/> raw units are treated as blocking. Sub-shape 2 (multi-floor
-    /// bbox stacks) is ignored — would only matter for bridges/archways. Heading uses Fixed32Math
-    /// SIN/COS LUT for client parity.
-    /// </summary>
     public static class PathMapBuilder
     {
-        /// <summary>World-units per PathMap node (matches <see cref="PathMap"/> internal TILE_SIZE).</summary>
         public const float NodeResolution = 10f;
 
-        /// <summary>Maze cell side length in world units (matches <see cref="MazeGenerator.TILE_SIZE"/>).</summary>
         public const float MazeTileSize = 400f;
 
-        /// <summary>Cobj heightmap entries above this value are treated as blocking (walls).</summary>
         public const int WallHeightThreshold = 30;
+
+        public const float HeightConnectThreshold = 0xa00;
+
+        private static readonly (int a0, int b0, int a1, int b1)[] DiagonalCornerEdges =
+        {
+            default, (2, 4, 0, 6), default, (4, 6, 2, 0),
+            default, (6, 0, 4, 2), default, (0, 2, 6, 4),
+        };
 
         public static PathMap Build(string zoneName, IReadOnlyList<MazeGenerator.MazeCell> cells)
         {
             if (cells == null || cells.Count == 0)
             {
-                Debug.LogError($"[PATHMAP-BUILD] zone='{zoneName}' SKIP — empty cell list");
+                Debug.LogError($"[PATHMAP-BUILD] zone='{zoneName}' skip=emptyCellList");
                 return null;
             }
 
             ComputeWorldBounds(cells, out float minX, out float maxX, out float minY, out float maxY);
             var pathMap = PathMap.CreateEmpty(zoneName, minX, maxX, minY, maxY);
 
+            float baseGroundHeight = ResolveBaseGroundHeight(zoneName);
+
             int gridW = (int)Math.Ceiling((maxX - minX) / NodeResolution) + 1;
             int gridH = (int)Math.Ceiling((maxY - minY) / NodeResolution) + 1;
             var blocked = new bool[gridW, gridH];
+            var heightGrid = new float[gridW, gridH];
             var inMazeFootprint = new bool[gridW, gridH];
 
             int tilesProcessed = 0;
@@ -73,7 +64,7 @@ namespace DungeonRunners.Utilities
                 try { layout = TileLayoutLoader.Load(tilePath); }
                 catch (Exception e)
                 {
-                    Debug.LogError($"[PATHMAP-BUILD] tile parse error: {cell.TileType} — {e.Message}");
+                    Debug.LogError($"[PATHMAP-BUILD] tileParse state=failed tile={cell.TileType} message='{e.Message}'");
                     continue;
                 }
 
@@ -94,13 +85,41 @@ namespace DungeonRunners.Utilities
                     placementsProcessed++;
                     int blockedHere = ApplyCobjToBlockedGrid(
                         cobj, placement, cell,
-                        blocked, gridW, gridH, minX, minY);
+                        blocked, heightGrid, gridW, gridH, minX, minY);
                     blockedCellsTotal += blockedHere;
                 }
             }
 
+            bool Walk(int gx, int gy)
+            {
+                return gx >= 0 && gx < gridW && gy >= 0 && gy < gridH
+                    && inMazeFootprint[gx, gy] && !blocked[gx, gy];
+            }
+
             int walkable = 0;
             int blockedCount = 0;
+
+            bool HeightConnected(int ax, int ay, int bx, int by)
+                => Mathf.Abs(heightGrid[ax, ay] - heightGrid[bx, by]) <= HeightConnectThreshold;
+
+            var cardinalFlags = new byte[gridW, gridH];
+            for (int gx = 0; gx < gridW; gx++)
+            {
+                for (int gy = 0; gy < gridH; gy++)
+                {
+                    if (!inMazeFootprint[gx, gy] || blocked[gx, gy]) continue;
+                    byte cardinal = 0;
+                    for (int directionIndex = 0; directionIndex < 8; directionIndex += 2)
+                    {
+                        var (directionX, directionY) = PathMap.Directions[directionIndex];
+                        int nx = gx + directionX, ny = gy + directionY;
+                        if (Walk(nx, ny) && HeightConnected(gx, gy, nx, ny))
+                            cardinal |= (byte)(1 << directionIndex);
+                    }
+                    cardinalFlags[gx, gy] = cardinal;
+                }
+            }
+
             for (int gx = 0; gx < gridW; gx++)
             {
                 for (int gy = 0; gy < gridH; gy++)
@@ -108,17 +127,32 @@ namespace DungeonRunners.Utilities
                     if (!inMazeFootprint[gx, gy]) continue;
 
                     bool isBlocked = blocked[gx, gy];
+                    byte flags = isBlocked ? (byte)0 : cardinalFlags[gx, gy];
+                    if (!isBlocked)
+                    {
+                        for (int directionIndex = 1; directionIndex < 8; directionIndex += 2)
+                        {
+                            var (directionX, directionY) = PathMap.Directions[directionIndex];
+                            int nx = gx + directionX, ny = gy + directionY;
+                            if (!Walk(nx, ny) || !HeightConnected(gx, gy, nx, ny)) continue;
+                            var corner = DiagonalCornerEdges[directionIndex];
+                            bool path0 = (cardinalFlags[gx, gy] & (1 << corner.a0)) != 0
+                                && (cardinalFlags[nx, ny] & (1 << corner.b0)) != 0;
+                            bool path1 = (cardinalFlags[gx, gy] & (1 << corner.a1)) != 0
+                                && (cardinalFlags[nx, ny] & (1 << corner.b1)) != 0;
+                            if (path0 || path1)
+                                flags |= (byte)(1 << directionIndex);
+                        }
+                    }
+
                     var node = new PathNode
                     {
                         GridX = gx,
                         GridY = gy,
                         WorldX = minX + gx * NodeResolution,
                         WorldY = minY + gy * NodeResolution,
-                        Height = 0f,
-                        // Allow all 8 directions for walkable nodes. The client's PathMap
-                        // bakes connection flags from level data; v1 lets the A* expander
-                        // rely on per-neighbor walkability instead.
-                        ConnectionFlags = isBlocked ? (byte)0x00 : (byte)0xFF,
+                        Height = heightGrid[gx, gy] != 0f ? heightGrid[gx, gy] : baseGroundHeight,
+                        ConnectionFlags = flags,
                         SolidFlag = isBlocked ? (byte)0xFE : (byte)0x00,
                     };
                     pathMap.SetNode(node);
@@ -130,12 +164,35 @@ namespace DungeonRunners.Utilities
                 $"[PATHMAP-BUILD] zone='{zoneName}' cells={cells.Count} tiles={tilesProcessed}/{cells.Count} ({tilesSkippedNoFile} no-file) " +
                 $"placements={placementsProcessed} ({placementsSkippedNoCobj} no-cobj) " +
                 $"nodes={pathMap.NodeCount} (walkable={walkable} blocked={blockedCount}) " +
-                $"bounds=({minX:F0},{minY:F0})→({maxX:F0},{maxY:F0}) blockedCobjCells={blockedCellsTotal}");
+                $"bounds=({minX:F0},{minY:F0})->({maxX:F0},{maxY:F0}) blockedCobjCells={blockedCellsTotal}");
 
             if (missingTileTypes != null && missingTileTypes.Count > 0)
                 Debug.LogError($"[PATHMAP-BUILD] missing tile files for zone='{zoneName}': {string.Join(", ", missingTileTypes)}");
 
             return pathMap;
+        }
+
+        private static float ResolveBaseGroundHeight(string zoneName)
+        {
+            string baseZone = zoneName;
+            int instIdx = baseZone.IndexOf("_inst", StringComparison.OrdinalIgnoreCase);
+            if (instIdx > 0) baseZone = baseZone.Substring(0, instIdx);
+            try
+            {
+                using (var connection = DungeonRunners.Database.GameDatabase.GetConnection())
+                using (var reader = DungeonRunners.Database.GameDatabase.ExecuteReader(connection,
+                    "SELECT h, COUNT(*) c FROM pathmap_nodes WHERE zone_name = @z AND s < 254 GROUP BY h ORDER BY c DESC LIMIT 1",
+                    ("@z", baseZone)))
+                {
+                    if (reader.Read() && !reader.IsDBNull(0))
+                        return (float)reader.GetDouble(0);
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[PATHMAP-BUILD] baseGroundHeight state=failed zone='{baseZone}' message='{e.Message}'");
+            }
+            return 0f;
         }
 
         private static void ComputeWorldBounds(
@@ -144,14 +201,14 @@ namespace DungeonRunners.Utilities
         {
             minX = float.PositiveInfinity; minY = float.PositiveInfinity;
             maxX = float.NegativeInfinity; maxY = float.NegativeInfinity;
-            foreach (var c in cells)
+            foreach (var cell in cells)
             {
-                if (c.WorldOriginX < minX) minX = c.WorldOriginX;
-                if (c.WorldOriginY < minY) minY = c.WorldOriginY;
-                float xR = c.WorldOriginX + MazeTileSize;
-                float yT = c.WorldOriginY + MazeTileSize;
-                if (xR > maxX) maxX = xR;
-                if (yT > maxY) maxY = yT;
+                if (cell.WorldOriginX < minX) minX = cell.WorldOriginX;
+                if (cell.WorldOriginY < minY) minY = cell.WorldOriginY;
+                float maxCellX = cell.WorldOriginX + MazeTileSize;
+                float maxCellY = cell.WorldOriginY + MazeTileSize;
+                if (maxCellX > maxX) maxX = maxCellX;
+                if (maxCellY > maxY) maxY = maxCellY;
             }
         }
 
@@ -174,40 +231,84 @@ namespace DungeonRunners.Utilities
 
         private static int ApplyCobjToBlockedGrid(
             CobjData cobj, TilePlacement placement, MazeGenerator.MazeCell cell,
-            bool[,] blocked, int gridW, int gridH, float minX, float minY)
+            bool[,] blocked, float[,] heightGrid, int gridW, int gridH, float minX, float minY)
         {
-            if (cobj.Width1 <= 0 || cobj.Height1 <= 0) return 0;
-
-            int cs = cobj.CellSize1;
-
-            float cosT = Mathf.Cos(placement.Heading * Mathf.Deg2Rad);
-            float sinT = Mathf.Sin(placement.Heading * Mathf.Deg2Rad);
+            int degT = Mathf.RoundToInt(placement.Heading);
+            float cosT = DungeonRunners.Combat.UnitMover.ZRotateCos(degT);
+            float sinT = DungeonRunners.Combat.UnitMover.ZRotateSin(degT);
 
             int blockedHere = 0;
-            for (int cy = 0; cy < cobj.Height1; cy++)
+            if (cobj.Width1 > 0 && cobj.Height1 > 0)
             {
-                for (int cx = 0; cx < cobj.Width1; cx++)
+                int cs = cobj.CellSize1;
+                for (int cy = 0; cy < cobj.Height1; cy++)
                 {
-                    ushort h = cobj.Heightmap[cy * cobj.Width1 + cx];
-                    if (h <= WallHeightThreshold) continue;
-
-                    float lx = cobj.OriginX1 + (cx + 0.5f) * cs;
-                    float ly = cobj.OriginY1 + (cy + 0.5f) * cs;
-
-                    float rx = lx * cosT - ly * sinT;
-                    float ry = lx * sinT + ly * cosT;
-
-                    float wx = cell.WorldOriginX + placement.X + rx;
-                    float wy = cell.WorldOriginY + placement.Y + ry;
-
-                    int gxNode = (int)Math.Round((wx - minX) / NodeResolution);
-                    int gyNode = (int)Math.Round((wy - minY) / NodeResolution);
-                    if (gxNode < 0 || gxNode >= gridW || gyNode < 0 || gyNode >= gridH) continue;
-
-                    if (!blocked[gxNode, gyNode])
+                    for (int cx = 0; cx < cobj.Width1; cx++)
                     {
-                        blocked[gxNode, gyNode] = true;
-                        blockedHere++;
+                        ushort h = cobj.Heightmap[cy * cobj.Width1 + cx];
+
+                        float lx = cobj.OriginX1 + (cx + 0.5f) * cs;
+                        float ly = cobj.OriginY1 + (cy + 0.5f) * cs;
+
+                        float rx = lx * cosT - ly * sinT;
+                        float ry = lx * sinT + ly * cosT;
+
+                        float wx = cell.WorldOriginX + placement.X + rx;
+                        float wy = cell.WorldOriginY + placement.Y + ry;
+
+                        int gxNode = (int)Math.Round((wx - minX) / NodeResolution);
+                        int gyNode = (int)Math.Round((wy - minY) / NodeResolution);
+                        if (gxNode < 0 || gxNode >= gridW || gyNode < 0 || gyNode >= gridH) continue;
+
+                        if (h <= WallHeightThreshold)
+                        {
+                            heightGrid[gxNode, gyNode] = Mathf.Max(heightGrid[gxNode, gyNode], placement.Z + h);
+                            continue;
+                        }
+
+                        if (!blocked[gxNode, gyNode])
+                        {
+                            blocked[gxNode, gyNode] = true;
+                            blockedHere++;
+                        }
+                    }
+                }
+            }
+
+            if (cobj.Width2 > 0 && cobj.Height2 > 0 && cobj.Cells != null)
+            {
+                int cs2 = cobj.CellSize2;
+                for (int cy = 0; cy < cobj.Height2; cy++)
+                {
+                    for (int cx = 0; cx < cobj.Width2; cx++)
+                    {
+                        var bboxCell = cobj.Cells[cy * cobj.Width2 + cx];
+                        if (bboxCell == null || bboxCell.BBoxes.Length == 0) continue;
+                        bool occupiesWalkBand = false;
+                        foreach (var box in bboxCell.BBoxes)
+                        {
+                            if (cobj.OriginZ2 + box.ZLow <= 40 && cobj.OriginZ2 + box.ZHigh >= 5) { occupiesWalkBand = true; break; }
+                        }
+                        if (!occupiesWalkBand) continue;
+
+                        float lx = cobj.OriginX2 + (cx + 0.5f) * cs2;
+                        float ly = cobj.OriginY2 + (cy + 0.5f) * cs2;
+
+                        float rx = lx * cosT - ly * sinT;
+                        float ry = lx * sinT + ly * cosT;
+
+                        float wx = cell.WorldOriginX + placement.X + rx;
+                        float wy = cell.WorldOriginY + placement.Y + ry;
+
+                        int gxNode = (int)Math.Round((wx - minX) / NodeResolution);
+                        int gyNode = (int)Math.Round((wy - minY) / NodeResolution);
+                        if (gxNode < 0 || gxNode >= gridW || gyNode < 0 || gyNode >= gridH) continue;
+
+                        if (!blocked[gxNode, gyNode])
+                        {
+                            blocked[gxNode, gyNode] = true;
+                            blockedHere++;
+                        }
                     }
                 }
             }

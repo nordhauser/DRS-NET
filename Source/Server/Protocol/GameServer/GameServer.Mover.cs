@@ -15,12 +15,12 @@ using System.Runtime.CompilerServices;
 using Org.BouncyCastle.Utilities;
 using Org.BouncyCastle.Crypto.Engines;
 using Org.BouncyCastle.Crypto.Parameters;
-using DungeonRunners.Managers;
+using DungeonRunners.Gameplay;
 using DungeonRunners.Database;
 using DungeonRunners.Engine.Playables;
 using System.Security.Cryptography;
 using DungeonRunners.Combat;
-using DungeonRunners.Networking.Sync;
+using DungeonRunners.Networking.EntitySynchInfo;
 
 namespace DungeonRunners.Networking
 {
@@ -40,7 +40,6 @@ namespace DungeonRunners.Networking
                 if (_zones.TryGetValue(conn.CurrentZoneId, out Zone cz))
                     currentZone = cz.name;
 
-                // Build sorted list of available obelisk checkpoints (matching client dialog order)
                 var available = new List<(string id, int order, string zone)>();
                 foreach (var cpId in playerState.UnlockedCheckpoints)
                 {
@@ -58,14 +57,11 @@ namespace DungeonRunners.Networking
                     return;
                 }
 
-                // Cycle through checkpoints on each click
-                if (!_obeliskClickIndex.ContainsKey(connId))
-                    _obeliskClickIndex[connId] = 0;
-                int idx = _obeliskClickIndex[connId] % available.Count;
-                _obeliskClickIndex[connId] = idx + 1;
+                int checkpointIndex = conn.ObeliskClickIndex % available.Count;
+                conn.ObeliskClickIndex = checkpointIndex + 1;
 
-                var selected = available[idx];
-                Debug.LogError($"[OBELISK] Teleporting to '{selected.zone}' (checkpoint {selected.id}, index {idx}/{available.Count})");
+                var selected = available[checkpointIndex];
+                Debug.LogError($"[OBELISK] Teleporting to '{selected.zone}' (checkpoint {selected.id}, index {checkpointIndex}/{available.Count})");
 
                 var checkpoint = DatabaseLoader.Checkpoints.FirstOrDefault(c =>
                     c.id.Equals(selected.id, StringComparison.OrdinalIgnoreCase));
@@ -84,7 +80,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[OBELISK] Error: {ex.Message}");
+                Debug.LogError($"[OBELISK] state=failed message='{ex.Message}'");
             }
         }
 
@@ -92,7 +88,6 @@ namespace DungeonRunners.Networking
         {
             try
             {
-                // Saved Place = town portal return point
                 if (conn.HasSavedTownPortal && !string.IsNullOrEmpty(conn.TownPortalZoneName))
                 {
                     Debug.LogError($"[SAVED-PLACE] Teleporting to saved portal: {conn.TownPortalZoneName}");
@@ -100,13 +95,13 @@ namespace DungeonRunners.Networking
                 }
                 else
                 {
-                    Debug.LogError("[SAVED-PLACE] No saved town portal — defaulting to town");
+                    Debug.LogError("[SAVED-PLACE] No saved town portal - defaulting to town");
                     ChangeZone(conn, "town", "");
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[SAVED-PLACE] Error: {ex.Message}");
+                Debug.LogError($"[SAVED-PLACE] state=failed message='{ex.Message}'");
             }
         }
 
@@ -127,39 +122,13 @@ namespace DungeonRunners.Networking
             SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
         }
 
-        // ===========================================================================
-        // SendBossGatePopup - fires the on-screen popup via the proven QuestManager
-        // wire path. TTD-verified call stack from a working wolf-tracking quest kill:
-        //
-        //   ClientEntityManager::processMessage
-        //   -> processComponentUpdate (CEM 0x35)
-        //   -> QuestManager::processUpdate (vtable lookup by component id)
-        //   -> processUpdateQuest (submsg 0x03)
-        //   -> Quest::processUpdate (submsg 0x01 = readObjectives)
-        //   -> on objective state change, fires DFCEvent 0x4C400
-        //   -> EventChannel::doEvent -> WorldUI::doEvent -> WorldUI::addInfo
-        //   -> on-screen popup appears with the objective label as text
-        //
-        // Sequence: Add fake quest -> Progress packet (state change fires popup) ->
-        // Remove fake quest. The fake quest uses Q02_a2 type hash so the client can
-        // resolve the type, instanceId 0xFFFFFF00 to avoid conflicts with real quests.
-        // Wire format mirrors QuestManager.SendAddPacket / SendProgressPacket /
-        // SendRemovePacket exactly, but the objective label is written as raw text
-        // (no ": current / required" suffix) so the popup shows clean text.
-        // ===========================================================================
         private void SendBossGatePopup(RRConnection conn)
         {
             if (conn == null || !conn.IsConnected || conn.QuestManagerId == 0) return;
 
-            const uint fakeInstanceId = 0xFFFFFF00u;
-            // EXPERIMENT: try wrapping in chat-style font tags. If WorldUI::addInfo shares
-            // the chat renderer, you get big white glowing text. If it uses a different
-            // renderer, you will see literal "<font...>" text and we revert to plain.
+            const uint popupInstanceId = 0xFFFFFF00u;
             const string popupText = "<font color=white effect=glow>The boss gate is open!</font>";
 
-            // Resolve the Q02_a2 type hash from the loaded quest database. The client
-            // already knows this quest type from BossGate-related .gc files, so the
-            // GCClassRegistry lookup inside processAddQuest will succeed.
             var q02a2 = DatabaseLoader.Quests.FirstOrDefault(q =>
                 string.Equals(q.id, "world.dungeon00.quest.Q02_a2", StringComparison.OrdinalIgnoreCase));
             if (q02a2 == null)
@@ -169,70 +138,56 @@ namespace DungeonRunners.Networking
             }
             uint typeHash = q02a2.hash != 0 ? q02a2.hash : DatabaseLoader.ComputeDJB2Hash(q02a2.id);
 
-            // ----- 1. AddPacket: create fake quest with one INCOMPLETE objective -----
-            var addW = new LEWriter();
-            addW.WriteByte(0x07);                       // BeginStream
-            addW.WriteByte(0x35);                       // processComponentUpdate (CEM)
-            addW.WriteUInt16(conn.QuestManagerId);      // QM component
-            addW.WriteByte(0x01);                       // QM submsg = AddQuest
-            addW.WriteByte(0x04);                       // type marker = uint32 hash
-            addW.WriteUInt32(typeHash);                 // Q02_a2 hash
-            addW.WriteUInt32(fakeInstanceId);           // synthetic instance id
-            addW.WriteByte(0x00);                       // allComplete = false
-            addW.WriteByte(0x01);                       // 1 objective
-            addW.WriteByte(0x02);                       // flags = has-required (0x02), not-complete
-            // Raw label, NO count suffix
-            foreach (char c in popupText) addW.WriteByte((byte)c);
-            addW.WriteByte(0x00);                       // cstring null terminator
-            addW.WriteUInt16(0x0002);                   // required = 2 (Progress will use 1 for state change)
-            if (!WritePlayerEntitySynch(conn, addW)) return;
-            addW.WriteByte(0x06);                       // EndStream
-            SendCompressedA(conn, 0x01, 0x0F, addW.ToArray());
+            var addWriter = new LEWriter();
+            addWriter.WriteByte(0x07);
+            addWriter.WriteByte(0x35);
+            addWriter.WriteUInt16(conn.QuestManagerId);
+            addWriter.WriteByte(0x01);
+            addWriter.WriteByte(0x04);
+            addWriter.WriteUInt32(typeHash);
+            addWriter.WriteUInt32(popupInstanceId);
+            addWriter.WriteByte(0x00);
+            addWriter.WriteByte(0x01);
+            addWriter.WriteByte(0x02);
+            foreach (char popupChar in popupText) addWriter.WriteByte((byte)popupChar);
+            addWriter.WriteByte(0x00);
+            addWriter.WriteUInt16(0x0002);
+            if (!WritePlayerEntitySynch(conn, addWriter)) return;
+            addWriter.WriteByte(0x06);
+            SendCompressedA(conn, 0x01, 0x0F, addWriter.ToArray());
 
-            // ----- 2. ProgressPacket: state change WITHOUT marking complete -----
-            // The Add packet wrote required=2; this Progress writes required=1 with the
-            // SAME label. Quest::processUpdate sees the field change and fires the popup
-            // event, but flags=0x02 (no 0x01 complete bit) means the client should NOT
-            // append " (complete)" to the displayed label.
-            var progW = new LEWriter();
-            progW.WriteByte(0x07);
-            progW.WriteByte(0x35);
-            progW.WriteUInt16(conn.QuestManagerId);
-            progW.WriteByte(0x03);                      // QM submsg = processUpdateQuest
-            progW.WriteUInt32(fakeInstanceId);          // same instance
-            progW.WriteByte(0x01);                      // Quest submsg = readObjectives
-            progW.WriteByte(0x01);                      // 1 objective
-            progW.WriteByte(0x02);                      // flags = has-required ONLY (no complete bit)
-            foreach (char c in popupText) progW.WriteByte((byte)c);
-            progW.WriteByte(0x00);                      // cstring terminator
-            progW.WriteUInt16(0x0001);                  // required = 1 (Add had 2 so state changes)
-            if (!WritePlayerEntitySynch(conn, progW)) return;
-            progW.WriteByte(0x06);                      // EndStream
-            SendCompressedA(conn, 0x01, 0x0F, progW.ToArray());
+            var progressWriter = new LEWriter();
+            progressWriter.WriteByte(0x07);
+            progressWriter.WriteByte(0x35);
+            progressWriter.WriteUInt16(conn.QuestManagerId);
+            progressWriter.WriteByte(0x03);
+            progressWriter.WriteUInt32(popupInstanceId);
+            progressWriter.WriteByte(0x01);
+            progressWriter.WriteByte(0x01);
+            progressWriter.WriteByte(0x02);
+            foreach (char popupChar in popupText) progressWriter.WriteByte((byte)popupChar);
+            progressWriter.WriteByte(0x00);
+            progressWriter.WriteUInt16(0x0001);
+            if (!WritePlayerEntitySynch(conn, progressWriter)) return;
+            progressWriter.WriteByte(0x06);
+            SendCompressedA(conn, 0x01, 0x0F, progressWriter.ToArray());
 
-            // ----- 3. RemovePacket: clean up the fake quest from the client log -----
-            var rmW = new LEWriter();
-            rmW.WriteByte(0x07);
-            rmW.WriteByte(0x35);
-            rmW.WriteUInt16(conn.QuestManagerId);
-            rmW.WriteByte(0x02);                        // QM submsg = RemoveQuest
-            rmW.WriteUInt32(fakeInstanceId);
-            if (!WritePlayerEntitySynch(conn, rmW)) return;
-            rmW.WriteByte(0x06);                        // EndStream
-            SendCompressedA(conn, 0x01, 0x0F, rmW.ToArray());
+            var removeWriter = new LEWriter();
+            removeWriter.WriteByte(0x07);
+            removeWriter.WriteByte(0x35);
+            removeWriter.WriteUInt16(conn.QuestManagerId);
+            removeWriter.WriteByte(0x02);
+            removeWriter.WriteUInt32(popupInstanceId);
+            if (!WritePlayerEntitySynch(conn, removeWriter)) return;
+            removeWriter.WriteByte(0x06);
+            SendCompressedA(conn, 0x01, 0x0F, removeWriter.ToArray());
 
-            Debug.LogError($"[BOSS-POPUP] Sent Add+Progress+Remove popup sequence to {conn.LoginName} (instance=0x{fakeInstanceId:X8} hash=0x{typeHash:X8})");
+            Debug.LogError($"[BOSS-POPUP] sent Add+Progress+Remove popup sequence to {conn.LoginName} instance=0x{popupInstanceId:X8} hash=0x{typeHash:X8}");
         }
 
-        /// <summary>
-        /// Wraps a message in font color/effect tags for the client's HTML renderer.
-        /// Supported: color=#RRGGBB, effect=glow
-        /// If the message already contains font tags, returns it unchanged.
-        /// </summary>
         public static string WrapChatColor(string message, string color, string effect)
         {
             if (string.IsNullOrEmpty(message)) return message;
-            // Don't double-wrap if message already has font tags
             if (message.Contains("<font")) return message;
 
             bool hasColor = !string.IsNullOrEmpty(color);
@@ -247,100 +202,6 @@ namespace DungeonRunners.Networking
             return $"<font{attrs}>{message}</font>";
         }
 
-        /// <summary>
-        /// Send a UDP packet to DSOUND.dll. Uses NAT-punched endpoint if available (remote),
-        /// otherwise falls back to direct send to tcpIP:2605 (localhost/LAN).
-        /// </summary>
-        private void SendToDll(RRConnection conn, byte[] packet)
-        {
-            System.Net.IPEndPoint natEP = null;
-            if (conn.LoginName != null) { lock (_dllEndpoints) { _dllEndpoints.TryGetValue(conn.LoginName, out natEP); } }
-            if (natEP != null)
-            {
-                _udpListener.Send(packet, packet.Length, natEP);
-            }
-            else
-            {
-                var tcpEP = conn.Client?.Client?.RemoteEndPoint as System.Net.IPEndPoint;
-                if (tcpEP == null) return;
-                var fallback = new System.Net.IPEndPoint(tcpEP.Address, 2605);
-                using (var sender = new System.Net.Sockets.UdpClient()) { sender.Send(packet, packet.Length, fallback); }
-            }
-        }
-
-        /// <summary>
-        /// Send 0xE0 UDP packet to DSOUND.dll on port 2605 to trigger hotbar UI refresh.
-        /// DLL fires 0x141F event from main thread which rebuilds Skills UI.
-        /// </summary>
-        private void SendHotbarRefreshToDll(RRConnection conn, string skillName, uint slotId)
-        {
-            try
-            {
-                var tcpEP = conn.Client.Client.RemoteEndPoint as System.Net.IPEndPoint;
-                if (tcpEP == null) { Debug.LogError("[HOTBAR-DLL] Cannot get client IP"); return; }
-                byte[] nameBytes = System.Text.Encoding.ASCII.GetBytes(skillName);
-                byte[] packet = new byte[6 + nameBytes.Length];
-                packet[0] = 0xE0;
-                BitConverter.GetBytes(slotId).CopyTo(packet, 1);
-                packet[5] = (byte)nameBytes.Length;
-                System.Array.Copy(nameBytes, 0, packet, 6, nameBytes.Length);
-                SendToDll(conn, packet);
-                Debug.LogError($"[HOTBAR-DLL] Sent 0xE0 slot={slotId} '{skillName}'");
-            }
-            catch (System.Exception ex)
-            {
-                Debug.LogError($"[HOTBAR-DLL] Send failed: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Send 0x10 UDP packet to DSOUND.dll on port 2605 with GlobalKnobs overrides.
-        /// DLL patches RPGSettings in memory.
-        /// Per-player: checks free_KEY or member_KEY prefix first, falls back to KEY.
-        /// Protocol: [0x10][count:u8][{offset:u16, writeType:u8, value:u32}...]
-        ///   writeType: 0=uint32, 1=uint16
-        /// </summary>
-        private void SendGlobalKnobsToDLL(RRConnection conn)
-        {
-            Debug.LogError("[KNOBS] RPGSettings override packet skipped; native GlobalKnobs stay package-authored");
-        }
-
-        /// <summary>
-        /// Send 0x12 UDP to DSOUND.dll — controls membership mode.
-        /// DLL calls setFreePlayer/clearFreePlayer + patches XP multiplier.
-        /// Protocol: [0x12][u8 isFree][f32 xpMult]
-        /// </summary>
-        private void SendMembershipToDLL(RRConnection conn)
-        {
-            try
-            {
-                var tcpEP = conn.Client.Client.RemoteEndPoint as System.Net.IPEndPoint;
-                if (tcpEP == null) return;
-
-                bool isFree = IsPlayerFree(conn.LoginName);
-                bool isAdmin = IsPlayerAdmin(conn.LoginName);
-                float xpMult = GCDatabase.Instance.GetKnob("FreePlayerExperienceMult", 0.87f);
-
-                byte[] packet = new byte[11];
-                packet[0] = 0x12;
-                packet[1] = isFree ? (byte)1 : (byte)0;
-                System.BitConverter.GetBytes(xpMult).CopyTo(packet, 2);
-                packet[6] = isAdmin ? (byte)1 : (byte)0;
-                System.BitConverter.GetBytes(conn.DllSessionToken).CopyTo(packet, 7);
-
-                SendToDll(conn, packet);
-                Debug.LogError($"[MEMBER] Sent isFree={isFree} isAdmin={isAdmin} xpMult={xpMult} token=0x{conn.DllSessionToken:X8} to DLL");
-            }
-            catch (System.Exception ex)
-            {
-                Debug.LogError($"[MEMBER] Send failed: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Load account flags from DB on login. Returns false if banned.
-        /// Sets _playerIsAdmin and _playerIsFree caches, updates last_login.
-        /// </summary>
         private bool LoadAccountFlags(string loginName)
         {
             try
@@ -364,13 +225,12 @@ namespace DungeonRunners.Networking
 
                             if (isBanned != 0)
                             {
-                                Debug.LogError($"[ACCOUNT] ⛔ {loginName} is BANNED — rejecting connection");
+                                Debug.LogError($"[ACCOUNT]  {loginName} is BANNED - rejecting connection");
                                 return false;
                             }
                         }
                     }
 
-                    // Update last_login
                     Database.GameDatabase.ExecuteNonQuery(db,
                         "UPDATE accounts SET last_login = datetime('now') WHERE username = @name",
                         ("@name", loginName));
@@ -378,19 +238,15 @@ namespace DungeonRunners.Networking
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"[ACCOUNT] Error loading flags for {loginName}: {ex.Message}");
+                Debug.LogError($"[ACCOUNT] loadFlags login='{loginName}' state=failed message='{ex.Message}'");
             }
             return true;
         }
 
-        /// <summary>
-        /// Check if player has admin role.
-        /// </summary>
         public bool IsPlayerAdmin(string loginName)
         {
             if (_playerIsAdmin.TryGetValue(loginName, out bool cached))
                 return cached;
-            // Not cached — load from DB
             try
             {
                 using (var db = Database.GameDatabase.GetConnection())
@@ -413,9 +269,6 @@ namespace DungeonRunners.Networking
             return false;
         }
 
-        /// <summary>
-        /// Set admin flag in DB.
-        /// </summary>
         private void SetPlayerAdmin(string loginName, bool isAdmin)
         {
             _playerIsAdmin[loginName] = isAdmin;
@@ -426,13 +279,12 @@ namespace DungeonRunners.Networking
                     Database.GameDatabase.ExecuteNonQuery(db,
                         "UPDATE accounts SET is_admin = @admin WHERE username = @name",
                         ("@name", loginName), ("@admin", isAdmin ? 1 : 0));
-                    // Admins are always members — set is_member=1 in DB
                     if (isAdmin)
                     {
                         Database.GameDatabase.ExecuteNonQuery(db,
                             "UPDATE accounts SET is_member = 1 WHERE username = @name",
                             ("@name", loginName));
-                        Debug.LogError($"[ACCOUNT] {loginName} admin=true, is_member=1 (admin→member)");
+                        Debug.LogError($"[ACCOUNT] {loginName} admin=true, is_member=1 (admin->member)");
                     }
                     else
                         Debug.LogError($"[ACCOUNT] {loginName} admin={isAdmin}");
@@ -440,13 +292,10 @@ namespace DungeonRunners.Networking
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"[ACCOUNT] Set admin error: {ex.Message}");
+                Debug.LogError($"[ACCOUNT] setAdmin state=failed message='{ex.Message}'");
             }
         }
 
-        /// <summary>
-        /// Set banned flag in DB.
-        /// </summary>
         private void SetPlayerBanned(string loginName, bool isBanned)
         {
             try
@@ -459,7 +308,7 @@ namespace DungeonRunners.Networking
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"[ACCOUNT] Set banned error: {ex.Message}");
+                Debug.LogError($"[ACCOUNT] setBanned state=failed message='{ex.Message}'");
             }
         }
 
@@ -476,13 +325,11 @@ namespace DungeonRunners.Networking
         }
         private bool IsPlayerFree(string loginName)
         {
-            // Admins always get member settings
             if (IsPlayerAdmin(loginName)) return false;
 
             if (_playerIsFree.TryGetValue(loginName, out bool cached))
                 return cached;
 
-            // Check DB
             try
             {
                 using (var db = Database.GameDatabase.GetConnection())
@@ -492,7 +339,7 @@ namespace DungeonRunners.Networking
                         ("@name", loginName));
                     if (result != null && result != System.DBNull.Value)
                     {
-                        bool isFree = System.Convert.ToInt32(result) == 0;  // is_member=0 → free
+                        bool isFree = System.Convert.ToInt32(result) == 0;
                         _playerIsFree[loginName] = isFree;
                         return isFree;
                     }
@@ -508,9 +355,6 @@ namespace DungeonRunners.Networking
             return false;
         }
 
-        /// <summary>
-        /// Set a player's membership in DB + cache. true=free, false=member.
-        /// </summary>
         private void SetPlayerMembership(string loginName, bool isFree)
         {
             _playerIsFree[loginName] = isFree;
@@ -524,7 +368,7 @@ namespace DungeonRunners.Networking
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"[MEMBER] DB save error: {ex.Message}");
+                Debug.LogError($"[MEMBER] dbSave state=failed message='{ex.Message}'");
             }
         }
 
@@ -535,7 +379,6 @@ namespace DungeonRunners.Networking
             if (VerbosePacketLogging)
                 Debug.Log($"Initial connection message type: 0x{messageType:X2}, data length: {data.Length}");
 
-            // 🔧 CRITICAL FIX: Ignore empty 0x02 messages (heartbeat/keep-alive)
             if (messageType == 0x02 && data.Length == 0)
             {
                 if (VerbosePacketLogging)
@@ -567,28 +410,19 @@ namespace DungeonRunners.Networking
 
                 conn.LoginName = user;
                 _users[conn.ConnId] = user;
-                LoadAccountFlags(user);  // Load flags, ban check at spawn time
-                if (conn.DllSessionToken == 0)
-                {
-                    conn.DllSessionToken = (uint)(new System.Random().Next(1, int.MaxValue));
-                    NativeRngLedger.LogSystemRandom("dll-session-token", (int)conn.DllSessionToken, user);
-                    Debug.LogError($"[DLL-TOKEN] Generated token 0x{conn.DllSessionToken:X8} for {user}");
-                }
+                LoadAccountFlags(user);
                 Debug.Log($"Initial login SUCCESS for user '{user}'");
 
-                // Send 0x10 message with channel 0x0A
                 var ack = new LEWriter();
                 ack.WriteByte(0x03);
                 SendMessage0x10(conn, 0x0A, ack.ToArray());
 
-                // Send A-lane advance message
                 var advance = new LEWriter();
                 advance.WriteUInt24(0x00B2B3B4);
                 advance.WriteByte(0x00);
                 SendCompressedA(conn, 0x00, 0x03, advance.ToArray());
                 Debug.Log($"Sent advance message");
 
-                // Start character flow
                 StartCharacterFlow(conn);
             }
             else
@@ -601,11 +435,8 @@ namespace DungeonRunners.Networking
         {
             Debug.LogError($"[STARTFLOW] StartCharacterFlow for {conn.LoginName}");
 
-            // Force reload from JSON to get latest data
-            /* DB always current — no reload needed */
             ;
 
-            // Load characters from JSON into _persistentCharacters
             var savedCharacters = CharacterRepository.GetCharactersForAccount(conn.LoginName);
             Debug.LogError($"[STARTFLOW] GetCharactersForAccount('{conn.LoginName}') returned {savedCharacters?.Count ?? 0} characters");
 
@@ -616,7 +447,7 @@ namespace DungeonRunners.Networking
                 var gcObj = new GCObject
                 {
                     Id = savedChar.id,
-                    NativeClass = "Player",
+                    DFCClass = "Player",
                     GCClass = "Player",
                     Name = savedChar.name
                 };
@@ -651,7 +482,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"SendMessage0x10 error: {ex.Message}");
+                Debug.LogError($"[SEND-MESSAGE-0x10] state=failed message='{ex.Message}'");
             }
         }
 
@@ -661,16 +492,16 @@ namespace DungeonRunners.Networking
 
             switch (messageType)
             {
-                case 0: // CharacterConnected request
+                case 0:
                     Debug.Log($"Client sent 4/0 request - sending character connected response");
-                    var connMsg = new LEWriter();
-                    connMsg.WriteByte(4);
-                    connMsg.WriteByte(0);
-                    SendCompressedA(conn, 0x01, 0x0F, connMsg.ToArray());
+                    var connectionMessage = new LEWriter();
+                    connectionMessage.WriteByte(4);
+                    connectionMessage.WriteByte(0);
+                    SendCompressedA(conn, 0x01, 0x0F, connectionMessage.ToArray());
                     Debug.Log($"Sent 4/0 character connected response");
                     break;
 
-                case 1: // UI nudge
+                case 1:
                     Debug.Log($"Client sent UI nudge (4/1) - sending ack");
                     var ack = new LEWriter();
                     ack.WriteByte(4);
@@ -680,13 +511,13 @@ namespace DungeonRunners.Networking
                     Debug.Log($"Sent 4/1 ack");
                     break;
 
-                case 2: // 🔥 CHARACTER CREATION REQUEST
+                case 2:
                     Debug.LogError($"[CHAR-CREATE] *** RECEIVED CHARACTER CREATION REQUEST (4/2) ***");
                     Debug.LogError($"[CHAR-CREATE] Data: {BitConverter.ToString(data ?? new byte[0])}");
                     HandleCharacterCreate(conn, data);
                     break;
 
-                case 3: // Get character list
+                case 3:
                     Debug.LogError($"[CHAR-CHANNEL] Case 3 - calling SendCharacterList NOW");
                     try
                     {
@@ -699,13 +530,13 @@ namespace DungeonRunners.Networking
                     Debug.LogError($"[CHAR-CHANNEL] Case 3 - SendCharacterList returned");
                     break;
 
-                case 4: // 🔥 CHARACTER DELETE REQUEST
+                case 4:
                     Debug.LogError($"[CHAR-DELETE] *** RECEIVED CHARACTER DELETE REQUEST (4/4) ***");
                     Debug.LogError($"[CHAR-DELETE] Data: {BitConverter.ToString(data ?? new byte[0])}");
                     HandleCharacterDelete(conn, data);
                     break;
 
-                case 5: // Play character
+                case 5:
                     HandleCharacterPlay(conn, data);
                     break;
 
@@ -717,7 +548,7 @@ namespace DungeonRunners.Networking
         }
         private void HandleCharacterCreate(RRConnection conn, byte[] data)
         {
-            Debug.LogError("[CHAR-CREATE] ═══════════════════════════════════════════════════════════");
+            Debug.LogError("[CHAR-CREATE] ");
             Debug.LogError($"[CHAR-CREATE] Data hex: {BitConverter.ToString(data)}");
 
             try
@@ -726,9 +557,8 @@ namespace DungeonRunners.Networking
                 string characterName = reader.ReadCString();
                 string avatarClass = reader.ReadCString();
 
-                Debug.LogError($"[CHAR-CREATE] Name: '{characterName}', AvatarClass: '{avatarClass}'");
+                Debug.LogError($"[CHAR-CREATE] name='{characterName}' avatarClass='{avatarClass}'");
 
-                // Read appearance bytes (5 bytes after avatar class)
                 byte skin = 0, face = 0, faceFeature = 0, hair = 0, hairColor = 0;
                 if (reader.Remaining >= 5)
                 {
@@ -740,21 +570,18 @@ namespace DungeonRunners.Networking
                     Debug.LogError($"[CHAR-CREATE] Appearance: Skin={skin}, Face={face}, FaceFeature={faceFeature}, Hair={hair}, HairColor={hairColor}");
                 }
 
-                // Map avatar class to class name
                 string className = "Fighter";
                 if (avatarClass.Contains("Fighter")) className = "Fighter";
                 else if (avatarClass.Contains("Warlock") || avatarClass.Contains("Mage")) className = "Mage";
                 else if (avatarClass.Contains("Ranger")) className = "Ranger";
 
-                // Create character in ClassConfig (this saves to JSON)
                 var savedChar = CharacterRepository.CreateCharacter(characterName, className, AccountRepository.GetAccountId(conn.LoginName), conn.LoginName, avatarClass);
                 if (savedChar == null)
                 {
-                    Debug.LogError("[CHAR-CREATE] ❌ CharacterRepository.CreateCharacter returned null!");
+                    Debug.LogError("[CHAR-CREATE]  CharacterRepository.CreateCharacter returned null!");
                     return;
                 }
 
-                // Save the full avatar class for gender AND appearance
                 savedChar.avatarClass = avatarClass;
                 savedChar.skin = skin;
                 savedChar.face = face;
@@ -763,13 +590,12 @@ namespace DungeonRunners.Networking
                 savedChar.hairColor = hairColor;
                 CharacterRepository.SaveCharacter(savedChar);
 
-                Debug.LogError($"[CHAR-CREATE] ✅ Created saved character ID={savedChar.id}, AvatarClass={avatarClass}");
+                Debug.LogError($"[CHAR-CREATE]  Created saved character ID={savedChar.id}, AvatarClass={avatarClass}");
 
-                // Create GCObject for persistent characters list
                 var newCharacter = new GCObject
                 {
                     Id = savedChar.id,
-                    NativeClass = "Player",
+                    DFCClass = "Player",
                     GCClass = "Player",
                     Name = characterName
                 };
@@ -780,14 +606,12 @@ namespace DungeonRunners.Networking
                 }
                 _persistentCharacters[conn.LoginName].Add(newCharacter);
 
-                // Build full Player object for response
-                GCObject tempChar = GCObjectFactory.NewPlayer(characterName);
-                tempChar.Id = savedChar.id;
+                GCObject playerObject = GCObjectFactory.NewPlayer(characterName, (uint)savedChar.id, GroupDirectory.Instance.GetGroupForConn(conn.ConnId)?.GroupId ?? 0);
+                playerObject.Id = savedChar.id;
 
                 var avatar = GCObjectFactory.LoadAvatar(savedChar);
                 avatar.Id = _nextEntityId++;
 
-                // Assign IDs to avatar children
                 foreach (var child in avatar.Children)
                 {
                     child.Id = _nextEntityId++;
@@ -801,26 +625,25 @@ namespace DungeonRunners.Networking
                     }
                 }
 
-                tempChar.AddChild(avatar);
+                playerObject.AddChild(avatar);
 
-                var procMod = GCObjectFactory.NewProcModifier();
-                procMod.Id = _nextEntityId++;
-                tempChar.AddChild(procMod);
+                var procModifierObject = GCObjectFactory.NewProcModifier();
+                procModifierObject.Id = _nextEntityId++;
+                playerObject.AddChild(procModifierObject);
 
-                // Send create response: [channel][type][ID][name][Player object]
                 var writer = new LEWriter();
                 writer.WriteByte(4);
                 writer.WriteByte(2);
                 writer.WriteUInt32(savedChar.id);
                 writer.WriteCString(characterName);
-                tempChar.WriteFullGCObject(writer);
+                playerObject.WriteFullGCObject(writer);
 
                 SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
-                Debug.LogError($"[CHAR-CREATE] ✅ Sent create response with full Player object");
+                Debug.LogError($"[CHAR-CREATE]  Sent create response with full Player object");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[CHAR-CREATE] ❌ Error: {ex.Message}\n{ex.StackTrace}");
+                Debug.LogError($"[CHAR-CREATE] state=failed message='{ex.Message}' stack='{ex.StackTrace}'");
             }
         }
         private void SendCharacterCreateResponse(RRConnection conn, bool success, string errorMessage)
@@ -834,30 +657,27 @@ namespace DungeonRunners.Networking
         }
         private void HandleCharacterDelete(RRConnection conn, byte[] data)
         {
-            Debug.LogError($"[CHAR-DELETE] ═══════════════════════════════════════");
+            Debug.LogError($"[CHAR-DELETE] ");
             try
             {
                 if (data == null || data.Length == 0)
                 {
-                    Debug.LogError($"[CHAR-DELETE] ❌ No data received!");
+                    Debug.LogError($"[CHAR-DELETE]  No data received!");
                     return;
                 }
 
                 var reader = new LEReader(data);
                 string characterName = reader.ReadCString();
                 uint characterId = reader.ReadUInt32();
-                Debug.LogError($"[CHAR-DELETE] Name: '{characterName}', ID: {characterId}");
+                Debug.LogError($"[CHAR-DELETE] name='{characterName}' id={characterId}");
 
-                // ═══════════════════════════════════════════════════════════════
-                // STEP 1: Remove from persistent list (server-side memory)
-                // ═══════════════════════════════════════════════════════════════
                 if (_persistentCharacters.TryGetValue(conn.LoginName, out var characters))
                 {
                     var toRemove = characters.Find(c => c.Id == characterId);
                     if (toRemove != null)
                     {
                         characters.Remove(toRemove);
-                        Debug.LogError($"[CHAR-DELETE] ✅ Removed from persistent list");
+                        Debug.LogError($"[CHAR-DELETE]  Removed from persistent list");
                     }
                 }
 
@@ -870,31 +690,22 @@ namespace DungeonRunners.Networking
                 }
                 Debug.LogError($"[CHAR-DELETE] Deleted from SQLite");
 
-                // ═══════════════════════════════════════════════════════════════
-                // STEP 3: Send ONLY the delete ack - nothing else!
-                // Client handles UI update locally from its cached character data
-                // ═══════════════════════════════════════════════════════════════
                 var writer = new LEWriter();
-                writer.WriteByte(4);   // Channel
-                writer.WriteByte(4);   // Delete ack type
+                writer.WriteByte(4);
+                writer.WriteByte(4);
                 writer.WriteUInt32(characterId);
                 SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
-                Debug.LogError($"[CHAR-DELETE] ✅ Sent delete ack for ID={characterId}");
-                Debug.LogError($"[CHAR-DELETE] ✅ Done - NO character list resend (client handles locally)");
-                // 🔥 FIX: Send fresh character list so client rebuilds UI with correct data
+                Debug.LogError($"[CHAR-DELETE]  Sent delete ack for ID={characterId}");
+                Debug.LogError($"[CHAR-DELETE]  Done - NO character list resend (client handles locally)");
                 SendCharacterList(conn);
-                // Debug.LogError($"[CHAR-DELETE] ✅ Sent fresh character list after delete");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[CHAR-DELETE] ❌ ERROR: {ex.Message}");
+                Debug.LogError($"[CHAR-DELETE] state=failed message='{ex.Message}'");
             }
         }
 
 
-        // ═══════════════════════════════════════════════════════════════════════════════
-        // ENTITY CHANNEL HANDLER — Refactored: single handler per opcode, no duplication
-        // ═══════════════════════════════════════════════════════════════════════════════
 
         private void HandleClientEntityChannel(RRConnection conn, byte messageType, byte[] data)
         {
@@ -902,15 +713,12 @@ namespace DungeonRunners.Networking
 
             if (messageType == 0x07)
             {
-                // BeginStream - contains wrapped sub-messages terminated by 0x06
                 ParseEntityStream(conn, reader);
                 return;
             }
 
-            // Top-level entity channel message — dispatch by opcode
             switch (messageType)
             {
-                // --- Handled opcodes (known wire format) ---
                 case 0x03: HandleOpcode_SendUpdate(conn, reader); break;
                 case 0x04: HandleEntityRequest(conn, reader, data); break;
                 case 0x08: HandleOpcode_CombatTick(conn, reader); break;
@@ -918,13 +726,10 @@ namespace DungeonRunners.Networking
                 case 0x0C: HandleOpcode_RngSeed(conn, reader); break;
                 case 0x34:
                 case 0x35: HandleOpcode_ComponentUpdate(conn, reader, messageType); break;
-                case 0x36: HandleOpcode_EntitySyncHP(conn, reader); break;
+                case 0x36: ProcessEntitySynchInfoHP(conn, reader); break;
                 case 0x64: HandleOpcode_StateMachine(conn, reader); break;
 
-                // --- Missing opcodes — log full payload for wire format analysis ---
                 case 0x01: LogMissingOpcode(0x01, "BehaviorNotify", data, conn); break;
-                // ...etc for all 11 cases (same pattern, just added conn)
-                // ...etc for all 11 cases (same pattern, just added conn)
                 case 0x0A: LogMissingOpcode(0x0A, "EntityChannel0A", data); break;
                 case 0x0B: LogMissingOpcode(0x0B, "EntityChannel0B", data); break;
                 case 0x23: LogMissingOpcode(0x23, "PathBehavior", data); break;
@@ -933,7 +738,7 @@ namespace DungeonRunners.Networking
                 case 0x27: LogMissingOpcode(0x27, "ActionCmd_27", data); break;
                 case 0x28: LogMissingOpcode(0x28, "PathTarget_Simple", data); break;
                 case 0x29: LogMissingOpcode(0x29, "PathTarget_Extended", data); break;
-                case 0x32: HandleOpcode_ComponentUpdate(conn, reader, messageType); break;  // ComponentRequest (same format as 0x35)
+                case 0x32: HandleOpcode_ComponentUpdate(conn, reader, messageType); break;
                 case 0x58: LogMissingOpcode(0x58, "EntityChannel58", data); break;
 
                 default:
@@ -944,17 +749,13 @@ namespace DungeonRunners.Networking
             }
         }
 
-        /// <summary>
-        /// Parses a BeginStream (0x07) sequence of sub-messages until EndStream (0x06).
-        /// Only dispatches opcodes with known wire formats to avoid corrupting the stream.
-        /// </summary>
         private void ParseEntityStream(RRConnection conn, LEReader reader)
         {
             int loopCount = 0;
             while (reader.Remaining > 0)
             {
                 byte subType = reader.ReadByte();
-                if (subType == 0x06) break; // EndStream
+                if (subType == 0x06) break;
                 loopCount++;
 
                 switch (subType)
@@ -967,17 +768,17 @@ namespace DungeonRunners.Networking
                     case 0x32:
                     case 0x34:
                     case 0x35: HandleOpcode_ComponentUpdate(conn, reader, subType); break;
-                    case 0x36: HandleOpcode_EntitySyncHP(conn, reader); break;
+                    case 0x36: ProcessEntitySynchInfoHP(conn, reader); break;
                     case 0x64: HandleOpcode_StateMachine(conn, reader); break;
                     default:
                         byte[] leftover = reader.Remaining > 0 ? reader.PeekRemaining() : new byte[0];
                         Debug.LogWarning($"[ENTITY-STREAM] Unknown sub=0x{subType:X2} remain={reader.Remaining}");
                         if (leftover.Length > 0 && leftover.Length < 128)
                         {
-                            byte[] fakePacket = new byte[leftover.Length + 1];
-                            fakePacket[0] = subType;
-                            Array.Copy(leftover, 0, fakePacket, 1, leftover.Length);
-                            LogMissingOpcode(subType, $"StreamSub_0x{subType:X2}", fakePacket, conn);
+                            byte[] streamPacket = new byte[leftover.Length + 1];
+                            streamPacket[0] = subType;
+                            Array.Copy(leftover, 0, streamPacket, 1, leftover.Length);
+                            LogMissingOpcode(subType, $"StreamSub_0x{subType:X2}", streamPacket, conn);
                         }
                         reader.Skip(reader.Remaining);
                         break;
@@ -985,44 +786,40 @@ namespace DungeonRunners.Networking
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════════════════
-        // ENTITY OPCODE HANDLERS — Called from both ParseEntityStream and top-level
-        // ═══════════════════════════════════════════════════════════════════════════════
 
         private void HandleOpcode_RngSeed(RRConnection conn, LEReader reader)
         {
             if (reader.Remaining < 4) return;
             uint clientSeed = reader.ReadUInt32();
             string instanceKey = conn != null ? GetInstanceZoneKey(conn) : null;
-            uint roomSeed = CombatManager.Instance.GetRoomSeedForInstance(instanceKey);
-            bool ready = CombatManager.Instance.TryGetRoomRuntime(instanceKey, out var runtime) && runtime.Initialized;
+            uint roomSeed = CombatRuntime.Instance.GetRoomSeedForInstance(instanceKey);
+            bool ready = CombatRuntime.Instance.TryGetRoomRuntime(instanceKey, out var runtime) && runtime.Initialized;
             Debug.LogError($"[RNG-SEED] Ignored client seed: 0x{clientSeed:X8} instance='{instanceKey ?? ""}' current=0x{roomSeed:X8} ready={ready}");
         }
 
-        private void HandleOpcode_EntitySyncHP(RRConnection conn, LEReader reader)
+        private void ProcessEntitySynchInfoHP(RRConnection conn, LEReader reader)
         {
             if (reader.Remaining < 3) return;
-            ushort syncEntityId = reader.ReadUInt16();
-            byte syncFlags = reader.ReadByte();
-            Debug.LogError($"[HP-SYNC] 0x36: entity={syncEntityId} flags=0x{syncFlags:X2} remaining={reader.Remaining}");
-            if ((syncFlags & 0x02) != 0)
+            ushort entitySynchInfoEntityId = reader.ReadUInt16();
+            byte entitySynchInfoFlags = reader.ReadByte();
+            Debug.LogError($"[ENTITY-SYNCH-INFO] opcode=0x36 entity={entitySynchInfoEntityId} flags=0x{entitySynchInfoFlags:X2} remaining={reader.Remaining}");
+            if ((entitySynchInfoFlags & 0x02) != 0)
             {
                 if (reader.Remaining >= 4)
                 {
                     uint clientHP = reader.ReadUInt32();
-                    Debug.LogError($"[HP-SYNC] entity={syncEntityId} HP={clientHP} ({clientHP / 256} actual)");
-                    // Try by EntityId first, then by ANY component ID (BehaviorId, SkillsId, etc.)
-                    var monster = CombatManager.Instance.GetMonster(syncEntityId)
-                                ?? CombatManager.Instance.GetMonsterByComponent(syncEntityId);
+                    Debug.LogError($"[ENTITY-SYNCH-INFO] entity={entitySynchInfoEntityId} hpWire={clientHP} hp={clientHP / 256}");
+                    var monster = CombatRuntime.Instance.GetMonster(entitySynchInfoEntityId)
+                                ?? CombatRuntime.Instance.GetMonsterByComponent(entitySynchInfoEntityId);
                     if (monster != null)
                     {
-                        int serverActual = (int)(CombatManager.Instance.PeekMonsterCurrentHPWire(monster) / 256);
+                        int serverActual = (int)(CombatRuntime.Instance.PeekMonsterCurrentHPWire(monster) / 256);
                         int clientActual = (int)(clientHP / 256);
                         int delta = serverActual - clientActual;
-                        Debug.LogError($"[HP-SYNC] Monster {monster.Name} (eid={monster.EntityId}) SERVER_HP={serverActual} CLIENT_HP={clientActual} DELTA={delta}");
-                        CombatManager.Instance.ObserveClientMonsterHP(monster, clientHP, "HP-SYNC-0x36");
+                        Debug.LogError($"[ENTITY-SYNCH-INFO] owner=monster name='{monster.Name}' entity={monster.EntityId} serverHP={serverActual} clientHP={clientActual} delta={delta}");
+                        CombatRuntime.Instance.ObserveClientMonsterHP(monster, clientHP, "ENTITY-SYNCH-INFO-0x36");
                     }
-                    else if (IsAvatarOrAvatarComponentId(conn, syncEntityId))
+                    else if (IsAvatarOrAvatarComponentId(conn, entitySynchInfoEntityId))
                     {
                         PlayerState state = GetPlayerState(conn.ConnId.ToString());
                         if (state != null)
@@ -1031,40 +828,38 @@ namespace DungeonRunners.Networking
                             int serverMax = (int)(state.MaxHPWire / 256);
                             int serverCurrent = (int)(state.CurrentHPWire / 256);
 
-                            // Verify: client HP should never exceed server MaxHP (+ small tolerance)
-                            int tolerance = 5; // allow small rounding difference
+                            int tolerance = 5;
                             if (clientActual > serverMax + tolerance)
                             {
-                                Debug.LogError($"[HP-VERIFY] ⚠️ Client HP {clientActual} EXCEEDS server MaxHP {serverMax}! Delta=+{clientActual - serverMax}. Possible cheat or missing equipment bonus.");
+                                Debug.LogError($"[HP-VERIFY] clientHP={clientActual} serverMaxHP={serverMax} delta={clientActual - serverMax} state=rejected reason=above-max");
                             }
                             else if (clientActual < 0)
                             {
-                                Debug.LogError($"[HP-VERIFY] ⚠️ Client HP negative: {clientActual}. Ignoring.");
+                                Debug.LogError($"[HP-VERIFY] clientHP={clientActual} state=rejected reason=negative");
                                 return;
                             }
 
-                            Debug.LogError($"[HP-SYNC] Player HP: {serverCurrent} -> {clientActual} (serverMax={serverMax})");
-                            ObserveClientPlayerHP(conn, clientHP, "HP-SYNC-0x36");
+                            Debug.LogError($"[ENTITY-SYNCH-INFO] owner=player serverHP={serverCurrent} clientHP={clientActual} serverMaxHP={serverMax}");
+                            ObserveClientPlayerHP(conn, clientHP, "ENTITY-SYNCH-INFO-0x36");
 
-                            // Extra bytes: unknown format, skip
                             if (reader.Remaining > 0)
                                 reader.Skip(reader.Remaining);
                         }
                     }
                     else
                     {
-                        Debug.LogError($"[HP-SYNC] Ignored HP for non-avatar entity={syncEntityId} hp={clientHP}");
+                        Debug.LogError($"[ENTITY-SYNCH-INFO] entity={entitySynchInfoEntityId} hpWire={clientHP} state=ignored reason=non-avatar");
                         if (reader.Remaining > 0)
                             reader.Skip(reader.Remaining);
                     }
                 }
                 else
                 {
-                    Debug.LogError($"[HP-SYNC] BUG: flags=0x02 but only {reader.Remaining} bytes left!");
+                    Debug.LogError($"[ENTITY-SYNCH-INFO] flags=0x02 remaining={reader.Remaining} state=short");
                     if (reader.Remaining > 0)
                     {
                         byte[] leftover = reader.PeekRemaining();
-                        Debug.LogError($"[HP-SYNC] leftover={BitConverter.ToString(leftover)}");
+                        Debug.LogError($"[ENTITY-SYNCH-INFO] leftover={BitConverter.ToString(leftover)}");
                     }
                 }
             }
@@ -1076,7 +871,7 @@ namespace DungeonRunners.Networking
             return conn?.Avatar != null && entityId == (uint)conn.Avatar.Id;
         }
 
-        private bool IsAvatarHPSyncComponentId(RRConnection conn, uint entityId)
+        private bool IsAvatarEntitySynchInfoComponentId(RRConnection conn, uint entityId)
         {
             if (IsAvatarEntityId(conn, entityId))
                 return true;
@@ -1095,7 +890,7 @@ namespace DungeonRunners.Networking
 
         private bool IsAvatarOrAvatarComponentId(RRConnection conn, uint entityId)
         {
-            return IsAvatarHPSyncComponentId(conn, entityId);
+            return IsAvatarEntitySynchInfoComponentId(conn, entityId);
         }
 
         private void GiveGold(RRConnection conn, uint amount, string source)
@@ -1116,204 +911,19 @@ namespace DungeonRunners.Networking
             if (conn.UnitContainerId == 0)
                 return;
 
-            var goldPkt = new LEWriter();
-            goldPkt.WriteByte(0x07);
-            goldPkt.WriteByte(0x35);
-            goldPkt.WriteUInt16(conn.UnitContainerId);
-            goldPkt.WriteByte(0x20);
-            goldPkt.WriteUInt32(amount);
-            goldPkt.WriteByte(0x00);
-            goldPkt.WriteUInt32(0x00000000);
-            goldPkt.WriteByte(0x01);
-            WritePlayerEntitySynch(conn, goldPkt);
-            goldPkt.WriteByte(0x06);
-            SendToClient(conn, goldPkt.ToArray());
+            var goldPacket = new LEWriter();
+            goldPacket.WriteByte(0x07);
+            goldPacket.WriteByte(0x35);
+            goldPacket.WriteUInt16(conn.UnitContainerId);
+            goldPacket.WriteByte(0x20);
+            goldPacket.WriteUInt32(amount);
+            goldPacket.WriteByte(0x00);
+            goldPacket.WriteUInt32(0x00000000);
+            goldPacket.WriteByte(0x01);
+            WritePlayerEntitySynch(conn, goldPacket);
+            goldPacket.WriteByte(0x06);
+            SendToClient(conn, goldPacket.ToArray());
             Debug.LogError($"[GIVE-GOLD] source={source ?? "unknown"} +{amount} gold sent to client");
-        }
-
-        private bool TryResolveDllReportConnection(IPEndPoint remoteEP, uint entityAddr, uint componentId, out RRConnection conn, out string reason)
-        {
-            conn = null;
-            reason = "no-owner";
-            var candidates = new List<RRConnection>();
-            foreach (var candidate in SnapshotConnections())
-            {
-                if (candidate == null || !candidate.IsConnected)
-                    continue;
-                if (!IsAvatarOrAvatarComponentId(candidate, entityAddr) &&
-                    !IsAvatarOrAvatarComponentId(candidate, componentId))
-                    continue;
-                candidates.Add(candidate);
-            }
-
-            if (candidates.Count == 0)
-            {
-                reason = "no-avatar-owner";
-                return false;
-            }
-
-            var udpMatches = candidates.Where(c => IsRegisteredDllEndpointMatch(c, remoteEP)).ToList();
-            if (udpMatches.Count == 1)
-            {
-                conn = udpMatches[0];
-                reason = "registered-dll-endpoint+avatar-owner";
-                return true;
-            }
-            if (udpMatches.Count > 1)
-            {
-                reason = "ambiguous-registered-dll-endpoint";
-                return false;
-            }
-
-            var tcpMatches = candidates.Where(c => IsTcpAddressMatch(c, remoteEP)).ToList();
-            if (tcpMatches.Count == 1)
-            {
-                conn = tcpMatches[0];
-                reason = "tcp-address+avatar-owner";
-                return true;
-            }
-            if (tcpMatches.Count > 1)
-            {
-                reason = "ambiguous-tcp-address+avatar-owner";
-                return false;
-            }
-
-            if (candidates.Count == 1)
-            {
-                conn = candidates[0];
-                reason = "unique-avatar-owner";
-                return true;
-            }
-
-            reason = "ambiguous-avatar-owner";
-            return false;
-        }
-
-        private bool TryResolveDllSenderConnection(IPEndPoint remoteEP, out RRConnection conn, out string reason)
-        {
-            conn = null;
-            reason = "no-sender";
-            var connections = SnapshotConnections();
-            var udpMatches = connections.Where(c => c != null && c.IsConnected && IsRegisteredDllEndpointMatch(c, remoteEP)).ToList();
-            if (udpMatches.Count == 1)
-            {
-                conn = udpMatches[0];
-                reason = "registered-dll-endpoint";
-                return true;
-            }
-            if (udpMatches.Count > 1)
-            {
-                reason = "ambiguous-registered-dll-endpoint";
-                return false;
-            }
-
-            var tcpMatches = connections.Where(c => c != null && c.IsConnected && IsTcpAddressMatch(c, remoteEP)).ToList();
-            if (tcpMatches.Count == 1)
-            {
-                conn = tcpMatches[0];
-                reason = "tcp-address";
-                return true;
-            }
-            if (tcpMatches.Count > 1)
-            {
-                reason = "ambiguous-tcp-address";
-                return false;
-            }
-
-            reason = "no-endpoint-match";
-            return false;
-        }
-
-        private bool TryResolveDllSessionConnection(IPEndPoint remoteEP, uint sessionToken, out RRConnection conn, out string reason)
-        {
-            conn = null;
-            reason = "no-session";
-            var tokenMatches = SnapshotConnections()
-                .Where(c => c != null && c.IsConnected && c.DllSessionToken == sessionToken)
-                .ToList();
-
-            if (tokenMatches.Count == 0)
-            {
-                reason = "no-session-token-match";
-                return false;
-            }
-
-            var udpMatches = tokenMatches.Where(c => IsRegisteredDllEndpointMatch(c, remoteEP)).ToList();
-            if (udpMatches.Count == 1)
-            {
-                conn = udpMatches[0];
-                reason = "registered-dll-endpoint+session-token";
-                return true;
-            }
-            if (udpMatches.Count > 1)
-            {
-                reason = "ambiguous-registered-dll-endpoint+session-token";
-                return false;
-            }
-
-            var tcpMatches = tokenMatches.Where(c => IsTcpAddressMatch(c, remoteEP)).ToList();
-            if (tcpMatches.Count == 1)
-            {
-                conn = tcpMatches[0];
-                reason = "tcp-address+session-token";
-                return true;
-            }
-            if (tcpMatches.Count > 1)
-            {
-                reason = "ambiguous-tcp-address+session-token";
-                return false;
-            }
-
-            if (tokenMatches.Count == 1)
-            {
-                conn = tokenMatches[0];
-                reason = "unique-session-token";
-                return true;
-            }
-
-            reason = "ambiguous-session-token";
-            return false;
-        }
-
-        private List<RRConnection> SnapshotConnections()
-        {
-            lock (_connections)
-            {
-                return _connections.Values.ToList();
-            }
-        }
-
-        private bool IsRegisteredDllEndpointMatch(RRConnection conn, IPEndPoint remoteEP)
-        {
-            if (conn == null || remoteEP == null || string.IsNullOrWhiteSpace(conn.LoginName))
-                return false;
-            lock (_dllEndpoints)
-            {
-                return _dllEndpoints.TryGetValue(conn.LoginName, out IPEndPoint registered) &&
-                       SameEndpoint(registered, remoteEP);
-            }
-        }
-
-        private static bool SameEndpoint(IPEndPoint left, IPEndPoint right)
-        {
-            return left != null && right != null &&
-                   left.Port == right.Port &&
-                   left.Address.Equals(right.Address);
-        }
-
-        private static bool IsTcpAddressMatch(RRConnection conn, IPEndPoint remoteEP)
-        {
-            if (conn == null || remoteEP == null)
-                return false;
-            try
-            {
-                var tcpEP = conn.Client?.Client?.RemoteEndPoint as IPEndPoint;
-                return tcpEP != null && tcpEP.Address.Equals(remoteEP.Address);
-            }
-            catch
-            {
-                return false;
-            }
         }
 
         private bool IsNonUnitPlayerComponentId(RRConnection conn, uint entityId)
@@ -1335,7 +945,7 @@ namespace DungeonRunners.Networking
         {
             if (conn == null) return;
             PlayerState state = GetPlayerState(conn.ConnId.ToString());
-            Debug.LogError($"[PLAYER-HP-TRUTH] VISIBLE-EVENT player={conn.LoginName ?? conn.ConnId.ToString()} serverHP={(state != null ? state.CurrentHPWire / 256f : 0f):F2}/{(state != null ? state.MaxHPWire / 256f : 0f):F2} syncHP={(state != null ? state.SynchHP / 256f : 0f):F2} reason={reason ?? "native monster attack"}");
+            Debug.LogError($"[PLAYER-HP-TRUTH] VISIBLE-EVENT player={conn.LoginName ?? conn.ConnId.ToString()} serverHP={(state != null ? state.CurrentHPWire / 256f : 0f):F2}/{(state != null ? state.MaxHPWire / 256f : 0f):F2} entitySynchInfoHP={(state != null ? state.EntitySynchInfoHP / 256f : 0f):F2} reason={reason ?? "monster attack"}");
         }
 
         private void RecordPlayerHPKnown(RRConnection conn, string source, uint acceptedHPWire)
@@ -1344,7 +954,7 @@ namespace DungeonRunners.Networking
             PlayerState state = GetPlayerState(conn.ConnId.ToString());
             uint playerEntityId = conn.Avatar != null ? (uint)conn.Avatar.Id : 0;
             if (playerEntityId != 0 && state != null)
-                HpSyncService.Instance.RecordPlayerOutboundHP(conn, state, playerEntityId, acceptedHPWire, source ?? "unknown");
+                EntitySynchInfoAuthority.Instance.RecordPlayerOutboundHP(conn, state, playerEntityId, acceptedHPWire, source ?? "unknown");
             else
             {
                 conn.LastOutboundHPWire = acceptedHPWire;
@@ -1354,19 +964,19 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[PLAYER-HP-TRUTH] KNOWN source={source} player={conn.LoginName ?? conn.ConnId.ToString()} hp={acceptedHPWire / 256f:F2}");
         }
 
-        private void CommitPlayerHPTruth(RRConnection conn, PlayerState state, string source, uint hpWire, bool updateRuntimeHP, bool applyNativeDamageCooldown)
+        private void CommitPlayerHPTruth(RRConnection conn, PlayerState state, string source, uint hpWire, bool updateRuntimeHP, bool applyDamageCooldown)
         {
             if (conn == null || state == null) return;
             uint beforeCurrent = state.CurrentHPWire;
-            uint beforeSync = state.SynchHP;
+            uint beforeEntitySynchInfoHP = state.EntitySynchInfoHP;
             uint beforeMax = state.MaxHPWire;
             if (updateRuntimeHP)
-                state.SetCurrentHP(hpWire, applyNativeDamageCooldown);
+                state.SetCurrentHP(hpWire, applyDamageCooldown);
             uint playerEntityId = conn.Avatar != null ? (uint)conn.Avatar.Id : 0;
             if (playerEntityId != 0)
-                HpSyncService.Instance.RegisterPlayer(conn, state, playerEntityId);
-            RecordPlayerHPKnown(conn, source, state.SynchHP);
-            Debug.LogError($"[PLAYER-HP-TRUTH] COMMIT source={source} player={conn.LoginName ?? conn.ConnId.ToString()} currentHP={beforeCurrent}->{state.CurrentHPWire}/{state.MaxHPWire} syncHP={beforeSync}->{state.SynchHP} maxHP={beforeMax}->{state.MaxHPWire} runtimeUpdate={updateRuntimeHP}");
+                EntitySynchInfoAuthority.Instance.RegisterPlayer(conn, state, playerEntityId);
+            RecordPlayerHPKnown(conn, source, state.EntitySynchInfoHP);
+            Debug.LogError($"[PLAYER-HP-TRUTH] COMMIT source={source} player={conn.LoginName ?? conn.ConnId.ToString()} currentHP={beforeCurrent}->{state.CurrentHPWire}/{state.MaxHPWire} entitySynchInfoHP={beforeEntitySynchInfoHP}->{state.EntitySynchInfoHP} maxHP={beforeMax}->{state.MaxHPWire} runtimeUpdate={updateRuntimeHP}");
         }
 
         private static bool IsWithinHPWireTolerance(uint a, uint b, uint tolerance)
@@ -1374,164 +984,33 @@ namespace DungeonRunners.Networking
             return a >= b ? a - b <= tolerance : b - a <= tolerance;
         }
 
-        private bool CanSendPlayerSynchronizedHP(RRConnection conn, string packetName)
+        private bool CanSendPlayerEntitySynchInfoHP(RRConnection conn, string packetName)
         {
             if (conn == null) return false;
             RefreshZoneSpawnInvulnerability(conn);
             PlayerState state = GetPlayerState(conn.ConnId.ToString());
             if (state == null) return false;
             uint playerEntityId = conn.Avatar != null ? (uint)conn.Avatar.Id : 0;
-            GetNativeValidationCutoff(out _, out float validationCutoffTime);
-            bool canAdvanceClientSync = CanAdvancePlayerClientSyncHP(playerEntityId);
+            GetValidationCutoff(out _, out float validationCutoffTime);
+            bool canAdvanceEntitySynchInfo = CanAdvancePlayerEntitySynchInfoHP(playerEntityId);
             if (playerEntityId != 0 && !IsZoneSpawnInvulnerabilityBlockingCombat(conn))
             {
-                SyncContext context = SyncContextFromTag(packetName);
+                EntitySynchInfoContext context = EntitySynchInfoContextFromTag(packetName);
                 if (CanApplyPlayerHPBeforeSuffix(context, packetName))
                 {
-                    CombatManager.Instance.UpdatePlayerPosition(playerEntityId, conn.PlayerPosX, conn.PlayerPosY);
+                    CombatRuntime.Instance.UpdatePlayerPosition(playerEntityId, conn.PlayerPosX, conn.PlayerPosY);
                     FlushPendingKills();
-                    FlushWeaponCycleBeforeSynch(conn, $"CanSendPlayerSynchronizedHP:{packetName}", true, validationCutoffTime);
-                    CombatManager.Instance.FlushPlayerCombatBeforeSync(playerEntityId, 0f, $"CanSendPlayerSynchronizedHP:{packetName}", validationCutoffTime);
-                    if (!CombatManager.Instance.FlushPlayerHPRuntimeBeforeSync(playerEntityId, packetName, out uint runtimeHPWire, out bool unsafeAttack, validationCutoffTime))
+                    FlushWeaponUseStateBeforeSynch(conn, $"CanSendPlayerEntitySynchInfoHP:{packetName}", true, validationCutoffTime);
+                    CombatRuntime.Instance.FlushPlayerCombatBeforeSynch(playerEntityId, 0f, $"CanSendPlayerEntitySynchInfoHP:{packetName}", validationCutoffTime);
+                    if (!CombatRuntime.Instance.FlushPlayerHPRuntimeBeforeSynch(playerEntityId, packetName, out uint runtimeHPWire, out bool unsafeAttack, validationCutoffTime))
                     {
-                        Debug.LogError($"[{packetName}] player HP runtime flush incomplete for {conn.LoginName ?? conn.ConnId.ToString()}: serverHP={state.CurrentHPWire / 256f:F2}/{state.MaxHPWire / 256f:F2} syncHP={state.SynchHP / 256f:F2} runtimeHP={runtimeHPWire / 256f:F2} unsafeAttack={unsafeAttack}");
+                        Debug.LogError($"[{packetName}] player HP runtime flush incomplete for {conn.LoginName ?? conn.ConnId.ToString()}: serverHP={state.CurrentHPWire / 256f:F2}/{state.MaxHPWire / 256f:F2} entitySynchInfoHP={state.EntitySynchInfoHP / 256f:F2} runtimeHP={runtimeHPWire / 256f:F2} unsafeAttack={unsafeAttack}");
                     }
                 }
             }
-            if (canAdvanceClientSync)
-                state.AdvanceClientSyncHP(validationCutoffTime, packetName);
+            if (canAdvanceEntitySynchInfo)
+                state.AdvanceEntitySynchInfoHP(validationCutoffTime, packetName, clientDriven: true);
             return true;
-        }
-
-        private bool TryFindPlayerComponentUpdate(RRConnection conn, byte[] innerData, out ushort componentId, out byte subtype)
-        {
-            return TryFindPlayerComponentUpdate(conn, innerData, out componentId, out subtype, out _);
-        }
-
-        private bool TryFindPlayerComponentUpdate(RRConnection conn, byte[] innerData, out ushort componentId, out byte subtype, out int componentOffset)
-        {
-            componentId = 0;
-            subtype = 0;
-            componentOffset = -1;
-            if (conn == null || innerData == null) return false;
-            for (int i = 0; i + 2 < innerData.Length; i++)
-            {
-                if (innerData[i] != 0x35 && innerData[i] != 0x36) continue;
-                if (innerData[i] == 0x35 && i + 3 >= innerData.Length) continue;
-                if (innerData[i] == 0x36 && i + 2 >= innerData.Length) continue;
-                ushort cid = (ushort)(innerData[i + 1] | (innerData[i + 2] << 8));
-                if (!IsAvatarHPSyncComponentId(conn, cid) && !IsNonUnitPlayerComponentId(conn, cid)) continue;
-                componentId = cid;
-                subtype = innerData[i] == 0x35 ? innerData[i + 3] : (byte)0;
-                componentOffset = i;
-                return true;
-            }
-            return false;
-        }
-
-        private bool TryFindMonsterComponentUpdate(byte[] innerData, out Monster monster, out ushort componentId, out byte subtype)
-        {
-            return TryFindMonsterComponentUpdate(innerData, out monster, out componentId, out subtype, out _);
-        }
-
-        private bool TryFindMonsterComponentUpdate(byte[] innerData, out Monster monster, out ushort componentId, out byte subtype, out int componentOffset)
-        {
-            monster = null;
-            componentId = 0;
-            subtype = 0;
-            componentOffset = -1;
-            if (innerData == null || CombatManager.Instance == null) return false;
-            for (int i = 0; i + 2 < innerData.Length; i++)
-            {
-                byte opcode = innerData[i];
-                if (opcode != 0x35 && opcode != 0x36) continue;
-                if (opcode == 0x35 && i + 3 >= innerData.Length) continue;
-                ushort cid = (ushort)(innerData[i + 1] | (innerData[i + 2] << 8));
-                Monster candidate = ResolveMonsterForComponent(cid, 0);
-                if (candidate == null) continue;
-                monster = candidate;
-                componentId = cid;
-                subtype = opcode == 0x35 ? innerData[i + 3] : (byte)0;
-                componentOffset = i;
-                return true;
-            }
-            return false;
-        }
-
-        private static bool TryGetNativeComponentPayloadEnd(byte[] innerData, int componentOffset, byte subtype, out int payloadEnd)
-        {
-            payloadEnd = -1;
-            if (innerData == null || componentOffset < 0 || componentOffset + 4 > innerData.Length || innerData[componentOffset] != 0x35)
-                return false;
-
-            int payloadStart = componentOffset + 4;
-            switch (subtype)
-            {
-                case 0x64:
-                    payloadEnd = payloadStart + 1;
-                    return payloadEnd <= innerData.Length;
-                case 0x65:
-                    if (payloadStart + 2 > innerData.Length) return false;
-                    int moveCount = innerData[payloadStart + 1];
-                    long end = (long)payloadStart + 2L + moveCount * 13L;
-                    if (end > int.MaxValue) return false;
-                    payloadEnd = (int)end;
-                    return payloadEnd <= innerData.Length;
-                default:
-                    return false;
-            }
-        }
-
-        private bool TryReadTrailingEntitySynchHP(byte[] innerData, int componentOffset, byte subtype, out uint hpWire)
-        {
-            hpWire = 0;
-            if (innerData == null || innerData.Length < 6) return false;
-            int terminator = FindCH07Terminator(innerData);
-            if (terminator <= 0) return false;
-            int flagsOffset = -1;
-            if (TryGetNativeComponentPayloadEnd(innerData, componentOffset, subtype, out int payloadEnd) && payloadEnd <= terminator)
-                flagsOffset = payloadEnd;
-            else if (terminator >= 5)
-                flagsOffset = terminator - 5;
-            if (flagsOffset < 0 || flagsOffset >= terminator) return false;
-            if ((innerData[flagsOffset] & 0x02) == 0) return false;
-            if (flagsOffset + 5 > terminator) return false;
-            hpWire = (uint)(innerData[flagsOffset + 1]
-                | (innerData[flagsOffset + 2] << 8)
-                | (innerData[flagsOffset + 3] << 16)
-                | (innerData[flagsOffset + 4] << 24));
-            return true;
-        }
-
-        private bool TryReadTrailingEntitySynchHP(byte[] innerData, out uint hpWire)
-        {
-            hpWire = 0;
-            if (innerData == null || innerData.Length < 6) return false;
-            int terminator = FindCH07Terminator(innerData);
-            if (terminator < 5) return false;
-            int flagsOffset = terminator - 5;
-            if ((innerData[flagsOffset] & 0x02) == 0) return false;
-            hpWire = (uint)(innerData[flagsOffset + 1]
-                | (innerData[flagsOffset + 2] << 8)
-                | (innerData[flagsOffset + 3] << 16)
-                | (innerData[flagsOffset + 4] << 24));
-            return true;
-        }
-
-        private bool TryNormalizeCH07RuntimeStream(RRConnection conn, byte[] innerData, SyncContext context, string packetName, out byte[] normalizedData, out bool drop)
-        {
-            normalizedData = innerData;
-            drop = false;
-            return false;
-        }
-
-        private static int FindCH07Terminator(byte[] innerData)
-        {
-            if (innerData == null || innerData.Length == 0) return -1;
-            int i = innerData.Length - 1;
-            while (i > 0 && innerData[i] == 0x00)
-                i--;
-            return innerData[i] == 0x06 ? i : -1;
         }
 
         private bool ObserveClientPlayerHP(RRConnection conn, uint clientHP, string source)
@@ -1541,7 +1020,7 @@ namespace DungeonRunners.Networking
             if (state == null) return false;
             uint playerEntityId = conn.Avatar != null ? (uint)conn.Avatar.Id : 0;
             if (playerEntityId != 0)
-                HpSyncService.Instance.RegisterPlayer(conn, state, playerEntityId);
+                EntitySynchInfoAuthority.Instance.RegisterPlayer(conn, state, playerEntityId);
 
             uint tolerance = 5u * 256u;
             if (clientHP > state.MaxHPWire + tolerance)
@@ -1550,17 +1029,14 @@ namespace DungeonRunners.Networking
                 return false;
             }
 
-            uint oldHP = state.SynchHP;
-            HpReportDecision hpDecision = HpReportDecision.AcceptObserved("legacy");
-            bool hpServiceAccepted = false;
-            if (playerEntityId != 0 && HpSyncService.Instance.TryResolvePlayerOwner(conn, state, playerEntityId, out HpOwnerRef owner))
+            uint oldHP = state.EntitySynchInfoHP;
+            EntitySynchInfoReportDecision hpDecision = EntitySynchInfoReportDecision.AcceptObserved("legacy");
+            bool entitySynchAccepted = false;
+            if (playerEntityId != 0 && EntitySynchInfoAuthority.Instance.TryResolvePlayerOwner(conn, state, playerEntityId, out EntitySynchInfoOwnerRef owner))
             {
-                hpServiceAccepted = HpSyncService.Instance.ObserveClientHpReport(owner, clientHP, HpSyncService.ClassifyReportSource(source), source ?? "client-player-hp", true, out hpDecision);
-                if (!hpServiceAccepted)
-                {
-                    Debug.LogError($"[{source}] Client player HP rejected by HpSyncService: hp={clientHP / 256f:F2}/{state.MaxHPWire / 256f:F2} reason={hpDecision.Reason}");
-                    return false;
-                }
+                entitySynchAccepted = EntitySynchInfoAuthority.Instance.ObserveClientHpReport(owner, clientHP, EntitySynchInfoAuthority.ClassifyReportSource(source), source ?? "client-player-hp", true, out hpDecision);
+                if (!entitySynchAccepted)
+                    Debug.LogError($"[{source}] Client player HP rejected by EntitySynchInfoAuthority: hp={clientHP / 256f:F2}/{state.MaxHPWire / 256f:F2} reason={hpDecision.Reason}");
             }
             uint observedClientHP = Math.Min(clientHP, state.MaxHPWire);
             state.ObserveClientHP(observedClientHP, source);
@@ -1568,9 +1044,9 @@ namespace DungeonRunners.Networking
             conn.LastObservedClientHPTime = state.LastObservedClientHPTime;
             conn.LastObservedClientHPSource = state.LastObservedClientHPSource;
             if (playerEntityId != 0)
-                HpSyncService.Instance.RegisterPlayer(conn, state, playerEntityId);
-            if (!hpServiceAccepted)
-                RecordPlayerHPKnown(conn, source, state.SynchHP);
+                EntitySynchInfoAuthority.Instance.RegisterPlayer(conn, state, playerEntityId);
+            if (!entitySynchAccepted)
+                RecordPlayerHPKnown(conn, source, state.EntitySynchInfoHP);
             if (observedClientHP < oldHP)
                 Debug.LogError($"[{source}] CLIENT PLAYER HP lower observed: {(oldHP - observedClientHP) / 256f:F2} HP ({oldHP}->{observedClientHP}) serverHP={state.CurrentHPWire}");
             else if (observedClientHP > oldHP)
@@ -1580,56 +1056,56 @@ namespace DungeonRunners.Networking
             return true;
         }
 
-        private bool TryConsumeClientSyncSuffix(RRConnection conn, LEReader reader, string source)
+        private bool TryConsumeClientEntitySynchInfoSuffix(RRConnection conn, LEReader reader, string source)
         {
-            return TryConsumeClientSyncSuffix(conn, reader, source, null);
+            return TryConsumeClientEntitySynchInfoSuffix(conn, reader, source, null);
         }
 
-        private bool TryConsumeClientSyncSuffix(RRConnection conn, LEReader reader, string source, Monster targetMonster)
+        private bool TryConsumeClientEntitySynchInfoSuffix(RRConnection conn, LEReader reader, string source, Monster targetMonster)
         {
-            return TryConsumeClientSyncSuffix(conn, reader, source, targetMonster, out _);
+            return TryConsumeClientEntitySynchInfoSuffix(conn, reader, source, targetMonster, out _);
         }
 
-        private bool TryConsumeClientSyncSuffix(RRConnection conn, LEReader reader, string source, Monster targetMonster, out bool acceptedMonsterHP)
+        private bool TryConsumeClientEntitySynchInfoSuffix(RRConnection conn, LEReader reader, string source, Monster targetMonster, out bool acceptedMonsterHP)
         {
             acceptedMonsterHP = false;
             if (reader == null || reader.Remaining < 1) return false;
 
-            byte syncFlags = reader.ReadByte();
-            if ((syncFlags & 0x02) == 0)
+            byte entitySynchInfoFlags = reader.ReadByte();
+            if ((entitySynchInfoFlags & 0x02) == 0)
             {
-                Debug.LogError($"[{source}] syncFlags=0x{syncFlags:X2} (no HP)");
+                Debug.LogError($"[{source}] entitySynchInfoFlags=0x{entitySynchInfoFlags:X2} (no HP)");
                 return false;
             }
 
             if (reader.Remaining < 4)
             {
-                Debug.LogError($"[{source}] syncFlags=0x{syncFlags:X2} but HP missing remaining={reader.Remaining}");
+                Debug.LogError($"[{source}] entitySynchInfoFlags=0x{entitySynchInfoFlags:X2} but HP missing remaining={reader.Remaining}");
                 return false;
             }
 
-            uint syncHP = reader.ReadUInt32();
-            Debug.LogError($"[{source}] syncFlags=0x{syncFlags:X2} HP={syncHP} ({syncHP / 256} actual)");
-            if (ObserveClientMonsterHPFromActionSuffix(conn, targetMonster, syncHP, source))
+            uint entitySynchInfoHP = reader.ReadUInt32();
+            Debug.LogError($"[{source}] entitySynchInfoFlags=0x{entitySynchInfoFlags:X2} HP={entitySynchInfoHP} ({entitySynchInfoHP / 256} actual)");
+            if (ObserveClientMonsterHPFromActionSuffix(conn, targetMonster, entitySynchInfoHP, source))
             {
                 acceptedMonsterHP = true;
                 return true;
             }
-            if (targetMonster != null && CombatManager.Instance != null && FitsMonsterHP(targetMonster, syncHP))
+            if (targetMonster != null && CombatRuntime.Instance != null && FitsMonsterHP(targetMonster, entitySynchInfoHP))
             {
-                CombatManager.Instance.RecordMonsterHPObservation(targetMonster, syncHP, source);
+                CombatRuntime.Instance.RecordMonsterHPObservation(targetMonster, entitySynchInfoHP, source);
                 acceptedMonsterHP = true;
                 return true;
             }
-            return ObserveClientPlayerHP(conn, syncHP, source);
+            return ObserveClientPlayerHP(conn, entitySynchInfoHP, source);
         }
 
-        private bool ObserveClientMonsterHPFromActionSuffix(RRConnection conn, Monster targetMonster, uint syncHP, string source)
+        private bool ObserveClientMonsterHPFromActionSuffix(RRConnection conn, Monster targetMonster, uint entitySynchInfoHP, string source)
         {
-            if (targetMonster == null || CombatManager.Instance == null) return false;
-            if (string.IsNullOrEmpty(source) || !source.StartsWith("ACTION-0x50-SYNC", StringComparison.Ordinal)) return false;
-            if (!FitsMonsterHP(targetMonster, syncHP)) return false;
-            CombatManager.Instance.RecordMonsterHPObservation(targetMonster, syncHP, source);
+            if (targetMonster == null || CombatRuntime.Instance == null) return false;
+            if (string.IsNullOrEmpty(source) || !source.StartsWith("ACTION-0x50-ENTITY-SYNCH-INFO", StringComparison.Ordinal)) return false;
+            if (!FitsMonsterHP(targetMonster, entitySynchInfoHP)) return false;
+            CombatRuntime.Instance.RecordMonsterHPObservation(targetMonster, entitySynchInfoHP, source);
             return true;
         }
 
@@ -1652,11 +1128,11 @@ namespace DungeonRunners.Networking
 
             if (combatDamage > 0)
             {
-                foreach (var m in CombatManager.Instance.GetActiveMonsters())
+                foreach (var m in CombatRuntime.Instance.GetActiveMonsters())
                 {
                     if (m.State == MonsterState.Combat && m.IsAlive)
                     {
-                        Debug.LogError($"[COMBAT-TICK] CLIENT_DMG={combatDamage} on {m.Name} (target ambiguous; waiting for HP sync) SERVER_HP={CombatManager.Instance.PeekMonsterCurrentHPWire(m) / 256}");
+                        Debug.LogError($"[COMBAT-TICK] CLIENT_DMG={combatDamage} on {m.Name} (target ambiguous; waiting for EntitySynchInfo HP) SERVER_HP={CombatRuntime.Instance.PeekMonsterCurrentHPWire(m) / 256}");
                         break;
                     }
                 }
@@ -1671,12 +1147,12 @@ namespace DungeonRunners.Networking
             ushort aggroEntityId = reader.ReadUInt16();
             byte aggroLevel = reader.ReadByte();
             Debug.LogError($"[AGGRO] 0x09: entityId={aggroEntityId} level={aggroLevel}");
-            var monster = CombatManager.Instance.GetMonster(aggroEntityId)
-                       ?? CombatManager.Instance.GetMonsterByComponent(aggroEntityId);
+            var monster = CombatRuntime.Instance.GetMonster(aggroEntityId)
+                       ?? CombatRuntime.Instance.GetMonsterByComponent(aggroEntityId);
             if (monster != null && conn?.Avatar != null)
             {
                 uint playerEntityId = (uint)conn.Avatar.Id;
-                CombatManager.Instance.EngageMonsterFromClientAction(monster, playerEntityId);
+                CombatRuntime.Instance.EngageMonsterFromClientAction(monster, playerEntityId);
             }
         }
 
@@ -1695,14 +1171,14 @@ namespace DungeonRunners.Networking
                 uint hp = reader.ReadUInt32();
                 Debug.LogError($"[SEND-UPDATE] HP: entity={entityId} HP={hp} ({hp / 256} actual)");
 
-                var monster = CombatManager.Instance.GetMonster(entityId)
-                             ?? CombatManager.Instance.GetMonsterByComponent(entityId);
+                var monster = CombatRuntime.Instance.GetMonster(entityId)
+                             ?? CombatRuntime.Instance.GetMonsterByComponent(entityId);
                 if (monster != null)
                 {
-                    int serverActual = (int)(CombatManager.Instance.PeekMonsterCurrentHPWire(monster) / 256);
+                    int serverActual = (int)(CombatRuntime.Instance.PeekMonsterCurrentHPWire(monster) / 256);
                     int clientActual = (int)(hp / 256);
                     Debug.LogError($"[SEND-UPDATE] Monster {monster.Name} SERVER_HP={serverActual} CLIENT_HP={clientActual} DELTA={serverActual - clientActual}");
-                    CombatManager.Instance.ObserveClientMonsterHP(monster, hp, "SEND-UPDATE-0x03");
+                    CombatRuntime.Instance.ObserveClientMonsterHP(monster, hp, "SEND-UPDATE-0x03");
                 }
                 else if (IsAvatarOrAvatarComponentId(conn, entityId))
                 {
@@ -1729,7 +1205,6 @@ namespace DungeonRunners.Networking
             ushort target = 0;
             uint stateValue = 0;
 
-            // Binary-verified flag format from StateMachine::ReadMessage @ 0x5F0C70
             if ((stateFlags & 0x02) != 0 && reader.Remaining >= 2)
                 stateType = reader.ReadUInt16();
             if ((stateFlags & 0x04) != 0 && reader.Remaining >= 2)
@@ -1768,89 +1243,72 @@ namespace DungeonRunners.Networking
             HandleComponentUpdate(conn, reader);
         }
 
-        // ═══════════════════════════════════════════════════════════════════════════════
-        // MISSING OPCODE LOGGER — Captures full payload for wire format analysis
-        // These opcodes are sent by the client but had no server handler.
-        // Once wire formats are decoded from captured payloads, replace with real handlers.
-        // ═══════════════════════════════════════════════════════════════════════════════
 
         private void LogMissingOpcode(byte opcode, string name, byte[] data, RRConnection conn = null)
         {
             if (!VerbosePacketLogging) return;
             int len = data?.Length ?? 0;
             string hex = len > 0 ? BitConverter.ToString(data, 0, Math.Min(len, 256)) : "(empty)";
-            Debug.LogError($"[DIAG-0x{opcode:X2}] ══════════════════════════════════════════════════════");
+            Debug.LogError($"[DETAIL-0x{opcode:X2}] ");
             string playerPos = conn != null ? $"player=({conn.PlayerPosX:F1},{conn.PlayerPosY:F1})" : "player=?";
-            Debug.LogError($"[DIAG-0x{opcode:X2}] {name} len={len} {playerPos} raw={hex}");
+            Debug.LogError($"[DETAIL-0x{opcode:X2}] {name} len={len} {playerPos} raw={hex}");
 
             if (data == null || len < 2) return;
 
-            // Try every uint16 as potential entity/component ID
             var sb = new System.Text.StringBuilder();
-            sb.Append($"[DIAG-0x{opcode:X2}] uint16 scan: ");
-            for (int i = 0; i <= len - 2; i += 2)
+            sb.Append($"[DETAIL-0x{opcode:X2}] uint16 scan: ");
+            for (int byteOffset = 0; byteOffset <= len - 2; byteOffset += 2)
             {
-                ushort val = (ushort)(data[i] | (data[i + 1] << 8));
+                ushort value = (ushort)(data[byteOffset] | (data[byteOffset + 1] << 8));
                 string tag = "";
-                if (val >= 50000 && val < 60000)
+                if (value >= 50000 && value < 60000)
                 {
-                    var mon = CombatManager.Instance.GetMonsterByComponent(val);
-                    tag = mon != null ? $"=MON:{mon.Name}" : "=MON_RANGE";
+                    var monster = CombatRuntime.Instance.GetMonsterByComponent(value);
+                    tag = monster != null ? $"=MON:{monster.Name}" : "=MON_RANGE";
                 }
-                sb.Append($"[{i}]=0x{val:X4}({val}){tag} ");
+                sb.Append($"[{byteOffset}]=0x{value:X4}({value}){tag} ");
             }
             Debug.LogError(sb.ToString());
 
-            // Try every uint32 as potential fixed-point coordinate (÷256)
             if (len >= 4)
             {
                 var sb2 = new System.Text.StringBuilder();
-                sb2.Append($"[DIAG-0x{opcode:X2}] int32/coord scan: ");
-                for (int i = 0; i <= len - 4; i += 4)
+                sb2.Append($"[DETAIL-0x{opcode:X2}] int32/coord scan: ");
+                for (int byteOffset = 0; byteOffset <= len - 4; byteOffset += 4)
                 {
-                    int val = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24);
-                    float coord = val / 256f;
+                    int value = data[byteOffset] | (data[byteOffset + 1] << 8) | (data[byteOffset + 2] << 16) | (data[byteOffset + 3] << 24);
+                    float coord = value / 256f;
                     string tag = (coord > -500 && coord < 1000 && coord != 0) ? " <COORD?>" : "";
-                    sb2.Append($"[{i}]={val}({coord:F1}){tag} ");
+                    sb2.Append($"[{byteOffset}]={value}({coord:F1}){tag} ");
                 }
                 Debug.LogError(sb2.ToString());
             }
 
-            // Try as: entityId(2) + subType(1) + payload
             if (len >= 3)
             {
                 ushort eid = (ushort)(data[0] | (data[1] << 8));
                 byte sub = data[2];
-                var mon = CombatManager.Instance.GetMonsterByComponent(eid);
-                string monTag = mon != null ? $" MONSTER={mon.Name}(pos={mon.PosX:F1},{mon.PosY:F1})" : "";
-                Debug.LogError($"[DIAG-0x{opcode:X2}] as [eid={eid}(0x{eid:X4}) sub=0x{sub:X2}]{monTag} remain={len - 3}b");
+                var monster = CombatRuntime.Instance.GetMonsterByComponent(eid);
+                string monTag = monster != null ? $" MONSTER={monster.Name}(pos={monster.PosX:F1},{monster.PosY:F1})" : "";
+                Debug.LogError($"[DETAIL-0x{opcode:X2}] as [eid={eid}(0x{eid:X4}) sub=0x{sub:X2}]{monTag} remain={len - 3}b");
             }
 
-            // Try as: componentId(2) + data
             if (len >= 5)
             {
                 ushort cid = (ushort)(data[0] | (data[1] << 8));
-                var mon = CombatManager.Instance.GetMonsterByComponent(cid);
-                if (mon != null)
+                var monster = CombatRuntime.Instance.GetMonsterByComponent(cid);
+                if (monster != null)
                 {
-                    Debug.LogError($"[DIAG-0x{opcode:X2}] *** MONSTER CID HIT *** cid={cid} -> {mon.Name} EntityId={mon.EntityId} BehaviorId={mon.BehaviorId}");
+                    Debug.LogError($"[DETAIL-0x{opcode:X2}] monsterCidHit cid={cid} name={monster.Name} entity={monster.EntityId} behavior={monster.BehaviorId}");
                 }
             }
 
-            Debug.LogError($"[DIAG-0x{opcode:X2}] ══════════════════════════════════════════════════════");
+            Debug.LogError($"[DETAIL-0x{opcode:X2}] ");
         }
 
 
 
 
-        // ═══════════════════════════════════════════════════════════════════════════════
-        // CENTRALIZED KILL HANDLER — ALL monster death events route through here.
-        // This prevents double-XP, double-quest-credit, and level desync bugs.
-        //
-        // Session 24+: TryFinalizeMonsterKill is the single entry point.
-        // HashSet _finalizedMonsterKills prevents any double processing.
-        // Multiple paths may detect HP=0 (0x36, 0x03, 0x65, server damage) — first wins.
-        // ═══════════════════════════════════════════════════════════════════════════════
         private static int _serverKillCount = 0;
     }
 }

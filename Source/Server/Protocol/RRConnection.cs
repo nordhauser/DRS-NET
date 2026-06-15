@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net.Sockets;
 using DungeonRunners.Engine;
 using DungeonRunners.Data;
@@ -22,6 +22,9 @@ namespace DungeonRunners.Networking
         public float PlayerPosX { get; set; } = 480.0f;
         public float PlayerPosY { get; set; } = -191.0f;
         public float PlayerHeading { get; set; } = 0.0f;
+        public readonly System.Collections.Generic.Queue<(float X, float Y)> AvatarAggroSampleQueue = new System.Collections.Generic.Queue<(float, float)>();
+        public float AggroSamplePosX { get; set; } = 480.0f;
+        public float AggroSamplePosY { get; set; } = -191.0f;
         public byte SessionID { get; set; } = 0;
         public uint UnitBehaviorId { get; set; }
         public float LastPositionUpdateTime { get; set; } = 0f;
@@ -29,7 +32,12 @@ namespace DungeonRunners.Networking
         public byte PendingLocalMoveCount { get; set; } = 0;
         public byte[] PendingLocalMoveData { get; set; } = Array.Empty<byte>();
         public float PendingLocalMoveFlushAt { get; set; } = 0f;
-        public int LastCombatSyncFlushFrame { get; set; } = -1;
+        public string PendingLocalMoveInstanceKey { get; set; } = "";
+        public bool HasLastRelayPos { get; set; } = false;
+        public float LastRelayPosX { get; set; } = 0f;
+        public float LastRelayPosY { get; set; } = 0f;
+        public byte LastRawMoveCount { get; set; } = 0;
+        public byte[] LastRawMoveData { get; set; } = null;
         public float IgnoreClientHPUntilTime { get; set; } = 0f;
         public uint LastOutboundHPWire { get; set; } = 0;
         public float LastOutboundHPTime { get; set; } = 0f;
@@ -47,7 +55,7 @@ namespace DungeonRunners.Networking
         public bool ActiveUseTargetVisibleHit { get; set; } = false;
         public float ActiveUseTargetInitUseRange { get; set; } = 0f;
         public float ActiveUseTargetInitUseDistance { get; set; } = 0f;
-        public float ActiveUseTargetClientSyncTolerance { get; set; } = 0f;
+        public float ActiveUseTargetClientTolerance { get; set; } = 0f;
         public long ActiveUseTargetLastProjectileSeq { get; set; } = 0;
         public int ActiveUseTargetLastImpactTick { get; set; } = -1;
         public int LastAvatarPreSuffixActionSliceFrame { get; set; } = -1;
@@ -97,10 +105,9 @@ namespace DungeonRunners.Networking
         public float PendingSpawnZ;
         public string PendingSpawnPoint { get; set; } = "";
 
-        // ═══ MULTIPLAYER ═══
-        public string CurrentZoneName { get; set; } = "";  // Exact zone name (e.g. "dungeon00_level01")
-        public uint InstanceId { get; set; } = 0;          // Binary: ZoneClient::GotoInstance(int) — group-based instance
-        public string RuntimeInstanceKey { get; set; } = ""; // Stamped combat/RNG runtime key for the current zone instance
+        public string CurrentZoneName { get; set; } = "";
+        public uint InstanceId { get; set; } = 0;
+        public string RuntimeInstanceKey { get; set; } = "";
         public string AvatarGcType { get; set; } = "";
         public string ClassName { get; set; } = "Fighter";
         public ushort SkillsComponentId { get; set; } = 0;
@@ -108,8 +115,8 @@ namespace DungeonRunners.Networking
         public ushort ModifiersComponentId { get; set; } = 0;
         public ushort BehaviorComponentId { get; set; } = 0;
         public int PlayerLevel { get; set; } = 1;
-        public uint CharSqlId { get; set; } = 0;  // Database character ID — set at character select
-        public bool GroupConnectedSent { get; set; } = false;  // True once processConnected(0x30) sent — never resend
+        public uint CharSqlId { get; set; } = 0;
+        public bool GroupConnectedSent { get; set; } = false;
         public float PlayerPosZ { get; set; } = 0f;
         public bool HasLivePlayerPosition { get; set; } = false;
         public float LivePlayerPosX { get; set; } = 0f;
@@ -118,23 +125,29 @@ namespace DungeonRunners.Networking
         public float LivePlayerHeading { get; set; } = 0f;
         public float LivePlayerPositionTime { get; set; } = 0f;
         public bool IsSpawned { get; set; } = false;
-        public bool NativeFullHPOnNextSpawn { get; set; } = false;
-        public bool AllowFlush { get; set; } = false; // Per-connection flush gate — false during zone transitions
+        public bool UseTargetApproachActive { get; set; } = false;
+        public float UseTargetApproachX { get; set; } = 0f;
+        public float UseTargetApproachY { get; set; } = 0f;
+        public int UseTargetApproachFollowConnId { get; set; } = 0;
+        public string UseTargetApproachInstanceKey { get; set; } = "";
+        public byte UseTargetApproachSampleCount { get; set; } = 0;
+        public byte[] UseTargetApproachSampleData { get; } = new byte[39];
+        public byte UseTargetApproachDelayTicks { get; set; } = 0;
+        public float UseTargetApproachStartTime { get; set; } = 0f;
+        public bool FullHPBaselineOnNextSpawn { get; set; } = false;
+        public bool RespawnFullHPPending { get; set; } = false;
+        public bool AllowFlush { get; set; } = false;
 
-        // ═══ TOWN PORTAL ═══
         public bool HasSavedTownPortal { get; set; } = false;
-        public string TownPortalZoneName { get; set; } = "";   // zone where portal was created
-        public string TownPortalTargetZone { get; set; } = ""; // zone the portal sends you to
+        public string TownPortalZoneName { get; set; } = "";
+        public string TownPortalTargetZone { get; set; } = "";
         public uint TownPortalZoneId { get; set; } = 0;
         public float TownPortalPosX { get; set; }
         public float TownPortalPosY { get; set; }
         public float TownPortalPosZ { get; set; }
 
-        // ═══ ZONE PORTAL ═══
         public string ZonePortalSource { get; set; } = "";
-
-        // ═══ DLL SECURITY ═══
-        public uint DllSessionToken { get; set; } = 0;
+        public int ObeliskClickIndex { get; set; } = 0;
 
         public RRConnection(int connId, TcpClient client, NetworkStream stream)
         {
@@ -158,7 +171,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[RRConnection] Error during disconnect: {ex.Message}");
+                Debug.LogWarning($"[RR-CONNECTION] disconnect state=error message='{ex.Message}'");
             }
         }
     }

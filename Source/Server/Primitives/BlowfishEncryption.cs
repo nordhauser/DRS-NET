@@ -5,9 +5,6 @@ using Org.BouncyCastle.Crypto.Parameters;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Handles Blowfish encryption/decryption for auth packets
-    /// </summary>
     public class BlowfishEncryption
     {
         private readonly BlowfishEngine _engine;
@@ -18,7 +15,6 @@ namespace DungeonRunners.Utilities
             if (string.IsNullOrEmpty(key))
                 throw new ArgumentNullException(nameof(key));
 
-            // Add null terminator if not present
             if (!key.EndsWith("\0"))
                 key += "\0";
 
@@ -32,7 +28,6 @@ namespace DungeonRunners.Utilities
             if (data == null || data.Length == 0)
                 return data;
 
-            // Pad to 8-byte blocks
             int paddedLength = ((data.Length + 7) / 8) * 8;
             byte[] padded = new byte[paddedLength];
             Array.Copy(data, padded, data.Length);
@@ -40,9 +35,9 @@ namespace DungeonRunners.Utilities
             byte[] output = new byte[paddedLength];
             _engine.Init(true, _keyParam);
 
-            for (int i = 0; i < paddedLength; i += 8)
+            for (int blockOffset = 0; blockOffset < paddedLength; blockOffset += 8)
             {
-                _engine.ProcessBlock(padded, i, output, i);
+                _engine.ProcessBlock(padded, blockOffset, output, blockOffset);
             }
 
             return output;
@@ -56,9 +51,9 @@ namespace DungeonRunners.Utilities
             byte[] output = new byte[data.Length];
             _engine.Init(false, _keyParam);
 
-            for (int i = 0; i < data.Length; i += 8)
+            for (int blockOffset = 0; blockOffset < data.Length; blockOffset += 8)
             {
-                _engine.ProcessBlock(data, i, output, i);
+                _engine.ProcessBlock(data, blockOffset, output, blockOffset);
             }
 
             return output;

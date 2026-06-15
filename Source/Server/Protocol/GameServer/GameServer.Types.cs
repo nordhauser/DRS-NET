@@ -15,17 +15,17 @@ using System.Runtime.CompilerServices;
 using Org.BouncyCastle.Utilities;
 using Org.BouncyCastle.Crypto.Engines;
 using Org.BouncyCastle.Crypto.Parameters;
-using DungeonRunners.Managers;
+using DungeonRunners.Gameplay;
 using DungeonRunners.Database;
 using DungeonRunners.Engine.Playables;
 using System.Security.Cryptography;
 using DungeonRunners.Combat;
-using DungeonRunners.Networking.Sync;
+using DungeonRunners.Networking.EntitySynchInfo;
 
 namespace DungeonRunners.Networking
 {
     public partial class GameServer
-    {  // Don't flush until spawn complete
+    {
 
         private enum EntitySynchInfoOwner
         {
@@ -45,7 +45,7 @@ namespace DungeonRunners.Networking
             public uint OwnerEntityId;
             public uint ComponentId;
             public byte Subtype;
-            public float NativeNow;
+            public float Now;
             public uint ValidationCutoffTick;
             public float ValidationCutoffTime;
             public string Provenance;
@@ -60,9 +60,9 @@ namespace DungeonRunners.Networking
                 return new EntitySynchInfoDecision { Allow = true, Flags = 0x00, HPWire = 0, Owner = owner, Reason = reason };
             }
 
-            public static EntitySynchInfoDecision HP(EntitySynchInfoOwner owner, uint hpWire, string reason, uint ownerEntityId = 0, uint componentId = 0, byte subtype = 0, float nativeNow = -1f, string provenance = null, uint validationCutoffTick = 0, float validationCutoffTime = -1f, string runtimeInstanceKey = null, uint schedulerTick = 0, bool subEntityPhase = false, int rngPos = -1, string hpMutationSource = null)
+            public static EntitySynchInfoDecision HP(EntitySynchInfoOwner owner, uint hpWire, string reason, uint ownerEntityId = 0, uint componentId = 0, byte subtype = 0, float clientNow = -1f, string provenance = null, uint validationCutoffTick = 0, float validationCutoffTime = -1f, string runtimeInstanceKey = null, uint schedulerTick = 0, bool subEntityPhase = false, int rngPos = -1, string hpMutationSource = null)
             {
-                return new EntitySynchInfoDecision { Allow = true, Flags = 0x02, HPWire = hpWire, Owner = owner, Reason = reason, OwnerEntityId = ownerEntityId, ComponentId = componentId, Subtype = subtype, NativeNow = nativeNow, Provenance = provenance, ValidationCutoffTick = validationCutoffTick, ValidationCutoffTime = validationCutoffTime, RuntimeInstanceKey = runtimeInstanceKey, SchedulerTick = schedulerTick, SubEntityPhase = subEntityPhase, RngPos = rngPos, HpMutationSource = hpMutationSource };
+                return new EntitySynchInfoDecision { Allow = true, Flags = 0x02, HPWire = hpWire, Owner = owner, Reason = reason, OwnerEntityId = ownerEntityId, ComponentId = componentId, Subtype = subtype, Now = clientNow, Provenance = provenance, ValidationCutoffTick = validationCutoffTick, ValidationCutoffTime = validationCutoffTime, RuntimeInstanceKey = runtimeInstanceKey, SchedulerTick = schedulerTick, SubEntityPhase = subEntityPhase, RngPos = rngPos, HpMutationSource = hpMutationSource };
             }
 
             public static EntitySynchInfoDecision Block(EntitySynchInfoOwner owner, string reason)
@@ -70,21 +70,22 @@ namespace DungeonRunners.Networking
                 return new EntitySynchInfoDecision { Allow = false, Flags = 0x00, HPWire = 0, Owner = owner, Reason = reason };
             }
 
-            public ResolvedEntitySynchInfo ToResolved(uint fallbackOwnerEntityId, uint fallbackComponentId, byte fallbackSubtype, float fallbackNativeNow, string fallbackProvenance)
+            public ResolvedEntitySynchInfo ToResolved(uint fallbackOwnerEntityId, uint fallbackComponentId, byte fallbackSubtype, float fallbackNow, string fallbackProvenance)
             {
                 uint ownerEntityId = OwnerEntityId != 0 ? OwnerEntityId : fallbackOwnerEntityId;
                 uint componentId = ComponentId != 0 ? ComponentId : fallbackComponentId;
                 byte resolvedSubtype = Subtype != 0 ? Subtype : fallbackSubtype;
-                float nativeNow = NativeNow >= 0f ? NativeNow : fallbackNativeNow;
+                float clientNow = Now >= 0f ? Now : fallbackNow;
                 string provenance = !string.IsNullOrWhiteSpace(Provenance) ? Provenance : fallbackProvenance;
-                return new ResolvedEntitySynchInfo(new EntitySynchInfoPayload(Flags, HPWire), ownerEntityId, componentId, resolvedSubtype, nativeNow, Reason, provenance, ValidationCutoffTick, ValidationCutoffTime, RuntimeInstanceKey, SchedulerTick, SubEntityPhase, RngPos, HpMutationSource);
+                return new ResolvedEntitySynchInfo(new EntitySynchInfoPayload(Flags, HPWire), ownerEntityId, componentId, resolvedSubtype, clientNow, Reason, provenance, ValidationCutoffTick, ValidationCutoffTime, RuntimeInstanceKey, SchedulerTick, SubEntityPhase, RngPos, HpMutationSource);
             }
         }
 
         private enum PendingMonsterBehaviorKind
         {
             Move,
-            Attack
+            Attack,
+            Follow
         }
 
         private struct PendingMonsterBehaviorUpdate
@@ -103,7 +104,6 @@ namespace DungeonRunners.Networking
         }
 
         private TcpListener _listener;
-        // UDP Session tracking for encryption
         private class UDPSession
         {
             public IPEndPoint Endpoint;
@@ -125,10 +125,6 @@ namespace DungeonRunners.Networking
 
         private Dictionary<string, UDPSession> _udpSessions = new Dictionary<string, UDPSession>();
 
-        // ═══ DJB2 hash → GC class lookup for skill training (binary-verified) ═══
-        // Entity ref in train request = DJB2(lowercase GC class path)
-        // Verified: 0xA6CCC405=1HMeleeSpeedBuff, 0xBC568FC5=PoisonResistBuff,
-        //           0x86501370=Sprint, 0x5E5B060A=Blight (4/4 captures matched)
         private static readonly Dictionary<uint, string> _skillHashToGcClass = new Dictionary<uint, string>
         {
             { 0xA6CCC405u, "skills.generic.1HMeleeSpeedBuff" },
@@ -211,25 +207,23 @@ namespace DungeonRunners.Networking
             { 0x7E1353D2u, "skills.Generic.SummonSnowman" },
             { 0xE9DDA4DFu, "skills.generic.Teleport" },
         };
-        // ═══ DROPPED ITEM PERSISTENCE ═══
         public class DroppedItemInfo
         {
             public GCObject Item;
-            public long DbId;           // row ID in dropped_items table (0 = not yet saved)
-            public string Zone;         // CurrentZoneGcType
-            public uint ZoneId;         // CurrentZoneId
-            public uint InstanceId;     // conn.InstanceId
+            public long DbId;
+            public string Zone;
+            public uint ZoneId;
+            public uint InstanceId;
             public float PosX, PosY, PosZ;
             public int PlayerLevel;
             public string DroppedBy;
-            public int Quantity = 1;    // stack count when dropped
-            public bool IsQuestItem;    // true = call NotifyQuestItemAcquired on pickup
-            public bool IsGoldDrop;     // true = gold pile, credit AddCurrency on pickup
-            public uint GoldAmount;     // gold value (only if IsGoldDrop)
+            public int Quantity = 1;
+            public bool IsQuestItem;
+            public bool IsGoldDrop;
+            public uint GoldAmount;
         }
         private Dictionary<ushort, DroppedItemInfo> _droppedItems = new Dictionary<ushort, DroppedItemInfo>();
 
-        /// <summary>Goto objective metadata from Q*.gc files.</summary>
         private struct GotoGCData
         {
             public readonly string TargetZone;
@@ -239,115 +233,6 @@ namespace DungeonRunners.Networking
             { TargetZone = zone; TargetEntity = entity; Range = range; }
         }
 
-        /// <summary>
-        /// Token Master reward picker. Maps (class, slot, tier) → a single
-        /// curated gcType drawn from the WishingWell* and TokenReward* IG
-        /// families authored in `Database/gc/`. Every gcType returned here
-        /// is verified bare in `Database/GCDictionary.dict` (no `items.pal.`
-        /// prefix — those are emitted by `GCObject.GetPacketGCClassFor`).
-        /// Returns "" when no mapping exists — caller skips the reward.
-        ///
-        ///   classKey: "fi" | "ma" | "rg" | "jewelry"
-        ///   slotKey:  "helm" | "boots" | "gloves" | "shoulders" | "shield"
-        ///             | "body" | "ring" | "amulet" | "1hweapon" | "2hweapon"
-        ///             | "jewelry"
-        ///   tier:     "rare" | "unique" | "mythic"
-        /// </summary>
-        // Token/wishing-well quest rewards are resolved through authored RewardItemGenerator data.
-        // Legacy hardcoded reward pickers were removed so unresolved SQL/import gaps stay visible.
-        private void TryAutoCompleteWishingWellQuest(RRConnection conn, uint questHash)
-        {
-            if (!DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var questData)) return;
-            if (string.IsNullOrEmpty(questData.id)) return;
-            bool isWell = questData.id.StartsWith("world.town.quest.well", StringComparison.OrdinalIgnoreCase);
-            bool isToken = questData.id.StartsWith("world.town.quest.token.", StringComparison.OrdinalIgnoreCase)
-                           && !questData.id.EndsWith(".Debug_TokenGive", StringComparison.OrdinalIgnoreCase);
-            if (!isWell && !isToken)
-                return;
-
-            string connId = conn.ConnId.ToString();
-            var playerState = QuestManager.Instance.GetPlayerState(connId);
-            if (playerState == null) return;
-            var activeQuest = playerState.ActiveQuests.FirstOrDefault(q =>
-                q.QuestId.Equals(questData.id, StringComparison.OrdinalIgnoreCase));
-            if (activeQuest == null)
-            {
-                Debug.LogError($"[WELL] AcceptConfirmed but no active quest entry for {questData.id} — skip auto-complete");
-                return;
-            }
-
-            Debug.LogError($"[WELL] Auto-complete check for {questData.id} (objCount={activeQuest.Objectives?.Count ?? 0})");
-
-            // Tick item objectives by scanning current inventory.
-            if (activeQuest.Objectives != null && activeQuest.Objectives.Count > 0 &&
-                _playerInventoryItems.ContainsKey(connId))
-            {
-                foreach (var obj in activeQuest.Objectives)
-                {
-                    if (obj.Type == null || !obj.Type.Equals("item", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    if (string.IsNullOrEmpty(obj.Target)) continue;
-                    int found = 0;
-                    foreach (var kvp in _playerInventoryItems[connId])
-                    {
-                        if (kvp.Value.item?.GCClass == null) continue;
-                        if (!kvp.Value.item.GCClass.Equals(obj.Target, StringComparison.OrdinalIgnoreCase))
-                            continue;
-                        int sc = GetStackCount(connId, kvp.Key);
-                        found += sc > 0 ? sc : 1;
-                    }
-                    obj.Current = Math.Min(obj.Required, found);
-                    Debug.LogError($"[WELL]   objective '{obj.Label}' {obj.Current}/{obj.Required} (inventory has {found} of {obj.Target})");
-                }
-                QuestManager.Instance.SendProgressPacket(conn, activeQuest.InstanceId, activeQuest);
-            }
-
-            bool allDone = activeQuest.Objectives == null
-                || activeQuest.Objectives.Count == 0
-                || activeQuest.Objectives.All(o => o.IsComplete);
-
-            if (!allDone)
-            {
-                // Can't complete (no King's Coin). Roll back the accept so the player
-                // doesn't end up with a stuck quest in the log. Re-broadcast the
-                // available list so the Well NPC's ! marker comes back — HandleAcceptConfirmed
-                // already fired one SendAvailableQuestUpdateForZone with the quest in
-                // ActiveQuests (so it was filtered out); we need to fire another now that
-                // we've removed it from ActiveQuests.
-                Debug.LogError($"[WELL] {questData.id} cannot auto-complete — removing from active");
-                uint instId = activeQuest.InstanceId;
-                QuestManager.Instance.RemoveQuestByInstanceId(connId, instId);
-                QuestManager.Instance.SendRemovePacket(conn, instId);
-                SavePlayerQuests(conn);
-                QuestManager.Instance.SendAvailableQuestUpdateForZone(conn);
-                return;
-            }
-
-            uint instanceId = activeQuest.InstanceId;
-            RemoveQuestItemsFromInventory(conn, activeQuest);
-            QuestManager.Instance.HandleTurnInConfirmed(conn, instanceId);
-            // Repeatable: drop from CompletedQuests so the next click can re-accept.
-            // HandleTurnInConfirmed already fired SendAvailableQuestUpdateForZone
-            // INSIDE itself, but at that point the quest was still in CompletedQuests
-            // (we hadn't removed it yet) so it got filtered out — that's why the
-            // Well NPC's ! marker stayed hidden until a zone change. Re-fire the
-            // available update AFTER the CompletedQuests cleanup so the client sees
-            // the quest is available again immediately.
-            if (questData.repeatable)
-            {
-                playerState.CompletedQuests.RemoveAll(c =>
-                    c.Equals(questData.id, StringComparison.OrdinalIgnoreCase));
-                QuestManager.Instance.SendAvailableQuestUpdateForZone(conn);
-            }
-            SavePlayerQuests(conn);
-            ApplyQuestRewards(conn, questData);
-            Debug.LogError($"[WELL] ✅ {questData.id} auto-completed");
-        }
-
-        /// <summary>
-        /// Gives the onAcceptItem to the player when they accept a quest.
-        /// Places directly into inventory using submsg 0x1E — same as merchant quest item buy.
-        /// </summary>
         private void GiveOnAcceptItem(RRConnection conn, string onAcceptItem)
         {
             if (string.IsNullOrEmpty(onAcceptItem)) return;
@@ -357,25 +242,23 @@ namespace DungeonRunners.Networking
             if (playerState == null || conn.UnitContainerId == 0) return;
 
             string gcClass = onAcceptItem;
-            var generated = LootManager.Instance.GenerateAuthoredGeneratorLoot(onAcceptItem, 1, playerState.Level, !IsPlayerFree(conn.LoginName), "quest-onaccept");
+            var generated = GCObjectGeneratorTable.Instance.GenerateAuthoredGeneratorLoot(onAcceptItem, 1, playerState.Level, !IsPlayerFree(conn.LoginName), "quest-onaccept");
             var generatedItem = generated.FirstOrDefault(d => d != null && d.IsItem);
             if (generatedItem != null && !string.IsNullOrWhiteSpace(generatedItem.GCType))
                 gcClass = generatedItem.GCType;
             else if (!IsDirectAuthoredRewardItem(onAcceptItem))
             {
-                RuntimeEvidenceManager.LogFallbackHit("loot-generator", "missing-generator", $"source=quest-onaccept generator={onAcceptItem}", 32);
-                Debug.LogError($"[AUTHORED-COVERAGE] area=quest-onaccept status=blocked reason=missing-generator generator={onAcceptItem}");
+                RuntimeEvidence.LogFallbackHit("gc-object-generator-table", "missing-generator", $"source=quest-onaccept generator={onAcceptItem}", 32);
+                Debug.LogError($"[AUTHORED-COVERAGE] area=quest-onaccept reason=missing-generator generator={onAcceptItem}");
                 return;
             }
 
-            Debug.LogError($"[QUEST-ACCEPT-ITEM] Giving item: {onAcceptItem} → GCClass={gcClass} source={(generatedItem != null ? "authored-generator" : "direct-item")}");
+            Debug.LogError($"[QUEST-ACCEPT-ITEM] Giving item: {onAcceptItem} -> GCClass={gcClass} source={(generatedItem != null ? "authored-generator" : "direct-item")}");
 
-            // Look up item dimensions
             var itemData = DatabaseLoader.FindItem(gcClass);
             int itemWidth = itemData?.inventoryWidth ?? 1;
             int itemHeight = itemData?.inventoryHeight ?? 1;
 
-            // Find empty inventory slot
             byte slotX = 0, slotY = 0;
             bool foundSlot = false;
             for (byte row = 0; row < 8 && !foundSlot; row++)
@@ -391,73 +274,55 @@ namespace DungeonRunners.Networking
 
             uint slot = GetNextInventorySlot(connId);
 
-            // Send item directly to inventory via UnitContainer 0x1E
-            // Same format as MerchantManager quest item buy
             var writer = new LEWriter();
-            writer.WriteByte(0x07);  // BeginStream
+            writer.WriteByte(0x07);
 
             writer.WriteByte(0x35);
             writer.WriteUInt16(conn.UnitContainerId);
-            writer.WriteByte(0x1E);          // Add item to inventory
-            writer.WriteByte(0x0B);          // inventory container ID
-            writer.WriteByte(0xFF);          // marker
-            writer.WriteCString(GCObject.GetPacketGCClassFor(gcClass));    // GC type
-            writer.WriteUInt32(slot);        // slot index
-            writer.WriteByte(slotX);         // grid X
-            writer.WriteByte(slotY);         // grid Y
-            writer.WriteByte(0x01);          // quantity
-            writer.WriteByte(0x01);          // level
-            writer.WriteByte(0x00);          // flags
-            writer.WriteByte(0x00);          // modifier count
+            writer.WriteByte(0x1E);
+            writer.WriteByte(0x0B);
+            writer.WriteByte(0xFF);
+            writer.WriteCString(GCObject.GetPacketGCClassFor(gcClass));
+            writer.WriteUInt32(slot);
+            writer.WriteByte(slotX);
+            writer.WriteByte(slotY);
+            writer.WriteByte(0x01);
+            writer.WriteByte(0x01);
+            writer.WriteByte(0x00);
+            writer.WriteByte(0x00);
             WritePlayerEntitySynch(conn, writer);
 
-            writer.WriteByte(0x06);  // EndStream
+            writer.WriteByte(0x06);
 
             byte[] packet = writer.ToArray();
             Debug.LogError($"[QUEST-ACCEPT-ITEM] Sending 0x1E packet ({packet.Length} bytes): {BitConverter.ToString(packet)}");
             SendCompressedA(conn, 0x01, 0x0F, packet);
 
-            // Track in server inventory
-            var newItem = new GCObject { GCClass = gcClass, NativeClass = "Item" };
+            var newItem = new GCObject { GCClass = gcClass, DFCClass = "Item" };
             TrackInventoryItem(connId, slot, newItem, slotX, slotY);
             OccupyInventorySlots(connId, slotX, slotY, itemWidth, itemHeight);
             SetStackCount(connId, slot, 1);
 
-            // Save to DB
             SavePlayerInventory(conn);
             NotifyQuestItemAcquired(conn, gcClass);
 
-            Debug.LogError($"[QUEST-ACCEPT-ITEM] ✅ {gcClass} placed in inventory at ({slotX},{slotY}) slot {slot}");
+            Debug.LogError($"[QUEST-ACCEPT-ITEM]  {gcClass} placed in inventory at ({slotX},{slotY}) slot {slot}");
         }
 
-        /// <summary>
-        /// Give the player N stackable items of a given gcType. Tops up existing stacks
-        /// first via 0x22 UpdateQuantity, then creates new 1×1 stacks for the remainder
-        /// via 0x1E AddItem. Used for King's Coin rewards (QuestItemPAL.Token, max stack 100)
-        /// and any other stackable item.
-        ///
-        /// Per RE of DungeonRunners.exe: King's Coins are NOT a separate currency. The
-        /// Container only has one currency (gold at +0x74). King's Coins are inventory
-        /// items of type QuestItemPAL.Token and the bottom-left inventory counter is
-        /// computed client-side via Inventory::getItemCountByType("QuestItemPAL.Token").
-        /// To make the counter increment, just add Token items via 0x1E (same path as
-        /// GiveOnAcceptItem).
-        /// </summary>
         private void GiveStackedItem(RRConnection conn, string gcType, int totalCount, int maxStackSize = 100)
         {
             if (totalCount <= 0 || string.IsNullOrEmpty(gcType)) return;
             if (conn.UnitContainerId == 0)
             {
-                Debug.LogError($"[GIVE-STACKED] No UnitContainerId — cannot give {gcType}");
+                Debug.LogError($"[GIVE-STACKED] No UnitContainerId - cannot give {gcType}");
                 return;
             }
 
             string connId = conn.ConnId.ToString();
             int remaining = totalCount;
 
-            Debug.LogError($"[GIVE-STACKED] {gcType} ×{totalCount} (max stack {maxStackSize})");
+            Debug.LogError($"[GIVE-STACKED] {gcType} x{totalCount} (max stack {maxStackSize})");
 
-            // ── Step 1: Top up existing stacks via 0x22 UpdateQuantity ──
             if (_playerInventoryItems.ContainsKey(connId))
             {
                 var slots = new List<uint>(_playerInventoryItems[connId].Keys);
@@ -476,9 +341,6 @@ namespace DungeonRunners.Networking
                     int newCount = currentCount + canAdd;
                     remaining -= canAdd;
 
-                    // 0x22 processUpdateQuantity (0x57dc50 in client):
-                    //   reads uint32 itemSlotId + byte newQuantity
-                    //   stores newQuantity at item+0x82 (the cached stack count byte)
                     var qWriter = new LEWriter();
                     qWriter.WriteByte(0x07);
                     qWriter.WriteByte(0x35);
@@ -491,11 +353,10 @@ namespace DungeonRunners.Networking
                     SendCompressedA(conn, 0x01, 0x0F, qWriter.ToArray());
 
                     SetStackCount(connId, slotId, newCount);
-                    Debug.LogError($"[GIVE-STACKED] Topped up slot {slotId} {currentCount}→{newCount} (+{canAdd})");
+                    Debug.LogError($"[GIVE-STACKED] Topped up slot {slotId} {currentCount}->{newCount} (+{canAdd})");
                 }
             }
 
-            // ── Step 2: Create new 1×1 stacks for the remainder via 0x1E AddItem ──
             var itemData = DatabaseLoader.FindItem(gcType);
             int itemWidth = itemData?.inventoryWidth ?? 1;
             int itemHeight = itemData?.inventoryHeight ?? 1;
@@ -505,7 +366,7 @@ namespace DungeonRunners.Networking
                 var (sx, sy) = FindNextFreeInventorySlot(connId, itemWidth, itemHeight);
                 if (sx < 0)
                 {
-                    Debug.LogError($"[GIVE-STACKED] ⚠️ Inventory full! {remaining}× {gcType} not given");
+                    Debug.LogError($"[GIVE-STACKED]  Inventory full! {remaining}x {gcType} not given");
                     break;
                 }
                 byte slotX = (byte)sx, slotY = (byte)sy;
@@ -533,29 +394,18 @@ namespace DungeonRunners.Networking
                 writer.WriteByte(0x06);
                 SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
 
-                var newItem = new GCObject { GCClass = gcType, NativeClass = "Item" };
+                var newItem = new GCObject { GCClass = gcType, DFCClass = "Item" };
                 TrackInventoryItem(connId, slot, newItem, slotX, slotY);
                 OccupyInventorySlots(connId, slotX, slotY, itemWidth, itemHeight);
                 SetStackCount(connId, slot, stackSize);
 
-                Debug.LogError($"[GIVE-STACKED] New stack: slot {slot} at ({slotX},{slotY}) ×{stackSize}");
+                Debug.LogError($"[GIVE-STACKED] New stack: slot {slot} at ({slotX},{slotY}) x{stackSize}");
             }
 
             SavePlayerInventory(conn);
-            Debug.LogError($"[GIVE-STACKED] ✅ Done. {totalCount - remaining}/{totalCount} {gcType} placed");
+            Debug.LogError($"[GIVE-STACKED]  Done. {totalCount - remaining}/{totalCount} {gcType} placed");
         }
 
-        /// <summary>
-        /// Swap minor potion drops to their major equivalents for member players.
-        /// Original DR enforced stack-of-10 by giving members DIFFERENT ITEMS (Major
-        /// potions have MaxStackSize=10 in their GC data, minors have MaxStackSize=5).
-        /// The client enforces those caps - we cannot make a minor potion stack to 10.
-        ///
-        /// Logs EVERY drop's gcType + final value so we can see exactly what is in
-        /// the items DB and what got swapped. If members are still seeing stack-of-5
-        /// after this, the log will tell us why (helper not called / helper called but
-        /// no potions in drops / potion gcType doesn't match the patterns).
-        /// </summary>
         private void UpgradePotionsForMembers(List<LootDrop> drops, RRConnection conn)
         {
             string who = conn?.LoginName ?? "<null>";
@@ -579,82 +429,62 @@ namespace DungeonRunners.Networking
             foreach (var drop in drops)
             {
                 if (drop == null || drop.IsGold || string.IsNullOrEmpty(drop.GCType)) continue;
-                string gc = drop.GCType;
-                string lc = gc.ToLowerInvariant();
-                string before = gc;
+                string gcType = drop.GCType;
+                string gcTypeLower = gcType.ToLowerInvariant();
+                string originalGcType = gcType;
 
-                // Pattern A: literal "Minor*Potion" anywhere (case-insensitive)
-                if (lc.Contains("minorhealthpotion"))
+                if (gcTypeLower.Contains("minorhealthpotion"))
                 {
                     drop.GCType = System.Text.RegularExpressions.Regex.Replace(
-                        gc, "minorhealthpotion", "MajorHealthPotion",
+                        gcType, "minorhealthpotion", "MajorHealthPotion",
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                     drop.Label = "Major Health Potion";
-                    Debug.LogError($"[LOOT-MEMBER]   SWAP A-H: '{before}' -> '{drop.GCType}'");
+                    Debug.LogError($"[LOOT-MEMBER]   SWAP A-H: '{originalGcType}' -> '{drop.GCType}'");
                     swapped++;
                     continue;
                 }
-                if (lc.Contains("minormanapotion"))
+                if (gcTypeLower.Contains("minormanapotion"))
                 {
                     drop.GCType = System.Text.RegularExpressions.Regex.Replace(
-                        gc, "minormanapotion", "MajorManaPotion",
+                        gcType, "minormanapotion", "MajorManaPotion",
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                     drop.Label = "Major Mana Potion";
-                    Debug.LogError($"[LOOT-MEMBER]   SWAP A-M: '{before}' -> '{drop.GCType}'");
+                    Debug.LogError($"[LOOT-MEMBER]   SWAP A-M: '{originalGcType}' -> '{drop.GCType}'");
                     swapped++;
                     continue;
                 }
 
-                // Pattern B: PotionPAL alternate naming "HealthPotion_Sm" / "ManaPotion_Sm"
-                // (seen in FreePotionIG.gc comments) -> "_Lg" suffix
-                if (lc.Contains("healthpotion_sm"))
+                if (gcTypeLower.Contains("healthpotion_sm"))
                 {
                     drop.GCType = System.Text.RegularExpressions.Regex.Replace(
-                        gc, "healthpotion_sm", "HealthPotion_Lg",
+                        gcType, "healthpotion_sm", "HealthPotion_Lg",
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                     drop.Label = "Major Health Potion";
-                    Debug.LogError($"[LOOT-MEMBER]   SWAP B-H: '{before}' -> '{drop.GCType}'");
+                    Debug.LogError($"[LOOT-MEMBER]   SWAP B-H: '{originalGcType}' -> '{drop.GCType}'");
                     swapped++;
                     continue;
                 }
-                if (lc.Contains("manapotion_sm"))
+                if (gcTypeLower.Contains("manapotion_sm"))
                 {
                     drop.GCType = System.Text.RegularExpressions.Regex.Replace(
-                        gc, "manapotion_sm", "ManaPotion_Lg",
+                        gcType, "manapotion_sm", "ManaPotion_Lg",
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                     drop.Label = "Major Mana Potion";
-                    Debug.LogError($"[LOOT-MEMBER]   SWAP B-M: '{before}' -> '{drop.GCType}'");
+                    Debug.LogError($"[LOOT-MEMBER]   SWAP B-M: '{originalGcType}' -> '{drop.GCType}'");
                     swapped++;
                     continue;
                 }
 
-                // Pattern C: any other "potion" item that might be a minor we don't
-                // recognize - just log so we can add a swap rule next round.
-                if (lc.Contains("potion"))
+                if (gcTypeLower.Contains("potion"))
                 {
-                    Debug.LogError($"[LOOT-MEMBER]   POTION NOT MATCHED: '{gc}' (need a swap rule for this)");
+                    Debug.LogError($"[LOOT-MEMBER]   POTION NOT MATCHED: '{gcType}' (need a swap rule for this)");
                 }
             }
             Debug.LogError($"[LOOT-MEMBER] {who}: {swapped} swap(s) total");
         }
 
-        /// <summary>
-        /// Checks player proximity to goto-objective targets. Throttled 1/sec/player.
-        ///
-        /// Covers the case where a goto objective targets an entity/waypoint IN the
-        /// current zone and the player has to walk up to it (e.g. "Locate Entrance to
-        /// Rattle Tooth's Lair" — boss_spawn waypoint in dungeon00_level03, range 200).
-        ///
-        /// Lookup strategy:
-        ///  1. Match the objective Label against _gotoGCByLabel (from Q*.gc) to get
-        ///     authoritative TargetZoneName / TargetEntityName / Range.
-        ///  2. If the player is in TargetZoneName, check distance to a waypoint named
-        ///     TargetEntityName — complete if within Range.
-        ///  3. Fallback: legacy portal-proximity path for objectives without GC data.
-        /// </summary>
         private void CheckGotoProximity(RRConnection conn)
         {
-            // Throttle: at most once per second per connection
             int connKey = conn.ConnId;
             float now = Time.time;
             if (_gotoNextCheckTime.TryGetValue(connKey, out float next) && now < next)
@@ -665,14 +495,13 @@ namespace DungeonRunners.Networking
             var questState = QuestManager.Instance.GetPlayerState(connId);
             if (questState == null) return;
 
-            // Quick bail: any incomplete goto objectives at all?
             bool hasGoto = false;
             foreach (var quest in questState.ActiveQuests)
             {
-                foreach (var obj in quest.Objectives)
+                foreach (var objective in quest.Objectives)
                 {
-                    if (!obj.IsComplete && obj.Type != null &&
-                        obj.Type.Equals("goto", StringComparison.OrdinalIgnoreCase))
+                    if (!objective.IsComplete && objective.Type != null &&
+                        objective.Type.Equals("goto", StringComparison.OrdinalIgnoreCase))
                     { hasGoto = true; break; }
                 }
                 if (hasGoto) break;
@@ -682,61 +511,46 @@ namespace DungeonRunners.Networking
             string curZone = conn.CurrentZoneName;
             if (string.IsNullOrEmpty(curZone)) return;
 
-            float px = conn.PlayerPosX;
-            float py = conn.PlayerPosY;
+            float playerX = conn.PlayerPosX;
+            float playerY = conn.PlayerPosY;
 
             foreach (var quest in questState.ActiveQuests)
             {
-                foreach (var obj in quest.Objectives)
+                foreach (var objective in quest.Objectives)
                 {
-                    if (obj.IsComplete) continue;
-                    if (obj.Type == null || !obj.Type.Equals("goto", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (objective.IsComplete) continue;
+                    if (objective.Type == null || !objective.Type.Equals("goto", StringComparison.OrdinalIgnoreCase)) continue;
 
-                    // ── Path 1: GC-data-driven proximity ──
-                    if (!string.IsNullOrEmpty(obj.Label) &&
-                        _gotoGCByLabel.TryGetValue(obj.Label, out var gc))
+                    if (!string.IsNullOrEmpty(objective.Label) &&
+                        _gotoGCByLabel.TryGetValue(objective.Label, out var gotoTarget))
                     {
-                        // Must be in the right zone (prefix match so child zones like
-                        // dungeon00_level03_boss count as being "in" dungeon00_level03).
-                        if (!string.IsNullOrEmpty(gc.TargetZone) &&
-                            !curZone.StartsWith(gc.TargetZone, StringComparison.OrdinalIgnoreCase))
+                        if (!string.IsNullOrEmpty(gotoTarget.TargetZone) &&
+                            !curZone.StartsWith(gotoTarget.TargetZone, StringComparison.OrdinalIgnoreCase))
                             continue;
 
-                        if (!string.IsNullOrEmpty(gc.TargetEntity))
+                        if (!string.IsNullOrEmpty(gotoTarget.TargetEntity))
                         {
-                            int rng = gc.Range > 0 ? gc.Range : 100;
+                            int range = gotoTarget.Range > 0 ? gotoTarget.Range : 100;
 
-                            // Step A: look for the waypoint by name in the CURRENT zone.
-                            // Fires when the player is physically next to a named
-                            // waypoint (e.g. inside dungeon00_level03_boss next to
-                            // the boss_spawn waypoint).
-                            var wps = DatabaseLoader.GetWaypointsForZone(curZone);
-                            if (wps != null)
+                            var waypoints = DatabaseLoader.GetWaypointsForZone(curZone);
+                            if (waypoints != null)
                             {
-                                foreach (var wp in wps)
+                                foreach (var waypoint in waypoints)
                                 {
-                                    if (!wp.name.Equals(gc.TargetEntity, StringComparison.OrdinalIgnoreCase))
+                                    if (!waypoint.name.Equals(gotoTarget.TargetEntity, StringComparison.OrdinalIgnoreCase))
                                         continue;
-                                    float dx = px - wp.posX;
-                                    float dy = py - wp.posY;
-                                    float dist = (float)System.Math.Sqrt(dx * dx + dy * dy);
-                                    if (dist <= rng)
+                                    float deltaX = playerX - waypoint.posX;
+                                    float deltaY = playerY - waypoint.posY;
+                                    float dist = (float)System.Math.Sqrt(deltaX * deltaX + deltaY * deltaY);
+                                    if (dist <= range)
                                     {
-                                        Debug.LogError($"[GOTO-PROXIMITY] ✅ Waypoint match: player ({px:F0},{py:F0}) within {dist:F0} of '{wp.name}' in {curZone} (range={rng}) — completing '{obj.Label}'");
-                                        CompleteGotoObjective(conn, quest, obj);
+                                        Debug.LogError($"[GOTO-PROXIMITY]  Waypoint match: player ({playerX:F0},{playerY:F0}) within {dist:F0} of '{waypoint.name}' in {curZone} (range={range}) - completing '{objective.Label}'");
+                                        CompleteGotoObjective(conn, quest, objective);
                                         return;
                                     }
                                 }
                             }
 
-                            // Step B: PORTAL fallback. Fires when the player is near a
-                            // portal in the current zone whose TARGET zone contains a
-                            // waypoint with the name we're looking for. This handles
-                            // the "Find Entrance to Rattle Tooth's Lair" case:
-                            // boss_spawn waypoint lives inside dungeon00_level03_boss,
-                            // but the quest should tick when the player walks up to
-                            // the entrance PORTAL in dungeon00_level03 — no need to
-                            // actually step through.
                             var portalsStepB = DatabaseLoader.GetPortalsForZone(curZone);
                             if (portalsStepB != null)
                             {
@@ -747,29 +561,27 @@ namespace DungeonRunners.Networking
                                     if (targetWps == null) continue;
 
                                     bool targetHasEntity = false;
-                                    foreach (var wp in targetWps)
-                                        if (wp.name.Equals(gc.TargetEntity, StringComparison.OrdinalIgnoreCase))
+                                    foreach (var waypoint in targetWps)
+                                        if (waypoint.name.Equals(gotoTarget.TargetEntity, StringComparison.OrdinalIgnoreCase))
                                         { targetHasEntity = true; break; }
                                     if (!targetHasEntity) continue;
 
-                                    float dx = px - portal.posX;
-                                    float dy = py - portal.posY;
-                                    float dist = (float)System.Math.Sqrt(dx * dx + dy * dy);
-                                    if (dist <= rng)
+                                    float deltaX = playerX - portal.posX;
+                                    float deltaY = playerY - portal.posY;
+                                    float dist = (float)System.Math.Sqrt(deltaX * deltaX + deltaY * deltaY);
+                                    if (dist <= range)
                                     {
-                                        Debug.LogError($"[GOTO-PROXIMITY] ✅ Portal match: player ({px:F0},{py:F0}) within {dist:F0} of portal '{portal.name}'→{portal.targetZone} (range={rng}) — completing '{obj.Label}'");
-                                        CompleteGotoObjective(conn, quest, obj);
+                                        Debug.LogError($"[GOTO-PROXIMITY]  Portal match: player ({playerX:F0},{playerY:F0}) within {dist:F0} of portal '{portal.name}'->{portal.targetZone} (range={range}) - completing '{objective.Label}'");
+                                        CompleteGotoObjective(conn, quest, objective);
                                         return;
                                     }
                                 }
                             }
                         }
-                        // No entity → zone-entry hook handles it
                         continue;
                     }
 
-                    // ── Path 2: Legacy portal-proximity (no GC match or DB target only) ──
-                    if (string.IsNullOrEmpty(obj.Target)) continue;
+                    if (string.IsNullOrEmpty(objective.Target)) continue;
                     var portals = DatabaseLoader.GetPortalsForZone(curZone);
                     if (portals == null || portals.Count == 0) continue;
 
@@ -781,21 +593,21 @@ namespace DungeonRunners.Networking
                         if (targetWaypoints == null) continue;
 
                         bool waypointMatch = false;
-                        foreach (var wp in targetWaypoints)
-                            if (wp.name.Equals(obj.Target, StringComparison.OrdinalIgnoreCase))
+                        foreach (var waypoint in targetWaypoints)
+                            if (waypoint.name.Equals(objective.Target, StringComparison.OrdinalIgnoreCase))
                             { waypointMatch = true; break; }
                         if (!waypointMatch) continue;
 
-                        float dx = px - portal.posX;
-                        float dy = py - portal.posY;
-                        float dist = (float)System.Math.Sqrt(dx * dx + dy * dy);
+                        float deltaX = playerX - portal.posX;
+                        float deltaY = playerY - portal.posY;
+                        float dist = (float)System.Math.Sqrt(deltaX * deltaX + deltaY * deltaY);
                         float triggerRange = System.Math.Max(portal.width, portal.height);
                         if (triggerRange < 100) triggerRange = 100;
 
                         if (dist <= triggerRange)
                         {
-                            Debug.LogError($"[GOTO-PROXIMITY] ✅ Portal path: player at ({px:F0},{py:F0}) within {dist:F0} of portal '{portal.name}' (range={triggerRange}) — completing '{obj.Label}'");
-                            CompleteGotoObjective(conn, quest, obj);
+                            Debug.LogError($"[GOTO-PROXIMITY]  Portal path: player at ({playerX:F0},{playerY:F0}) within {dist:F0} of portal '{portal.name}' (range={triggerRange}) - completing '{objective.Label}'");
+                            CompleteGotoObjective(conn, quest, objective);
                             return;
                         }
                     }
@@ -803,12 +615,6 @@ namespace DungeonRunners.Networking
             }
         }
 
-        /// <summary>
-        /// Called when a player enters a new zone (from ChangeZone). Completes any
-        /// goto objectives whose TargetZoneName matches the new zone AND have no
-        /// TargetEntityName (zone-entry alone is enough). Quests with an entity get
-        /// handled by CheckGotoProximity on the next tick.
-        /// </summary>
         private void CompleteGotoObjectivesOnZoneEntry(RRConnection conn)
         {
             string connId = conn.ConnId.ToString();
@@ -821,24 +627,22 @@ namespace DungeonRunners.Networking
             bool anyCompleted = false;
             foreach (var quest in questState.ActiveQuests)
             {
-                foreach (var obj in quest.Objectives)
+                foreach (var objective in quest.Objectives)
                 {
-                    if (obj.IsComplete) continue;
-                    if (obj.Type == null || !obj.Type.Equals("goto", StringComparison.OrdinalIgnoreCase)) continue;
-                    if (string.IsNullOrEmpty(obj.Label)) continue;
+                    if (objective.IsComplete) continue;
+                    if (objective.Type == null || !objective.Type.Equals("goto", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.IsNullOrEmpty(objective.Label)) continue;
 
-                    if (!_gotoGCByLabel.TryGetValue(obj.Label, out var gc)) continue;
-                    if (string.IsNullOrEmpty(gc.TargetZone)) continue;
-                    if (!curZone.StartsWith(gc.TargetZone, StringComparison.OrdinalIgnoreCase)) continue; // prefix: _boss/_off child zones
+                    if (!_gotoGCByLabel.TryGetValue(objective.Label, out var gotoTarget)) continue;
+                    if (string.IsNullOrEmpty(gotoTarget.TargetZone)) continue;
+                    if (!curZone.StartsWith(gotoTarget.TargetZone, StringComparison.OrdinalIgnoreCase)) continue;
 
-                    // Zone matches. Complete immediately if no entity required.
-                    if (string.IsNullOrEmpty(gc.TargetEntity))
+                    if (string.IsNullOrEmpty(gotoTarget.TargetEntity))
                     {
-                        Debug.LogError($"[GOTO-ZONE-ENTRY] ✅ Player entered '{curZone}' — completing goto '{obj.Label}' for quest {quest.QuestId}");
-                        CompleteGotoObjective(conn, quest, obj);
+                        Debug.LogError($"[GOTO-ZONE-ENTRY]  Player entered '{curZone}' - completing goto '{objective.Label}' for quest {quest.QuestId}");
+                        CompleteGotoObjective(conn, quest, objective);
                         anyCompleted = true;
                     }
-                    // Entity required: CheckGotoProximity handles it on next tick.
                 }
             }
 
@@ -846,31 +650,18 @@ namespace DungeonRunners.Networking
                 SavePlayerQuests(conn);
         }
 
-        /// <summary>
-        /// Marks a goto objective complete and pushes progress to the client.
-        /// Shared by CheckGotoProximity and CompleteGotoObjectivesOnZoneEntry.
-        /// </summary>
-        private void CompleteGotoObjective(RRConnection conn, ActiveQuest quest, QuestProgress obj)
+        private void CompleteGotoObjective(RRConnection conn, ActiveQuest quest, QuestProgress objective)
         {
-            obj.Current = obj.Required;
+            objective.Current = objective.Required;
             QuestManager.Instance.SendProgressPacket(conn, quest.InstanceId, quest);
             SavePlayerQuests(conn);
         }
 
 
-        /// <summary>
-        /// Apply quest completion rewards using the original Dungeon Runners formulas
-        /// from GlobalKnobs.gc:
-        ///   gold = max(1, level × QuestGoldPerLevel × cashReward × (member ? MemberGoldMod : 1))
-        ///   xp   = max(1, level × QuestExperiencePerLevel × (expMod/5) × freeMult × diffMult)
-        ///   tokens = TokenReward (King's Coin count, spent at relic vendors)
-        ///   xp buff = QuestXPBonus modifier (15% EXPMOD, removed on death) if GrantXPBuff
-        /// </summary>
         private void ApplyQuestRewards(RRConnection conn, QuestData questData)
         {
             if (questData == null) return;
 
-            // ----- Look up constants from ServerSettings (mirrors GlobalKnobs.gc) -----
             float questGoldPerLevel = GCDatabase.Instance.GetKnob("QuestGoldPerLevel", 250f);
             float questXPPerLevel = GCDatabase.Instance.GetKnob("QuestExperiencePerLevel", 100f);
             float memberGoldMod = GCDatabase.Instance.GetKnob("MemberGoldMod", 1.15f);
@@ -884,26 +675,17 @@ namespace DungeonRunners.Networking
             int qLevel = questData.level > 0 ? questData.level : 1;
             float cashMult = questData.cashReward > 0 ? questData.cashReward : 0.5f;
 
-            // ----- Compute gold (matches in-client quest dialog: level × QuestGoldPerLevel × CashReward) -----
-            // NO member bonus on quest rewards. The 1.15× MemberGoldMod applies to monster gold drops only.
-            // Granting more than the dialog shows causes the "shows 125, gets 144" mismatch.
             uint goldReward = (uint)System.Math.Max(1, System.Math.Round(
                 qLevel * questGoldPerLevel * cashMult));
 
-            // ----- XP from quest turn-in: NONE. -----
-            // Per RE of all Q*.gc files: zero quests have a RewardExperience field.
-            // Quests grant XP ONLY indirectly via the QuestXPBonus AttributeModifier
-            // ("15% More Cowbell" buff) when GrantXPBuff=true. The buff boosts XP from
-            // KILLS until death. See block below for the buff dispatch.
             uint xpReward = 0;
 
             int tokenReward = questData.tokenReward;
 
-            Debug.LogError($"[QUEST-REWARDS] {questData.id} (L{qLevel}) → " +
+            Debug.LogError($"[QUEST-REWARDS] {questData.id} (L{qLevel}) -> " +
                            $"{goldReward} gold, {xpReward} XP, {tokenReward} King's Coin(s)" +
-                           $" [free={isFree}, cash×{cashMult}, diff×{diffXPMult}, xpBuff={questData.grantXPBuff}]");
+                           $" [free={isFree}, cashx{cashMult}, diffx{diffXPMult}, xpBuff={questData.grantXPBuff}]");
 
-            // ----- Apply gold -----
             if (goldReward > 0 && _selectedCharacter.TryGetValue(conn.LoginName, out var rewardGcObj))
             {
                 var rewardChar = DungeonRunners.Database.CharacterRepository.GetCharacter(rewardGcObj.Id);
@@ -914,45 +696,38 @@ namespace DungeonRunners.Networking
                 }
                 if (conn.UnitContainerId != 0)
                 {
-                    var goldPkt = new LEWriter();
-                    goldPkt.WriteByte(0x07);
-                    goldPkt.WriteByte(0x35);
-                    goldPkt.WriteUInt16(conn.UnitContainerId);
-                    goldPkt.WriteByte(0x20);           // AddCurrency
-                    goldPkt.WriteUInt32(goldReward);
-                    goldPkt.WriteByte(0x00);           // source
-                    goldPkt.WriteUInt32(0x00000000);   // entityHandle
-                    goldPkt.WriteByte(0x01);           // notifyFlag
-                    WritePlayerEntitySynch(conn, goldPkt);
-                    goldPkt.WriteByte(0x06);
-                    SendToClient(conn, goldPkt.ToArray());
-                    Debug.LogError($"[QUEST-REWARDS] 💰 Sent +{goldReward} gold to client");
+                    var goldPacket = new LEWriter();
+                    goldPacket.WriteByte(0x07);
+                    goldPacket.WriteByte(0x35);
+                    goldPacket.WriteUInt16(conn.UnitContainerId);
+                    goldPacket.WriteByte(0x20);
+                    goldPacket.WriteUInt32(goldReward);
+                    goldPacket.WriteByte(0x00);
+                    goldPacket.WriteUInt32(0x00000000);
+                    goldPacket.WriteByte(0x01);
+                    WritePlayerEntitySynch(conn, goldPacket);
+                    goldPacket.WriteByte(0x06);
+                    SendToClient(conn, goldPacket.ToArray());
+                    Debug.LogError($"[QUEST-REWARDS]  Sent +{goldReward} gold to client");
                 }
             }
 
-            // ----- Apply King's Coin reward as inventory items (QuestItemPAL.Token) -----
-            // Per RE: King's Coins are NOT a separate currency. They are inventory items
-            // of type QuestItemPAL.Token (1×1, max stack 100). The bottom-left inventory
-            // counter is computed client-side via Inventory::getItemCountByType("QuestItemPAL.Token").
             if (tokenReward > 0)
             {
                 GiveStackedItem(conn, "QuestItemPAL.Token", tokenReward, 100);
             }
 
-            // ----- XP from quest turn-in is NONE. The buff below is the only quest XP. -----
 
-            // ----- Apply XP buff if quest has GrantXPBuff -----
             if (questData.grantXPBuff)
             {
                 SendQuestXPBonusModifier(conn);
             }
 
-            // ----- Reward items via RewardItemGenerator -----
             if (!string.IsNullOrEmpty(questData.rewardItemGenerator) && questData.numRewardItems > 0)
             {
-                Debug.LogError($"[QUEST-REWARDS] 📦 Rolling {questData.numRewardItems}× from {questData.rewardItemGenerator}");
+                Debug.LogError($"[QUEST-REWARDS]  Rolling {questData.numRewardItems}x from {questData.rewardItemGenerator}");
                 string gen = questData.rewardItemGenerator;
-                var authoredRewardDrops = LootManager.Instance.GenerateAuthoredGeneratorLoot(
+                var authoredRewardDrops = GCObjectGeneratorTable.Instance.GenerateAuthoredGeneratorLoot(
                     gen,
                     questData.numRewardItems,
                     qLevel,
@@ -984,18 +759,18 @@ namespace DungeonRunners.Networking
                 if (TryGiveDirectAuthoredQuestReward(conn, questData, gen))
                     return;
 
-                if (LootManager.Instance.CanResolveAuthoredGenerator(gen))
+                if (GCObjectGeneratorTable.Instance.CanResolveAuthoredGenerator(gen))
                 {
-                    Debug.LogError($"[AUTHORED-COVERAGE] area=quest-reward status=blocked reason=authored-generator-empty quest={questData.id} generator={gen} count={questData.numRewardItems}");
+                    Debug.LogError($"[AUTHORED-COVERAGE] area=quest-reward reason=authored-generator-empty quest={questData.id} generator={gen} count={questData.numRewardItems}");
                     return;
                 }
 
-                RuntimeEvidenceManager.LogFallbackHit(
-                    "loot-generator",
+                RuntimeEvidence.LogFallbackHit(
+                    "gc-object-generator-table",
                     "missing-generator",
                     $"source=quest-reward quest={questData.id} generator={gen} count={questData.numRewardItems}",
                     32);
-                Debug.LogError($"[AUTHORED-COVERAGE] area=quest-reward status=blocked reason=missing-generator quest={questData.id} generator={gen} count={questData.numRewardItems}");
+                Debug.LogError($"[AUTHORED-COVERAGE] area=quest-reward reason=missing-generator quest={questData.id} generator={gen} count={questData.numRewardItems}");
             }
         }
 
@@ -1031,58 +806,43 @@ namespace DungeonRunners.Networking
                 gcType.EndsWith("IG", StringComparison.OrdinalIgnoreCase))
                 return false;
 
-            return AuthoredExtendsNativeClass(gcType, "Item") ||
-                   AuthoredExtendsNativeClass(gcType, "ActiveItem") ||
-                   AuthoredExtendsNativeClass(gcType, "MeleeWeapon") ||
-                   AuthoredExtendsNativeClass(gcType, "RangedWeapon") ||
-                   AuthoredExtendsNativeClass(gcType, "Armor");
+            return AuthoredExtendsClass(gcType, "Item") ||
+                   AuthoredExtendsClass(gcType, "ActiveItem") ||
+                   AuthoredExtendsClass(gcType, "MeleeWeapon") ||
+                   AuthoredExtendsClass(gcType, "RangedWeapon") ||
+                   AuthoredExtendsClass(gcType, "Armor");
         }
 
-        /// <summary>
-        /// Send the QuestXPBonus modifier (15% EXPMOD buff, removed on death).
-        /// Same packet pattern as SendFreePlayerModifier — both are AttributeModifiers.
-        /// GC type: quests.base.QuestXPBonus, Label: "Quest Reward: 15% More Cowbell".
-        /// </summary>
         public void SendQuestXPBonusModifier(RRConnection conn)
         {
             if (conn.ModifiersId == 0)
             {
-                Debug.LogError("[QUEST-XP-BUFF] Cannot send QuestXPBonus — ModifiersId not set");
+                Debug.LogError("[QUEST-XP-BUFF] Cannot send QuestXPBonus - ModifiersId not set");
                 return;
             }
 
             var writer = new LEWriter();
-            writer.WriteByte(0x07);              // BeginStream
-            writer.WriteByte(0x35);              // ComponentUpdate
+            writer.WriteByte(0x07);
+            writer.WriteByte(0x35);
             writer.WriteUInt16((ushort)conn.ModifiersId);
-            writer.WriteByte(0x00);              // processAddModifier type
+            writer.WriteByte(0x00);
             WriteGCType(writer, "quests.base.QuestXPBonus", preserveCase: true);
-            // Modifier::readData — 14 bytes (TTD-proven @ 0x4FF390):
-            writer.WriteUInt32(2);               // [+0x78] ID (must differ from FreePlayerExperienceModifier=1)
-            writer.WriteByte(0);                 // [+0x86] Level
-            writer.WriteUInt32(0);               // [+0x80] PowerLevel
-            writer.WriteUInt32(0x00000000);      // [+0x7C] Duration (0 = until removed by death)
-            writer.WriteByte(0x01);              // [+0x87] SourceIsSelf
+            writer.WriteUInt32(2);
+            writer.WriteByte(0);
+            writer.WriteUInt32(0);
+            writer.WriteUInt32(0x00000000);
+            writer.WriteByte(0x01);
             WritePlayerEntitySynch(conn, writer);
-            writer.WriteByte(0x06);              // EndStream
+            writer.WriteByte(0x06);
 
             SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
-            Debug.LogError($"[QUEST-XP-BUFF] ⭐ Sent QuestXPBonus modifier (+15% EXPMOD)");
+            Debug.LogError($"[QUEST-XP-BUFF]  Sent QuestXPBonus modifier (+15% EXPMOD)");
 
-            // Track the buff so it persists across zone transitions.
-            // ResendAllModifiers() is called after every zone change and will re-apply it.
-            TrackModifierSent(conn.LoginName, "quests.base.QuestXPBonus", 2,
+            RecordModifierSent(conn.LoginName, "quests.base.QuestXPBonus", 2,
                 level: 0, powerLevel: 0, duration: 0, sourceIsSelf: 1);
-            Debug.LogError($"[QUEST-XP-BUFF] 📌 Tracked for zone-change persistence");
+            Debug.LogError($"[QUEST-XP-BUFF]  Tracked for zone-change persistence");
         }
 
-        /// <summary>
-        /// Send the ZoneSpawnInvulnerabilityModifier — brief immunity to damage
-        /// applied each time the player enters a new zone, removed on native
-        /// RemoveOnAction events. Mirrors the binary's ZoneSpawnInvulnerability
-        /// behavior — "prepare yourself for battle" buff.
-        /// GC type: ZoneSpawnInvulnerabilityModifier.
-        /// </summary>
         public void SendZoneSpawnInvulnerability(RRConnection conn)
         {
             if (!ShouldSendZoneSpawnInvulnerability(conn))
@@ -1094,29 +854,27 @@ namespace DungeonRunners.Networking
 
             if (conn.ModifiersId == 0)
             {
-                Debug.LogError("[ZONE-INVULN] Cannot send ZoneSpawnInvulnerability — ModifiersId not set");
+                Debug.LogError("[ZONE-INVULN] Cannot send ZoneSpawnInvulnerability - ModifiersId not set");
                 return;
             }
 
             SetZoneSpawnInvulnerability(conn);
             var writer = new LEWriter();
-            writer.WriteByte(0x07);              // BeginStream
-            writer.WriteByte(0x35);              // ComponentUpdate
+            writer.WriteByte(0x07);
+            writer.WriteByte(0x35);
             writer.WriteUInt16((ushort)conn.ModifiersId);
-            writer.WriteByte(0x00);              // processAddModifier type
+            writer.WriteByte(0x00);
             WriteGCType(writer, "avatar.base.ZoneSpawnInvulnerabilityModifier", preserveCase: true);
-            // Modifier::readData — 14 bytes (TTD-proven @ 0x4FF390):
-            writer.WriteUInt32(3);               // [+0x78] ID (1=FreePlayer, 2=QuestXPBonus, 3=ZoneSpawnInvuln)
-            writer.WriteByte(0);                 // [+0x86] Level
-            writer.WriteUInt32(0);               // [+0x80] PowerLevel
-            writer.WriteUInt32(ZoneSpawnInvulnerabilityDuration);            // [+0x7C] Duration (from .gc file)
-            writer.WriteByte(0x01);              // [+0x87] SourceIsSelf
+            writer.WriteUInt32(3);
+            writer.WriteByte(0);
+            writer.WriteUInt32(0);
+            writer.WriteUInt32(ZoneSpawnInvulnerabilityDuration);
+            writer.WriteByte(0x01);
             WritePlayerEntitySynch(conn, writer);
-            writer.WriteByte(0x06);              // EndStream
+            writer.WriteByte(0x06);
 
             SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
             Debug.LogError($"[ZONE-INVULN] Sent ZoneSpawnInvulnerability for {conn.LoginName} (zone={conn.CurrentZoneName})");
-            // NOT tracked for persistence — must be re-applied on every zone change.
         }
 
         private const uint ZoneSpawnInvulnerabilityDuration = 1800;
@@ -1142,8 +900,8 @@ namespace DungeonRunners.Networking
             public bool QueuedWithoutInitialTarget;
             public bool ProjectileRuntimeInitialized;
             public float FireTime;
-            public int FireNativeTick;
-            public int LastUpdateNativeTick;
+            public int FireTick;
+            public int LastUpdateTick;
             public int UpdatesCompleted;
             public int MaxLifetimeTicks;
             public float ProjectileSpeed;
@@ -1209,22 +967,22 @@ namespace DungeonRunners.Networking
 
         private void DrainPendingModifierKills()
         {
-            while (CombatManager.Instance.HasPendingModifierKills)
+            while (CombatRuntime.Instance.HasPendingModifierKills)
             {
-                var kill = CombatManager.Instance.DequeuePendingModifierKill();
+                var kill = CombatRuntime.Instance.DequeuePendingModifierKill();
                 if (kill == null)
                     break;
 
-                var monster = CombatManager.Instance.GetMonster(kill.TargetEntityId);
+                var monster = CombatRuntime.Instance.GetMonster(kill.TargetEntityId);
                 var conn = FindConnectionByAvatarEntityId(kill.SourceEntityId);
-                Debug.LogError($"[POISON-SHOT-MOD-KILL] drain target={kill.TargetEntityId} sourceEntity={kill.SourceEntityId} nativeDamageTime={kill.NativeDamageTime:F3} conn={(conn != null ? conn.ConnId.ToString() : "null")} source={kill.Source ?? "modifier-tick"}");
+                Debug.LogError($"[POISON-SHOT-MOD-KILL] drain target={kill.TargetEntityId} sourceEntity={kill.SourceEntityId} clientDamageTime={kill.DamageTime:F3} conn={(conn != null ? conn.ConnId.ToString() : "null")} source={kill.Source ?? "modifier-tick"}");
                 if (monster == null)
                 {
                     Debug.LogError($"[POISON-SHOT-MOD-KILL] missing monster target={kill.TargetEntityId}");
                     continue;
                 }
 
-                CombatManager.Instance.CancelMonsterPendingAttack(monster, "SPELL-MOD-tick-kill");
+                CombatRuntime.Instance.CancelMonsterPendingAttack(monster, "SPELL-MOD-tick-kill");
                 try
                 {
                     bool finalized = TryFinalizeMonsterKill(conn, monster, "SPELL-MOD-tick");
@@ -1242,72 +1000,99 @@ namespace DungeonRunners.Networking
             }
         }
 
-        private void DrainWeaponCycleKills(string source)
+        private void DrainWeaponUseStateKills(string source)
         {
-            while (Combat.WeaponCycleTracker.Instance.HasPendingKills)
+            while (Combat.WeaponUseRuntime.Instance.HasPendingKills)
             {
-                var kill = Combat.WeaponCycleTracker.Instance.DequeueKill();
+                var kill = Combat.WeaponUseRuntime.Instance.DequeueKill();
                 if (kill == null || !kill.Killed)
                     continue;
 
-                Debug.LogError($"[WEAPON-CYCLE] ★ KILL: {kill.Monster?.Name ?? "monster"} killed by {kill.ConnKey} ({kill.DamageDealt} final dmg) source={source ?? "unknown"}");
+                Debug.LogError($"[WEAPON-USE]  KILL: {kill.Monster?.Name ?? "monster"} killed by {kill.ConnKey} ({kill.DamageDealt} final dmg) source={source ?? "unknown"}");
                 if (kill.Monster != null)
-                    CombatManager.Instance.CancelMonsterPendingAttack(kill.Monster, "WeaponCycle-kill");
+                    CombatRuntime.Instance.CancelMonsterPendingAttack(kill.Monster, "WeaponUseState-kill");
                 try
                 {
-                    bool finalized = TryFinalizeMonsterKill(kill.Connection, kill.Monster, source ?? "WeaponCycle-tick");
-                    Debug.LogError($"[WEAPON-CYCLE] finalize result={finalized} monster={kill.Monster?.Name} eid={kill.Monster?.EntityId} source={source ?? "unknown"}");
+                    bool finalized = TryFinalizeMonsterKill(kill.Connection, kill.Monster, source ?? "WeaponUseState-tick");
+                    Debug.LogError($"[WEAPON-USE] finalize result={finalized} monster={kill.Monster?.Name} eid={kill.Monster?.EntityId} source={source ?? "unknown"}");
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogError($"[KILL-ERROR] WeaponCycle finalize failed for {kill.Monster?.Name}: {ex.Message}\n{ex.StackTrace}");
+                    Debug.LogError($"[KILL-ERROR] WeaponUseState finalize failed for {kill.Monster?.Name}: {ex.Message}\n{ex.StackTrace}");
                     if (IsUseTargetingMonster(kill.Connection, kill.Monster))
-                        ClearUseTargetAndReleaseControl(kill.Connection, "WeaponCycle-error");
+                        ClearUseTargetAndReleaseControl(kill.Connection, "WeaponUseState-error");
                 }
                 if (kill.Connection != null)
-                    ClearUseTargetAndReleaseControl(kill.Connection, "WeaponCycle-kill", sendClientControlReset: true, requireActiveUseTargetForReset: true);
+                    ClearUseTargetAndReleaseControl(kill.Connection, "WeaponUseState-kill", sendClientControlReset: true, requireActiveUseTargetForReset: true);
             }
+        }
+
+        private HashSet<string> GetActivePlayerInstanceKeys()
+        {
+            var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var conn in _connections.Values)
+            {
+                if (conn == null || !conn.IsConnected || conn.Avatar == null)
+                    continue;
+                string key = conn.RuntimeInstanceKey;
+                if (!string.IsNullOrEmpty(key))
+                    keys.Add(key);
+            }
+            return keys;
         }
 
         private void TickCombatDeterministicSystems(float tickNow, bool allowNewMonsterAttacks)
         {
             ProcessPendingSpellsForPlayerEntity(0, tickNow);
-            Combat.WeaponCycleTracker.Instance.TickProjectileEntityPhase(null, tickNow, "ClientEntityManager.updateEntities-subentities");
-            CombatManager.Instance.MarkNativeSubEntityUpdateCompleted(CombatManager.Instance.NativeCombatTick, tickNow, "GameServer.Update-subentities");
+            ProcessPendingAoECasts(tickNow);
 
-            foreach (uint entityId in CombatManager.Instance.GetNativeEntityOrderSnapshot())
+            bool tickEntityWanderThisPass = _entityCatchUpTicksThisFrame < _entityUpdateBudgetThisFrame;
+            if (tickEntityWanderThisPass)
+                _entityCatchUpTicksThisFrame++;
+
+            HashSet<string> activeInstanceKeys = GetActivePlayerInstanceKeys();
+
+            Combat.WeaponUseRuntime.Instance.TickProjectileEntityPhase(null, tickNow, "ClientEntityManager.updateEntities-subentities");
+            CombatRuntime.Instance.MarkSubEntityUpdateCompleted(CombatRuntime.Instance.CombatTick, tickNow, "GameServer.Update-subentities");
+
+            foreach (uint entityId in CombatRuntime.Instance.GetEntityOrderSnapshot())
             {
-                if (CombatManager.Instance.IsNativeMonsterEntity(entityId))
+                if (CombatRuntime.Instance.IsMonsterEntity(entityId))
                 {
-                    var monster = CombatManager.Instance.GetMonster(entityId);
-                    var monsterRng = CombatManager.Instance.GetRoomRngForMonster(monster);
-                    if (monsterRng != null)
+                    var monster = CombatRuntime.Instance.GetMonster(entityId);
+                    if (monster != null && !string.IsNullOrEmpty(monster.InstanceKey) && !activeInstanceKeys.Contains(monster.InstanceKey))
+                        continue;
+                    var monsterRng = CombatRuntime.Instance.GetRoomRngForMonster(monster);
+                    if (tickEntityWanderThisPass && monsterRng != null)
                         Combat.WanderSimulator.Instance.TickEntity(entityId, monsterRng);
-                    CombatManager.Instance.UpdateNativeMonsterEntity(entityId, COMBAT_TICK, allowNewMonsterAttacks, tickNow);
+                    if (monster != null && !monster.AggroTriggered)
+                        CombatRuntime.Instance.ApplyMonsterWanderClientVisiblePosition(monster, "wander-tick");
+                    CombatRuntime.Instance.TickMonsterUpdateSkillsForEntity(entityId);
+                    CombatRuntime.Instance.UpdateMonsterEntity(entityId, COMBAT_TICK, allowNewMonsterAttacks, tickNow, tickEntityWanderThisPass);
                 }
-                else if (CombatManager.Instance.IsNativePlayerEntity(entityId))
+                else if (CombatRuntime.Instance.IsPlayerEntity(entityId))
                 {
-                    var playerRng = CombatManager.Instance.GetRoomRngForPlayerEntity(entityId);
-                    Combat.WeaponCycleTracker.Instance.TickPlayerEntity(entityId, playerRng, tickNow);
+                    var playerRng = CombatRuntime.Instance.GetRoomRngForPlayerEntity(entityId);
+                    Combat.WeaponUseRuntime.Instance.TickPlayerEntity(entityId, playerRng, tickNow);
                 }
             }
 
-            CombatManager.Instance.UpdateNativeMaintenance(COMBAT_TICK);
-            TickLazyEncounterSpawns();
+            CombatRuntime.Instance.UpdateMaintenance(COMBAT_TICK);
+            UpdateEncounterObjects();
             DrainPendingModifierKills();
-            DrainWeaponCycleKills("WeaponCycle-tick");
-            while (Combat.WeaponCycleTracker.Instance.HasPendingControlReleases)
+            DrainWeaponUseStateKills("WeaponUseState-tick");
+            while (Combat.WeaponUseRuntime.Instance.HasPendingControlReleases)
             {
-                var releaseConn = Combat.WeaponCycleTracker.Instance.DequeueControlRelease();
+                var releaseConn = Combat.WeaponUseRuntime.Instance.DequeueControlRelease();
                 if (releaseConn != null)
-                    ClearUseTargetAndReleaseControl(releaseConn, "WeaponCycle-resolve-release", sendClientControlReset: true, requireActiveUseTargetForReset: true);
+                    ClearUseTargetAndReleaseControl(releaseConn, "WeaponUseState-resolve-release", sendClientControlReset: true, requireActiveUseTargetForReset: true);
             }
         }
 
         private void ProcessPendingSpellsForPlayerEntity(uint playerEntityId, float now)
         {
             int pendingCount = _pendingSpells.Count;
-            for (int i = 0; i < pendingCount; i++)
+            for (int pendingIndex = 0; pendingIndex < pendingCount; pendingIndex++)
             {
                 if (!_pendingSpells.TryDequeue(out var pending))
                     break;
@@ -1369,21 +1154,21 @@ namespace DungeonRunners.Networking
             if (maxDistance <= 0.001f)
                 maxDistance = Mathf.Max(0.001f, aimDistance);
 
-            float fireTime = GetNativeCombatNow();
-            int fireTick = Combat.WeaponCycleTracker.NativeTickIndexFromTime(fireTime);
+            float fireTime = GetCombatNow() + ResolveActiveSkillTriggerFrames(spell, state) * COMBAT_TICK;
+            int fireTick = Combat.WeaponUseRuntime.TickIndexFromTime(fireTime);
             int maxLifetimeTicks = spell != null && size > 0f && speed > 0f
-                ? Math.Max(1, Combat.WeaponCycleTracker.NativeProjectileFlightTicks(maxDistance, speed))
+                ? Math.Max(1, Combat.WeaponUseRuntime.ProjectileFlightTicks(maxDistance, speed))
                 : 1;
             float stepDistance = spell != null && size > 0f && speed > 0f
-                ? Combat.WeaponCycleTracker.NativeProjectileStepDistance(speed)
+                ? Combat.WeaponUseRuntime.ProjectileStepDistance(speed)
                 : 0f;
             float initialDistance = spell != null && size > 0f && speed > 0f
-                ? Combat.WeaponCycleTracker.NativeProjectileInitialDistance(speed, maxDistance)
+                ? Combat.WeaponUseRuntime.ProjectileInitialDistance(speed, maxDistance)
                 : 0f;
-            float diagnosticDistance = hitDistanceHint > 0f
+            float resolvedHitDistance = hitDistanceHint > 0f
                 ? Mathf.Min(hitDistanceHint, maxDistance)
                 : maxDistance;
-            float projectileDelay = ResolveProjectileImpactDelay(spell, diagnosticDistance);
+            float projectileDelay = ResolveProjectileImpactDelay(spell, state, resolvedHitDistance);
 
             return new PendingSpell
             {
@@ -1401,13 +1186,13 @@ namespace DungeonRunners.Networking
                 AimY = aimY,
                 InstanceKey = conn != null ? GetInstanceZoneKey(conn) : null,
                 DueTime = fireTime + projectileDelay,
-                ProjectileHitDistance = diagnosticDistance,
+                ProjectileHitDistance = resolvedHitDistance,
                 ProjectileDelay = projectileDelay,
                 QueuedWithoutInitialTarget = queuedWithoutInitialTarget,
                 ProjectileRuntimeInitialized = spell != null && size > 0f && speed > 0f,
                 FireTime = fireTime,
-                FireNativeTick = fireTick,
-                LastUpdateNativeTick = fireTick,
+                FireTick = fireTick,
+                LastUpdateTick = fireTick,
                 UpdatesCompleted = initialDistance > 0f ? 1 : 0,
                 MaxLifetimeTicks = maxLifetimeTicks,
                 ProjectileSpeed = speed,
@@ -1432,23 +1217,23 @@ namespace DungeonRunners.Networking
             if (spell == null || pending.ProjectileSpeed <= 0f || pending.ProjectileSize <= 0f)
                 return IsPendingSpellDue(pending, now);
 
-            int nowTick = Combat.WeaponCycleTracker.NativeTickIndexFromTime(now);
-            if (nowTick <= pending.LastUpdateNativeTick)
+            int nowTick = Combat.WeaponUseRuntime.TickIndexFromTime(now);
+            if (nowTick <= pending.LastUpdateTick)
                 return false;
 
-            for (int updateTick = pending.LastUpdateNativeTick + 1; updateTick <= nowTick; updateTick++)
+            for (int updateTick = pending.LastUpdateTick + 1; updateTick <= nowTick; updateTick++)
             {
-                float updateTime = updateTick * Combat.WeaponCycleTracker.NativeUpdateTickSeconds;
+                float updateTime = updateTick * Combat.WeaponUseRuntime.UpdateTickSeconds;
                 if (pending.UpdatesCompleted >= pending.MaxLifetimeTicks)
                 {
-                    Debug.LogError($"[SPELL-PROJECTILE] expired no-hit spell={spell.DisplayName ?? spell.SkillId ?? "spell"} seq={pending.Sequence} manip={pending.ManipId} aim=({pending.AimX:F1},{pending.AimY:F1}) current={pending.CurrentDistance:F2}/{pending.MaxDistance:F2} updates={pending.UpdatesCompleted}/{pending.MaxLifetimeTicks} tick={updateTick} source={source ?? "unknown"} native=Projectile::update lifetime-zero-before-unit-check");
+                    Debug.LogError($"[SPELL-PROJECTILE] expired no-hit spell={spell.DisplayName ?? spell.SkillId ?? "spell"} seq={pending.Sequence} manip={pending.ManipId} aim=({pending.AimX:F1},{pending.AimY:F1}) current={pending.CurrentDistance:F2}/{pending.MaxDistance:F2} updates={pending.UpdatesCompleted}/{pending.MaxLifetimeTicks} tick={updateTick} source={source ?? "unknown"} sourceFunction=Projectile::update lifetime-zero-before-unit-check");
                     return true;
                 }
 
                 float beforeDistance = pending.CurrentDistance;
                 float afterDistance = Mathf.Min(pending.MaxDistance, beforeDistance + Mathf.Max(0.001f, pending.StepDistance));
                 pending.UpdatesCompleted++;
-                pending.LastUpdateNativeTick = updateTick;
+                pending.LastUpdateTick = updateTick;
 
                 if (TryResolvePendingSpellTargetAlongSegment(ref pending, beforeDistance, afterDistance, out Combat.Monster target, out float hitDistance, out bool worldBlocked))
                 {
@@ -1457,9 +1242,9 @@ namespace DungeonRunners.Networking
                     pending.ProjectileDelay = Mathf.Max(0f, updateTime - pending.FireTime);
                     pending.DueTime = updateTime;
                     pending.CurrentDistance = hitDistance;
-                    float hitRadius = WeaponCycleTracker.NativeProjectileCollisionRadius(target.CollisionRadius, pending.ProjectileSize);
-                    Debug.LogError($"[SPELL-PROJECTILE] subentity impact spell={spell.DisplayName ?? spell.SkillId ?? "spell"} seq={pending.Sequence} target={target.Name}#{target.EntityId} segment={beforeDistance:F2}->{afterDistance:F2} hitDist={hitDistance:F2} tick={updateTick} updates={pending.UpdatesCompleted}/{pending.MaxLifetimeTicks} radius={hitRadius:F2} projectileRadius={WeaponCycleTracker.NativeProjectileRadiusFromAuthoredSize(pending.ProjectileSize):F2} worldBlocked={worldBlocked} source={source ?? "unknown"}");
-                    if (target.IsAlive && CombatManager.Instance.PeekMonsterCurrentHPWire(target) != 0)
+                    float hitRadius = WeaponUseRuntime.ProjectileCollisionRadius(target.CollisionRadius, pending.ProjectileSize);
+                    Debug.LogError($"[SPELL-PROJECTILE] subentity impact spell={spell.DisplayName ?? spell.SkillId ?? "spell"} seq={pending.Sequence} target={target.Name}#{target.EntityId} segment={beforeDistance:F2}->{afterDistance:F2} hitDist={hitDistance:F2} tick={updateTick} updates={pending.UpdatesCompleted}/{pending.MaxLifetimeTicks} radius={hitRadius:F2} projectileRadius={WeaponUseRuntime.ProjectileRadiusFromAuthoredSize(pending.ProjectileSize):F2} worldBlocked={worldBlocked} source={source ?? "unknown"}");
+                    if (target.IsAlive && CombatRuntime.Instance.PeekMonsterCurrentHPWire(target) != 0)
                         HandleSpellAttack(pending.Conn, pending.State, target, pending.ManipId, pending.UseFlags, pending.AimX, pending.AimY, updateTime);
                     return true;
                 }
@@ -1467,7 +1252,7 @@ namespace DungeonRunners.Networking
                 pending.CurrentDistance = afterDistance;
                 if (pending.CurrentDistance + 0.0001f >= pending.MaxDistance || pending.UpdatesCompleted >= pending.MaxLifetimeTicks)
                 {
-                    Debug.LogError($"[SPELL-PROJECTILE] expired no-hit spell={spell.DisplayName ?? spell.SkillId ?? "spell"} seq={pending.Sequence} manip={pending.ManipId} aim=({pending.AimX:F1},{pending.AimY:F1}) current={pending.CurrentDistance:F2}/{pending.MaxDistance:F2} updates={pending.UpdatesCompleted}/{pending.MaxLifetimeTicks} tick={updateTick} source={source ?? "unknown"} native=Projectile::update range-end");
+                    Debug.LogError($"[SPELL-PROJECTILE] expired no-hit spell={spell.DisplayName ?? spell.SkillId ?? "spell"} seq={pending.Sequence} manip={pending.ManipId} aim=({pending.AimX:F1},{pending.AimY:F1}) current={pending.CurrentDistance:F2}/{pending.MaxDistance:F2} updates={pending.UpdatesCompleted}/{pending.MaxLifetimeTicks} tick={updateTick} source={source ?? "unknown"} sourceFunction=Projectile::update range-end");
                     return true;
                 }
             }
@@ -1500,35 +1285,35 @@ namespace DungeonRunners.Networking
                 ? pending.InstanceKey
                 : (pending.Conn != null ? GetInstanceZoneKey(pending.Conn) : null);
             float projectileSize = Mathf.Max(0f, pending.ProjectileSize);
-            float projectileRadius = WeaponCycleTracker.NativeProjectileRadiusFromAuthoredSize(projectileSize);
+            float projectileRadius = WeaponUseRuntime.ProjectileRadiusFromAuthoredSize(projectileSize);
             float scanRange = Mathf.Max(segmentEnd + projectileRadius + 20f, pending.MaxDistance + projectileRadius + 20f);
 
             Combat.Monster best = null;
             float bestAlong = float.MaxValue;
             float bestDistSq = float.MaxValue;
             bool bestBlocked = false;
-            foreach (var candidate in CombatManager.Instance.GetActiveMonsters())
+            foreach (var candidate in CombatRuntime.Instance.GetActiveMonsters())
             {
                 if (candidate == null || !candidate.IsAlive)
                     continue;
-                if (CombatManager.Instance.PeekMonsterCurrentHPWire(candidate) == 0)
+                if (CombatRuntime.Instance.PeekMonsterCurrentHPWire(candidate) == 0)
                     continue;
-                if (!CombatManager.Instance.MatchesInstance(candidate, instanceKey))
+                if (!CombatRuntime.Instance.MatchesInstance(candidate, instanceKey))
                     continue;
                 if (!string.IsNullOrWhiteSpace(zoneName)
                     && !string.IsNullOrWhiteSpace(candidate.ZoneName)
                     && !string.Equals(candidate.ZoneName, zoneName, StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                float clientVisibleNow = pending.LastUpdateNativeTick * WeaponCycleTracker.NativeUpdateTickSeconds;
-                CombatManager.Instance.TryGetMonsterClientVisiblePosition(candidate, clientVisibleNow, out float candidateX, out float candidateY);
+                float clientVisibleNow = pending.LastUpdateTick * WeaponUseRuntime.UpdateTickSeconds;
+                CombatRuntime.Instance.TryGetMonsterClientVisiblePosition(candidate, clientVisibleNow, out float candidateX, out float candidateY);
                 if (((candidateX - pending.StartX) * (candidateX - pending.StartX)) + ((candidateY - pending.StartY) * (candidateY - pending.StartY)) > scanRange * scanRange)
                     continue;
 
                 float cx = candidateX - pending.StartX;
                 float cy = candidateY - pending.StartY;
                 float projected = (cx * dirX) + (cy * dirY);
-                float radius = WeaponCycleTracker.NativeProjectileCollisionRadius(candidate.CollisionRadius, projectileSize);
+                float radius = WeaponUseRuntime.ProjectileCollisionRadius(candidate.CollisionRadius, projectileSize);
                 if (projected + radius < segmentStart || projected - radius > segmentEnd)
                     continue;
 
@@ -1556,7 +1341,7 @@ namespace DungeonRunners.Networking
             if (best == null)
                 return false;
 
-            CombatManager.Instance.SyncMonsterWanderClientVisiblePosition(best, "SpellProjectileChecker-subentity-hit");
+            CombatRuntime.Instance.ApplyMonsterWanderClientVisiblePosition(best, "SpellProjectileChecker-subentity-hit");
             hitMonster = best;
             hitDistance = Mathf.Max(0f, bestAlong);
             worldBlocked = bestBlocked;
@@ -1570,8 +1355,8 @@ namespace DungeonRunners.Networking
                 : (pending.Conn != null ? GetInstanceZoneKey(pending.Conn) : null);
             if (pending.Monster != null &&
                 pending.Monster.IsAlive &&
-                CombatManager.Instance.PeekMonsterCurrentHPWire(pending.Monster) != 0 &&
-                CombatManager.Instance.MatchesInstance(pending.Monster, instanceKey))
+                CombatRuntime.Instance.PeekMonsterCurrentHPWire(pending.Monster) != 0 &&
+                CombatRuntime.Instance.MatchesInstance(pending.Monster, instanceKey))
                 return pending.Monster;
 
             Combat.SpellData spell = pending.Spell;
@@ -1599,7 +1384,7 @@ namespace DungeonRunners.Networking
 
             pending.Monster = target;
             pending.ProjectileHitDistance = hitDistance;
-            pending.ProjectileDelay = ResolveProjectileImpactDelay(spell, hitDistance);
+            pending.ProjectileDelay = ResolveProjectileImpactDelay(spell, pending.State, hitDistance);
             Debug.LogError($"[SPELL-PROJECTILE] resolved spell={spell.DisplayName ?? spell.SkillId ?? "spell"} target={target.Name}#{target.EntityId} hitDist={hitDistance:F2} due={pending.DueTime:F3} now={now:F3} source={source ?? "unknown"} queuedWithoutInitialTarget={pending.QueuedWithoutInitialTarget}");
             return target;
         }
@@ -1620,7 +1405,7 @@ namespace DungeonRunners.Networking
             {
                 TargetEntityId = monster != null ? monster.EntityId : 0,
                 PendingBefore = _pendingSpells.Count,
-                BeforeHPWire = monster != null ? CombatManager.Instance.PeekMonsterCurrentHPWire(monster) : 0u
+                BeforeHPWire = monster != null ? CombatRuntime.Instance.PeekMonsterCurrentHPWire(monster) : 0u
             };
 
             if (monster == null || result.PendingBefore == 0)
@@ -1631,14 +1416,14 @@ namespace DungeonRunners.Networking
             }
 
             int pendingCount = _pendingSpells.Count;
-            for (int i = 0; i < pendingCount; i++)
+            for (int pendingIndex = 0; pendingIndex < pendingCount; pendingIndex++)
             {
                 if (!_pendingSpells.TryDequeue(out var pending))
                     break;
 
                 if (pending.ProjectileRuntimeInitialized)
                 {
-                    uint beforeProjectileHP = CombatManager.Instance.PeekMonsterCurrentHPWire(monster);
+                    uint beforeProjectileHP = CombatRuntime.Instance.PeekMonsterCurrentHPWire(monster);
                     bool consumed = UpdatePendingSpellProjectile(ref pending, now, source);
                     if (!consumed)
                     {
@@ -1653,7 +1438,7 @@ namespace DungeonRunners.Networking
                     else
                         result.DueOther++;
 
-                    uint afterProjectileHP = CombatManager.Instance.PeekMonsterCurrentHPWire(monster);
+                    uint afterProjectileHP = CombatRuntime.Instance.PeekMonsterCurrentHPWire(monster);
                     if (afterProjectileHP != beforeProjectileHP)
                         result.Applied++;
                     continue;
@@ -1673,7 +1458,7 @@ namespace DungeonRunners.Networking
                 else
                     result.DueOther++;
 
-                if (resolvedTarget == null || !resolvedTarget.IsAlive || CombatManager.Instance.PeekMonsterCurrentHPWire(resolvedTarget) == 0)
+                if (resolvedTarget == null || !resolvedTarget.IsAlive || CombatRuntime.Instance.PeekMonsterCurrentHPWire(resolvedTarget) == 0)
                 {
                     result.SkippedDead++;
                     if (pending.QueuedWithoutInitialTarget)
@@ -1681,7 +1466,7 @@ namespace DungeonRunners.Networking
                     continue;
                 }
 
-                uint beforeHP = CombatManager.Instance.PeekMonsterCurrentHPWire(resolvedTarget);
+                uint beforeHP = CombatRuntime.Instance.PeekMonsterCurrentHPWire(resolvedTarget);
                 HandleSpellAttack(
                     pending.Conn,
                     pending.State,
@@ -1691,19 +1476,18 @@ namespace DungeonRunners.Networking
                     pending.AimX,
                     pending.AimY,
                     ResolvePendingSpellImpactTime(pending, now));
-                uint afterHP = CombatManager.Instance.PeekMonsterCurrentHPWire(resolvedTarget);
+                uint afterHP = CombatRuntime.Instance.PeekMonsterCurrentHPWire(resolvedTarget);
                 result.Applied++;
                 Debug.LogError($"[SPELL-PRE-SUFFIX] source={source ?? "unknown"} target={resolvedTarget.Name}#{resolvedTarget.EntityId} behavior={resolvedTarget.BehaviorId} due={pending.DueTime:F3} now={now:F3} delay={pending.ProjectileDelay:F3} hitDist={pending.ProjectileHitDistance:F2} hp={beforeHP}->{afterHP} sameTarget={sameTarget} applied=True");
             }
 
             result.PendingAfter = _pendingSpells.Count;
-            result.AfterHPWire = CombatManager.Instance.PeekMonsterCurrentHPWire(monster);
+            result.AfterHPWire = CombatRuntime.Instance.PeekMonsterCurrentHPWire(monster);
             if (result.PendingBefore > 0 || result.DueForTarget > 0 || result.DueOther > 0 || result.Applied > 0)
                 Debug.LogError($"[SPELL-PRE-SUFFIX] source={source ?? "unknown"} target={monster.Name}#{monster.EntityId} pending={result.PendingBefore}->{result.PendingAfter} due={result.DueForTarget} dueOther={result.DueOther} applied={result.Applied} skippedDead={result.SkippedDead} future={result.RequeuedFuture} other={result.RequeuedOther} hp={result.BeforeHPWire}->{result.AfterHPWire} now={now:F3}");
             return result;
         }
 
-        // Pending kills: legacy queue drained by native server-side finalization.
         private Dictionary<uint, (RRConnection conn, Combat.Monster monster, string source, float time)> _pendingKills
             = new Dictionary<uint, (RRConnection, Combat.Monster, string, float)>();
     }

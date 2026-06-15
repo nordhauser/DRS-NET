@@ -8,31 +8,31 @@ namespace DungeonRunners.Networking
 {
     public static class WirePacketTally
     {
-        private static HashSet<ushort> _mEids = new HashSet<ushort>();
-        private static HashSet<ushort> _mCids = new HashSet<ushort>();
+        private static HashSet<ushort> _monsterEntityIds = new HashSet<ushort>();
+        private static HashSet<ushort> _monsterComponentIds = new HashSet<ushort>();
         private static int _totalTCP, _totalUDP, _totalChannel, _monsterHits;
         private static Dictionary<string, int> _tcpTypes = new Dictionary<string, int>();
         private static Dictionary<string, int> _udpTypes = new Dictionary<string, int>();
-        private static Dictionary<string, int> _chTypes = new Dictionary<string, int>();
-        private static Dictionary<string, int> _streamSubs = new Dictionary<string, int>();
-        private static Dictionary<string, int> _compSubs = new Dictionary<string, int>();
-        private static List<string> _monsterMsgs = new List<string>();
+        private static Dictionary<string, int> _channelTypes = new Dictionary<string, int>();
+        private static Dictionary<string, int> _streamSubMessages = new Dictionary<string, int>();
+        private static Dictionary<string, int> _componentSubMessages = new Dictionary<string, int>();
+        private static List<string> _monsterMessages = new List<string>();
         private static float _lastReport;
         private static bool _active;
         private static bool Enabled => ServerSettings.GetBool("verboseMonsterWireLogging", false) || ServerSettings.GetBool("verbosePacketLogging", false);
 
-        private static void Inc(Dictionary<string, int> d, string k)
+        private static void IncrementCount(Dictionary<string, int> counts, string key)
         {
-            if (d.ContainsKey(k)) d[k]++; else d[k] = 1;
+            if (counts.ContainsKey(key)) counts[key]++; else counts[key] = 1;
         }
 
-        public static void RegisterMonster(ushort eid, ushort behId, ushort sklId, ushort manId, ushort modId)
+        public static void RegisterMonster(ushort entityId, ushort behaviorId, ushort skillId, ushort manipulatorId, ushort modifierId)
         {
             if (!Enabled) return;
-            _mEids.Add(eid);
-            _mCids.Add(behId); _mCids.Add(sklId); _mCids.Add(manId); _mCids.Add(modId);
+            _monsterEntityIds.Add(entityId);
+            _monsterComponentIds.Add(behaviorId); _monsterComponentIds.Add(skillId); _monsterComponentIds.Add(manipulatorId); _monsterComponentIds.Add(modifierId);
             _active = true;
-            Debug.LogError($"[MC] Registered eid={eid} cids=[{behId},{sklId},{manId},{modId}]");
+            Debug.LogError($"[MC] Registered eid={entityId} cids=[{behaviorId},{skillId},{manipulatorId},{modifierId}]");
         }
 
         public static void OnRawTCP(byte[] data)
@@ -40,25 +40,25 @@ namespace DungeonRunners.Networking
             if (!Enabled) return;
             if (!_active || data == null || data.Length < 1 || data[0] == 0x02) return;
             _totalTCP++;
-            Inc(_tcpTypes, $"0x{data[0]:X2}");
+            IncrementCount(_tcpTypes, $"0x{data[0]:X2}");
             ScanForMonsterIds(data, $"TCP-0x{data[0]:X2}");
         }
 
-        public static void OnChannel(byte ch, byte type, byte[] data)
+        public static void OnChannel(byte channel, byte messageType, byte[] data)
         {
             if (!Enabled) return;
             if (!_active || data == null) return;
             _totalChannel++;
-            Inc(_chTypes, $"ch{ch}/0x{type:X2}");
-            ScanForMonsterIds(data, $"ch{ch}/0x{type:X2}");
-            if (ch == 7 && type == 0x07 && data.Length > 0) ParseStream(data);
-            if (ch == 7 && (type == 0x34 || type == 0x35) && data.Length >= 3)
+            IncrementCount(_channelTypes, $"ch{channel}/0x{messageType:X2}");
+            ScanForMonsterIds(data, $"ch{channel}/0x{messageType:X2}");
+            if (channel == 7 && messageType == 0x07 && data.Length > 0) ParseStream(data);
+            if (channel == 7 && (messageType == 0x34 || messageType == 0x35) && data.Length >= 3)
             {
-                ushort cid = (ushort)(data[0] | (data[1] << 8));
-                byte sub = data[2];
-                Inc(_compSubs, $"cid={cid}/0x{sub:X2}");
-                if (_mCids.Contains(cid))
-                    _monsterMsgs.Add($"CH-COMP cid={cid} sub=0x{sub:X2} len={data.Length} hex={Hex(data)}");
+                ushort componentId = (ushort)(data[0] | (data[1] << 8));
+                byte subMessage = data[2];
+                IncrementCount(_componentSubMessages, $"cid={componentId}/0x{subMessage:X2}");
+                if (_monsterComponentIds.Contains(componentId))
+                    _monsterMessages.Add($"CH-COMP cid={componentId} sub=0x{subMessage:X2} len={data.Length} hex={Hex(data)}");
             }
         }
 
@@ -67,72 +67,72 @@ namespace DungeonRunners.Networking
             if (!Enabled) return;
             if (!_active || data == null || data.Length < 1) return;
             _totalUDP++;
-            Inc(_udpTypes, $"0x{data[0]:X2}");
+            IncrementCount(_udpTypes, $"0x{data[0]:X2}");
             ScanForMonsterIds(data, $"UDP-0x{data[0]:X2}");
             if (data[0] == 0x07 && data.Length > 1)
             {
-                byte[] inner = new byte[data.Length - 1];
-                Array.Copy(data, 1, inner, 0, inner.Length);
-                ParseStream(inner);
+                byte[] innerData = new byte[data.Length - 1];
+                Array.Copy(data, 1, innerData, 0, innerData.Length);
+                ParseStream(innerData);
             }
             if ((data[0] == 0x34 || data[0] == 0x35) && data.Length >= 4)
             {
-                ushort cid = (ushort)(data[1] | (data[2] << 8));
-                byte sub = data[3];
-                Inc(_compSubs, $"UDP-cid={cid}/0x{sub:X2}");
-                if (_mCids.Contains(cid))
-                    _monsterMsgs.Add($"UDP-COMP cid={cid} sub=0x{sub:X2} len={data.Length} hex={Hex(data)}");
+                ushort componentId = (ushort)(data[1] | (data[2] << 8));
+                byte subMessage = data[3];
+                IncrementCount(_componentSubMessages, $"UDP-cid={componentId}/0x{subMessage:X2}");
+                if (_monsterComponentIds.Contains(componentId))
+                    _monsterMessages.Add($"UDP-COMP cid={componentId} sub=0x{subMessage:X2} len={data.Length} hex={Hex(data)}");
             }
         }
 
         private static void ParseStream(byte[] data)
         {
-            int pos = 0;
-            while (pos < data.Length)
+            int position = 0;
+            while (position < data.Length)
             {
-                byte sub = data[pos];
-                if (sub == 0x06 || sub == 0x46) break;
-                Inc(_streamSubs, $"0x{sub:X2}");
-                if ((sub == 0x34 || sub == 0x35) && pos + 3 < data.Length)
+                byte subMessage = data[position];
+                if (subMessage == 0x06 || subMessage == 0x46) break;
+                IncrementCount(_streamSubMessages, $"0x{subMessage:X2}");
+                if ((subMessage == 0x34 || subMessage == 0x35) && position + 3 < data.Length)
                 {
-                    ushort cid = (ushort)(data[pos + 1] | (data[pos + 2] << 8));
-                    byte csub = data[pos + 3];
-                    Inc(_compSubs, $"s-cid={cid}/0x{csub:X2}");
-                    if (_mCids.Contains(cid))
-                        _monsterMsgs.Add($"S-COMP cid={cid} sub=0x{csub:X2} @{pos} hex={Hex(data, pos, 20)}");
+                    ushort componentId = (ushort)(data[position + 1] | (data[position + 2] << 8));
+                    byte componentSubMessage = data[position + 3];
+                    IncrementCount(_componentSubMessages, $"s-cid={componentId}/0x{componentSubMessage:X2}");
+                    if (_monsterComponentIds.Contains(componentId))
+                        _monsterMessages.Add($"S-COMP cid={componentId} sub=0x{componentSubMessage:X2} @{position} hex={Hex(data, position, 20)}");
                 }
-                if (sub == 0x36 && pos + 3 < data.Length)
+                if (subMessage == 0x36 && position + 3 < data.Length)
                 {
-                    ushort eid = (ushort)(data[pos + 1] | (data[pos + 2] << 8));
-                    if (_mEids.Contains(eid))
-                        _monsterMsgs.Add($"S-SYNC eid={eid} @{pos} hex={Hex(data, pos, 10)}");
+                    ushort entityId = (ushort)(data[position + 1] | (data[position + 2] << 8));
+                    if (_monsterEntityIds.Contains(entityId))
+                        _monsterMessages.Add($"S-ENTITY-SYNCH eid={entityId} @{position} hex={Hex(data, position, 10)}");
                 }
-                if (pos + 2 < data.Length)
+                if (position + 2 < data.Length)
                 {
-                    ushort v = (ushort)(data[pos + 1] | (data[pos + 2] << 8));
-                    if (_mCids.Contains(v))
-                        _monsterMsgs.Add($"S-0x{sub:X2} MCID={v} @{pos + 1} hex={Hex(data, pos, 20)}");
-                    if (_mEids.Contains(v))
-                        _monsterMsgs.Add($"S-0x{sub:X2} MEID={v} @{pos + 1} hex={Hex(data, pos, 20)}");
+                    ushort candidateId = (ushort)(data[position + 1] | (data[position + 2] << 8));
+                    if (_monsterComponentIds.Contains(candidateId))
+                        _monsterMessages.Add($"S-0x{subMessage:X2} MCID={candidateId} @{position + 1} hex={Hex(data, position, 20)}");
+                    if (_monsterEntityIds.Contains(candidateId))
+                        _monsterMessages.Add($"S-0x{subMessage:X2} MEID={candidateId} @{position + 1} hex={Hex(data, position, 20)}");
                 }
-                pos++;
+                position++;
             }
         }
 
-        private static void ScanForMonsterIds(byte[] data, string src)
+        private static void ScanForMonsterIds(byte[] data, string source)
         {
-            for (int i = 0; i < data.Length - 1; i++)
+            for (int dataOffset = 0; dataOffset < data.Length - 1; dataOffset++)
             {
-                ushort val = (ushort)(data[i] | (data[i + 1] << 8));
-                if (_mCids.Contains(val))
+                ushort candidateId = (ushort)(data[dataOffset] | (data[dataOffset + 1] << 8));
+                if (_monsterComponentIds.Contains(candidateId))
                 {
                     _monsterHits++;
-                    _monsterMsgs.Add($"CID={val} in {src} @{i} hex={Hex(data, Math.Max(0, i - 2), 24)}");
+                    _monsterMessages.Add($"CID={candidateId} in {source} @{dataOffset} hex={Hex(data, Math.Max(0, dataOffset - 2), 24)}");
                 }
-                if (_mEids.Contains(val))
+                if (_monsterEntityIds.Contains(candidateId))
                 {
                     _monsterHits++;
-                    _monsterMsgs.Add($"EID={val} in {src} @{i} hex={Hex(data, Math.Max(0, i - 2), 24)}");
+                    _monsterMessages.Add($"EID={candidateId} in {source} @{dataOffset} hex={Hex(data, Math.Max(0, dataOffset - 2), 24)}");
                 }
             }
         }
@@ -143,35 +143,35 @@ namespace DungeonRunners.Networking
             if (!_active) return;
             if (Time.time - _lastReport < 3f) return;
             _lastReport = Time.time;
-            Debug.LogError("[MC] ═══════════════════════════════════════════════");
-            Debug.LogError($"[MC] TCP={_totalTCP} UDP={_totalUDP} CH={_totalChannel} Hits={_monsterHits}");
-            Debug.LogError($"[MC] eids=[{string.Join(",", _mEids)}] cids=[{string.Join(",", _mCids)}]");
+            Debug.LogError("[MC] report");
+            Debug.LogError($"[MC] tcp={_totalTCP} udp={_totalUDP} ch={_totalChannel} hits={_monsterHits}");
+            Debug.LogError($"[MC] eids=[{string.Join(",", _monsterEntityIds)}] cids=[{string.Join(",", _monsterComponentIds)}]");
             if (_tcpTypes.Count > 0) Debug.LogError($"[MC] TCP: {Fmt(_tcpTypes)}");
             if (_udpTypes.Count > 0) Debug.LogError($"[MC] UDP: {Fmt(_udpTypes)}");
-            if (_chTypes.Count > 0) Debug.LogError($"[MC] CH: {Fmt(_chTypes)}");
-            if (_streamSubs.Count > 0) Debug.LogError($"[MC] STREAM: {Fmt(_streamSubs)}");
-            if (_compSubs.Count > 0) Debug.LogError($"[MC] COMP: {Fmt(_compSubs)}");
-            if (_monsterMsgs.Count > 0)
+            if (_channelTypes.Count > 0) Debug.LogError($"[MC] CH: {Fmt(_channelTypes)}");
+            if (_streamSubMessages.Count > 0) Debug.LogError($"[MC] STREAM: {Fmt(_streamSubMessages)}");
+            if (_componentSubMessages.Count > 0) Debug.LogError($"[MC] COMP: {Fmt(_componentSubMessages)}");
+            if (_monsterMessages.Count > 0)
             {
-                Debug.LogError($"[MC] ═══ MONSTER ({_monsterMsgs.Count}) ═══");
-                foreach (var m in _monsterMsgs.Skip(Math.Max(0, _monsterMsgs.Count - 20)))
-                    Debug.LogError($"[MC] 🔴 {m}");
+                Debug.LogError($"[MC] MONSTER ({_monsterMessages.Count})");
+                foreach (var monsterMessage in _monsterMessages.Skip(Math.Max(0, _monsterMessages.Count - 20)))
+                    Debug.LogError($"[MC] {monsterMessage}");
             }
             else if (_totalTCP + _totalUDP > 0)
-                Debug.LogError("[MC] ⚠️ NO MONSTER MESSAGES! Client not sending or wrong channel/format");
-            Debug.LogError("[MC] ═══════════════════════════════════════════════");
+                Debug.LogError("[MC] monsterMessages=0 reason=client-channel-or-format");
+            Debug.LogError("[MC] report");
         }
 
-        private static string Fmt(Dictionary<string, int> d)
+        private static string Fmt(Dictionary<string, int> counts)
         {
-            return string.Join(" | ", d.OrderByDescending(x => x.Value).Select(x => $"{x.Key}={x.Value}"));
+            return string.Join(" | ", counts.OrderByDescending(entry => entry.Value).Select(entry => $"{entry.Key}={entry.Value}"));
         }
 
-        private static string Hex(byte[] d, int start = 0, int len = 40)
+        private static string Hex(byte[] data, int start = 0, int length = 40)
         {
-            start = Math.Max(0, Math.Min(start, d.Length));
-            len = Math.Min(len, d.Length - start);
-            return len <= 0 ? "" : BitConverter.ToString(d, start, len);
+            start = Math.Max(0, Math.Min(start, data.Length));
+            length = Math.Min(length, data.Length - start);
+            return length <= 0 ? "" : BitConverter.ToString(data, start, length);
         }
     }
 }

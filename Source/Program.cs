@@ -34,9 +34,9 @@ namespace DungeonRunners
 
             ServerConfig config = BuildConfig();
 
-            var rootGo = new GameObject("ServerManager");
-            var serverManager = rootGo.AddComponent<ServerManager>();
-            InjectPrivateField(serverManager, "serverConfig", config);
+            var rootGo = new GameObject("ServerHost");
+            var serverHost = rootGo.AddComponent<ServerHost>();
+            InjectPrivateField(serverHost, "serverConfig", config);
 
             bool quitRequested = false;
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; quitRequested = true; Debug.Log("[BOOT] Ctrl+C — shutting down"); };

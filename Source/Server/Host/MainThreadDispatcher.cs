@@ -4,9 +4,6 @@ using DungeonRunners.Engine;
 
 namespace DungeonRunners.Core
 {
-    /// <summary>
-    /// Dispatches actions to Unity's main thread from background threads
-    /// </summary>
     public class MainThreadDispatcher : MonoBehaviour
     {
         private static MainThreadDispatcher _instance;
@@ -52,7 +49,7 @@ namespace DungeonRunners.Core
                     }
                     catch (Exception ex)
                     {
-                        Debug.LogError($"MainThreadDispatcher error: {ex}");
+                        Debug.LogError($"[MAIN-THREAD-DISPATCHER] state=failed message='{ex}'");
                     }
                 }
             }
@@ -68,9 +65,5 @@ namespace DungeonRunners.Core
             }
         }
 
-        public static void EnqueueCoroutine(Func<System.Collections.IEnumerator> coroutineFunc)
-        {
-            Enqueue(() => Instance.StartCoroutine(coroutineFunc()));
-        }
     }
 }

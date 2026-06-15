@@ -5,9 +5,6 @@ using System.Text;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Writes data to byte arrays in little-endian format
-    /// </summary>
     public class ByteWriter
     {
         private List<byte> _buffer;

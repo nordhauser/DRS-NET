@@ -5,28 +5,15 @@ using DungeonRunners.Engine;
 
 namespace DungeonRunners.Combat
 {
-    /// <summary>
-    /// Replicates client's Wander::update state machine for RNG synchronization.
-    /// ALL values from binary disassembly at 0x5314F0 (jump table at 0x531760).
-    /// 
-    /// State machine (binary-proven):
-    ///   State 0 (0x531513): Set state=3. No RNG.
-    ///   State 1 (0x531624): 2 RNG ALWAYS (X,Y offset). Then state=2.
-    ///   State 2 (0x5315F4): vtable[0x38] arrival check. No RNG. If arrived → state=3.
-    ///   State 3 (0x53151F): 1 RNG: Generate()%150. Timer = (result+90). If canWander: timer*=3. ALWAYS → state=4.
-    ///   State 4 (0x53158E): Timer countdown. When 0: if canWander: 1 RNG %100, &lt;30 → state=1 (30%), else timer=450.
-    /// </summary>
     public class WanderSimulator
     {
         private static WanderSimulator _instance;
         public static WanderSimulator Instance => _instance ??= new WanderSimulator();
         private static readonly bool VerboseWanderLogs = IsTruthy(Environment.GetEnvironmentVariable("DR_SERVER_VERBOSE_WANDER_LOGS"));
-        private static readonly bool WanderDisabled = IsTruthy(Environment.GetEnvironmentVariable("DR_SERVER_DISABLE_WANDER"));
 
         private List<WanderState> _entities = new List<WanderState>();
         private List<uint> _tickOrder = new List<uint>();
 
-        private bool _defaultCanWander = true;
         public int EntityCount => _entities.Count;
 
         private static bool IsTruthy(string value)
@@ -48,6 +35,25 @@ namespace DungeonRunners.Combat
         {
             if (VerboseWanderLogs)
                 Debug.LogError(message);
+        }
+
+        private static void LogWanderClientPos(WanderState ws)
+        {
+            if (ws.Monster == null)
+                return;
+            if (float.IsNaN(ws.ClientX) || float.IsNaN(ws.ClientY))
+            {
+                Debug.LogError($"[MON-WANDER-POS] entity={ws.EntityId} client=(NaN,NaN) state={ws.State} target=({ws.TargetX:F1},{ws.TargetY:F1}) sourceFunction=UnitMover::Update(Fixed8)");
+                return;
+            }
+            int fx = (int)Math.Round(ws.ClientX * UnitMover.Fixed);
+            int fy = (int)Math.Round(ws.ClientY * UnitMover.Fixed);
+            if (ws.HasLoggedClientPos && fx == ws.LastLoggedFixedX && fy == ws.LastLoggedFixedY)
+                return;
+            ws.HasLoggedClientPos = true;
+            ws.LastLoggedFixedX = fx;
+            ws.LastLoggedFixedY = fy;
+            Debug.LogError($"[MON-WANDER-POS] entity={ws.EntityId} client=({ws.ClientX:F2},{ws.ClientY:F2}) fixed8=(0x{(uint)fx:X8},0x{(uint)fy:X8}) state={ws.State} target=({ws.TargetX:F1},{ws.TargetY:F1}) sourceFunction=UnitMover::Update(Fixed8)");
         }
 
         public void RegisterEntity(uint entityId, bool canWander = true)
@@ -73,7 +79,7 @@ namespace DungeonRunners.Combat
             {
                 EntityId = monster.EntityId,
                 Monster = monster,
-                State = 0,
+                State = 3,
                 Timer = 0,
                 CanWander = canWander,
                 DefaultX = monster.SpawnPosX,
@@ -86,6 +92,7 @@ namespace DungeonRunners.Combat
             _entities.Add(state);
             _tickOrder.Add(monster.EntityId);
             Debug.LogError($"[WANDER-SIM] Registered monster {monster.EntityId} walk={monster.WalkSpeed:F1} range={monster.WanderRange:F1} canWander={canWander} (total: {_entities.Count})");
+            LogWanderClientPos(state);
         }
 
         public void UnregisterEntity(uint entityId)
@@ -96,32 +103,28 @@ namespace DungeonRunners.Combat
 
         public void TickAll(MersenneTwister roomRng)
         {
-            if (WanderDisabled)
-                return;
-            for (int i = 0; i < _entities.Count; i++)
+            for (int entityIndex = 0; entityIndex < _entities.Count; entityIndex++)
             {
-                TickEntity(_entities[i], roomRng, ResolveUnitOwnedRng(_entities[i], roomRng));
+                TickEntity(_entities[entityIndex], roomRng, ResolveUnitOwnedRng(_entities[entityIndex], roomRng));
             }
         }
 
         public void TickEntity(uint entityId, MersenneTwister roomRng, MersenneTwister unitOwnedRng = null)
         {
-            if (WanderDisabled)
-                return;
-            for (int i = 0; i < _entities.Count; i++)
+            for (int entityIndex = 0; entityIndex < _entities.Count; entityIndex++)
             {
-                if (_entities[i].EntityId != entityId)
+                if (_entities[entityIndex].EntityId != entityId)
                     continue;
-                TickEntity(_entities[i], roomRng, unitOwnedRng ?? ResolveUnitOwnedRng(_entities[i], roomRng));
+                TickEntity(_entities[entityIndex], roomRng, unitOwnedRng ?? ResolveUnitOwnedRng(_entities[entityIndex], roomRng));
                 return;
             }
         }
 
         public bool TryGetClientVisiblePosition(uint entityId, out float posX, out float posY)
         {
-            for (int i = 0; i < _entities.Count; i++)
+            for (int entityIndex = 0; entityIndex < _entities.Count; entityIndex++)
             {
-                var state = _entities[i];
+                var state = _entities[entityIndex];
                 if (state.EntityId != entityId)
                     continue;
 
@@ -135,10 +138,6 @@ namespace DungeonRunners.Combat
             return false;
         }
 
-        /// <summary>
-        /// Binary Wander::update at 0x5314F0, with movement kept as client-visible
-        /// simulation state until the native UnitMover packet contract is closed.
-        /// </summary>
         private void TickEntity(WanderState ws, MersenneTwister roomRng, MersenneTwister unitOwnedRng)
         {
             if (ws.Monster != null && (!ws.Monster.IsAlive || ws.Monster.State != MonsterState.Idle))
@@ -147,23 +146,14 @@ namespace DungeonRunners.Combat
             switch (ws.State)
             {
                 case 0:
-                    // 0x531513: mov byte ptr [ebp+0x75], 3 — set state=3, return. No RNG.
                     ws.State = 3;
                     break;
 
                 case 1:
-                    // 0x531624: Movement tick.
-                    // Binary: BOTH canWander and !canWander paths reach Generate() calls.
-                    // 0x531699: cmp [ebp+0x74],0 — canWander check
-                    // 0x53169D: je 0x531759 — if !canWander, jump to 0x531759
-                    // 0x531759: xor bl,bl; jmp 0x5316B7 — still reaches RNG section
-                    // 0x5316BE: call Generate() — RNG #1 (X offset)
-                    // 0x5316DA: call Generate() — RNG #2 (Y offset)
-                    // ALWAYS 2 RNG regardless of canWander.
-                    int rngBeforeTarget = unitOwnedRng?.CallsSinceReseed ?? -1;
-                    uint rawX = NativeRngLedger.Generate(unitOwnedRng, "unitOwnedCombat", "Wander::target-x", $"{ws.Monster?.Name ?? "monster"}#{ws.EntityId}");  // 0x5316BE: X offset
-                    uint rawY = NativeRngLedger.Generate(unitOwnedRng, "unitOwnedCombat", "Wander::target-y", $"{ws.Monster?.Name ?? "monster"}#{ws.EntityId}");  // 0x5316DA: Y offset
-                    LogVerboseWander($"[WANDER-RNG] entity={ws.EntityId} state=1 target rawX=0x{rawX:X8} rawY=0x{rawY:X8} rng={rngBeforeTarget}->{unitOwnedRng?.CallsSinceReseed ?? -1} stream=unitOwnedCombat");
+                    int rngBeforeTarget = roomRng?.CallsSinceReseed ?? -1;
+                    uint rawX = RngLedger.Generate(roomRng, "room", "Wander::target-x", $"{ws.Monster?.Name ?? "monster"}#{ws.EntityId}");
+                    uint rawY = RngLedger.Generate(roomRng, "room", "Wander::target-y", $"{ws.Monster?.Name ?? "monster"}#{ws.EntityId}");
+                    LogVerboseWander($"[WANDER-RNG] entity={ws.EntityId} state=1 target rawX=0x{rawX:X8} rawY=0x{rawY:X8} rng={rngBeforeTarget}->{roomRng?.CallsSinceReseed ?? -1} stream=room");
                     if (ws.Monster != null && ws.Monster.WanderRange > 0f)
                     {
                         int range = Mathf.Max(1, Mathf.RoundToInt(ws.Monster.WanderRange));
@@ -173,15 +163,16 @@ namespace DungeonRunners.Combat
                         ws.TargetX = baseX + (int)(rawX % span) - range;
                         ws.TargetY = baseY + (int)(rawY % span) - range;
                         ws.TargetAttempt++;
+                        Debug.LogError($"[WANDER-TGT] entity={ws.EntityId} st={ws.State} cw={(ws.CanWander ? 1 : 0)} anchor=({baseX:F2},{baseY:F2}) cur=({ws.ClientX:F2},{ws.ClientY:F2}) rawX=0x{rawX:X8} rawY=0x{rawY:X8} target=({ws.TargetX:F2},{ws.TargetY:F2})");
                         bool pathValid = true;
                         if (ws.CanWander && !string.IsNullOrWhiteSpace(ws.Monster.ZoneName))
                         {
                             string pathMapKey = !string.IsNullOrWhiteSpace(ws.Monster.InstanceKey)
                                 ? ws.Monster.InstanceKey
                                 : ws.Monster.ZoneName;
-                            var pathMap = PathMapManager.Instance.GetPathMap(pathMapKey);
-                            if (pathMap != null && pathMap.TryCanReachPoint(ws.ClientX, ws.ClientY, ws.TargetX, ws.TargetY, out bool canReachPoint))
-                                pathValid = canReachPoint;
+                            var pathMap = PathMapCatalog.Instance.GetPathMap(pathMapKey);
+                            if (pathMap != null)
+                                pathValid = pathMap.CanReachPoint(ws.ClientX, ws.ClientY, ws.TargetX, ws.TargetY);
                             if (!pathValid)
                             {
                                 LogVerboseWander($"[WANDER-AUDIT] entity={ws.EntityId} state=1 attempt={ws.TargetAttempt} canWander={ws.CanWander} anchor=({baseX:F1},{baseY:F1}) current=({ws.ClientX:F1},{ws.ClientY:F1}) rawX=0x{rawX:X8} rawY=0x{rawY:X8} target=({ws.TargetX:F1},{ws.TargetY:F1}) pathValid=False accepted=False rng={rngBeforeTarget}->{unitOwnedRng?.CallsSinceReseed ?? -1} stream=unitOwnedCombat");
@@ -201,38 +192,50 @@ namespace DungeonRunners.Combat
                         ws.HasTarget = false;
                         ws.MoveTicksRemaining = 1;
                     }
-                    // 0x53174D: mov byte ptr [ebp+0x75], 2
                     ws.State = 2;
                     ws.TargetAttempt = 0;
                     break;
 
                 case 2:
-                    // 0x5315F4: Arrival check. No RNG.
-                    // 0x53160E: call vtable[0x38] — isAtDestination()
-                    // 0x531612: jne return — if still moving, stay in state 2
-                    // 0x531618: mov byte ptr [ebp+0x75], 3 — if arrived, state=3
                     if (ws.Monster != null && ws.HasTarget)
                     {
-                        float dx = ws.TargetX - ws.ClientX;
-                        float dy = ws.TargetY - ws.ClientY;
-                        float dist = Mathf.Sqrt(dx * dx + dy * dy);
+                        if (!ws.FixedInit)
+                        {
+                            ws.FixedX = (int)Math.Round(ws.ClientX * UnitMover.Fixed);
+                            ws.FixedY = (int)Math.Round(ws.ClientY * UnitMover.Fixed);
+                            ws.FixedInit = true;
+                        }
+                        int tgtX = (int)Math.Round(ws.TargetX * UnitMover.Fixed);
+                        int tgtY = (int)Math.Round(ws.TargetY * UnitMover.Fixed);
                         float speed = ws.Monster.WalkSpeed > 0f ? ws.Monster.WalkSpeed : ws.Monster.MoveSpeed;
-                        float step = speed / 30f;
-                        if (ws.MoveTicksRemaining > 0)
-                            ws.MoveTicksRemaining--;
-                        if (ws.MoveTicksRemaining == 0 || dist <= step || dist <= 0.001f)
+                        int stepFixed = (int)Math.Round(speed * UnitMover.Fixed / 30f);
+                        if (stepFixed < 1) stepFixed = 1;
+                        int turnRate = UnitMover.TurnRatePerTickFixed(ws.Monster.TurnRateDegrees);
+                        if (!ws.HeadingInit)
+                        {
+                            ws.HeadingFixed = UnitMover.VectorToHeadingFixed(tgtX - ws.FixedX, tgtY - ws.FixedY);
+                            ws.HeadingInit = true;
+                        }
+                        int nextX, nextY, nextHeading;
+                        bool arrived;
+                        UnitMover.StepTowardFixedHeading(ws.FixedX, ws.FixedY, ws.HeadingFixed, tgtX, tgtY, stepFixed, turnRate, out nextX, out nextY, out nextHeading, out arrived);
+                        var wpm = PathMapCatalog.Instance.GetPathMap(!string.IsNullOrWhiteSpace(ws.Monster.InstanceKey) ? ws.Monster.InstanceKey : ws.Monster.ZoneName);
+                        UnitMover.ResolveMovement(wpm, ws.FixedX, ws.FixedY, nextX, nextY, out nextX, out nextY);
+                        ws.FixedX = nextX;
+                        ws.FixedY = nextY;
+                        ws.HeadingFixed = nextHeading;
+                        ws.ClientX = nextX / (float)UnitMover.Fixed;
+                        ws.ClientY = nextY / (float)UnitMover.Fixed;
+                        if (arrived)
                         {
                             ws.ClientX = ws.TargetX;
                             ws.ClientY = ws.TargetY;
+                            ws.FixedInit = false;
                             ws.HasTarget = false;
                             ws.State = 3;
-                            LogVerboseWander($"[WANDER-MOVE] entity={ws.EntityId} arrived visual=({ws.ClientX:F1},{ws.ClientY:F1}) target=({ws.TargetX:F1},{ws.TargetY:F1})");
+                            LogVerboseWander($"[WANDER-MOVE] entity={ws.EntityId} arrived visual=({ws.ClientX:F1},{ws.ClientY:F1}) target=({ws.TargetX:F1},{ws.TargetY:F1}) sourceFunction=UnitMover::Update(Fixed8)");
                         }
-                        else
-                        {
-                            ws.ClientX += dx / dist * step;
-                            ws.ClientY += dy / dist * step;
-                        }
+                        LogWanderClientPos(ws);
                     }
                     else
                     {
@@ -246,74 +249,48 @@ namespace DungeonRunners.Combat
                     break;
 
                 case 3:
-                    // 0x53151F: Wander decision.
-                    // 0x531555: call Generate() — 1 RNG consumed ALWAYS
-                    // 0x53155C-0x53156C: Generate() % 150 (via multiply-shift)
-                    // 0x531572: lea eax, [ecx + 0x5A] — timer = (result % 150) + 90
-                    // 0x53156E: cmp [ebp+0x74], 0 — canWander check
-                    // 0x531579: je 0x531582 — if !canWander, skip multiply
-                    // 0x53157B: lea eax, [eax + eax*2] — timer *= 3
-                    // 0x531582: mov byte ptr [ebp+0x75], 4 — ALWAYS state=4
                     {
-                        int rngBeforeTimer = unitOwnedRng?.CallsSinceReseed ?? -1;
-                        uint raw = NativeRngLedger.Generate(unitOwnedRng, "unitOwnedCombat", "Wander::timer", $"{ws.Monster?.Name ?? "monster"}#{ws.EntityId}");
+                        int rngBeforeTimer = roomRng?.CallsSinceReseed ?? -1;
+                        uint raw = RngLedger.Generate(roomRng, "room", "Wander::timer", $"{ws.Monster?.Name ?? "monster"}#{ws.EntityId}");
                         uint decision = raw % 150;
-                        ushort timer = (ushort)(decision + 90);  // 0x5A = 90
+                        ushort timer = (ushort)(decision + 90);
 
                         if (ws.CanWander)
                         {
-                            timer = (ushort)(timer * 3);  // 0x53157B: lea eax,[eax+eax*2]
+                            timer = (ushort)(timer * 3);
                         }
 
                         ws.Timer = timer;
-                        ws.State = 4;  // ALWAYS state 4, never state 1
-                        LogVerboseWander($"[WANDER-RNG] entity={ws.EntityId} state=3 timer raw=0x{raw:X8} roll={decision} timer={timer} canWander={ws.CanWander} rng={rngBeforeTimer}->{unitOwnedRng?.CallsSinceReseed ?? -1} stream=unitOwnedCombat");
+                        ws.State = 4;
+                        LogVerboseWander($"[WANDER-RNG] entity={ws.EntityId} state=3 timer raw=0x{raw:X8} roll={decision} timer={timer} canWander={ws.CanWander} rng={rngBeforeTimer}->{roomRng?.CallsSinceReseed ?? -1} stream=room");
                     }
                     break;
 
                 case 4:
-                    // 0x53158E: Timer countdown.
-                    // 0x531592-0x531598: if timer > 0, decrement and store
-                    // 0x53159C-0x5315A1: if timer != 0, return (no RNG)
                     if (ws.Timer > 0)
-                    {
                         ws.Timer--;
-                    }
                     if (ws.Timer > 0)
-                    {
-                        // No RNG consumed while timer > 0
                         return;
-                    }
 
-                    // Timer expired (timer == 0)
-                    // 0x5315A7: cmp [ebp+0x74], 0 — canWander check
-                    // 0x5315AB: je 0x5315E8 — if !canWander → state=1 directly (no RNG)
                     if (!ws.CanWander)
                     {
                         ws.State = 1;
                         return;
                     }
 
-                    // canWander path:
-                    // 0x5315C4: call Generate() — 1 RNG
-                    // 0x5315C9-0x5315D0: div by 100 → Generate() % 100
-                    // 0x5315D2: cmp edx, 0x1E — compare remainder with 30
-                    // 0x5315D5: jb 0x5315E8 — if < 30 (30%) → state=1
-                    // 0x5315D7: mov edx, 0x1C2 — else timer = 450
                     {
                         int rngBeforeMoveCheck = roomRng?.CallsSinceReseed ?? -1;
-                        uint raw = NativeRngLedger.Generate(roomRng, "room", "Wander::move-check", $"{ws.Monster?.Name ?? "monster"}#{ws.EntityId}");
+                        uint raw = RngLedger.Generate(roomRng, "room", "Wander::move-check", $"{ws.Monster?.Name ?? "monster"}#{ws.EntityId}");
                         uint roll = raw % 100;
                         LogVerboseWander($"[WANDER-RNG] entity={ws.EntityId} state=4 move-check raw=0x{raw:X8} roll={roll} rng={rngBeforeMoveCheck}->{roomRng?.CallsSinceReseed ?? -1} stream=room");
 
-                        if (roll < 30)  // 30% chance → move
+                        if (roll < 30)
                         {
                             ws.State = 1;
                         }
-                        else  // 70% chance → stay idle
+                        else
                         {
-                            ws.Timer = 450;  // 0x1C2
-                            // Stay in state 4
+                            ws.Timer = 450;
                         }
                     }
                     break;
@@ -329,7 +306,7 @@ namespace DungeonRunners.Combat
             if (ws?.Monster?.Rng != null)
                 return ws.Monster.Rng;
             if (ws?.Monster != null)
-                Debug.LogError($"[RNG-LEDGER] stream=unitOwnedCombat phase=Wander::resolve-unit-rng owner='{ws.Monster.Name}#{ws.Monster.EntityId}' alias=room nativeObject=EntityManager+0x44 reason=native-unit-manager-alias native=Wander::update");
+                Debug.LogError($"[RNG-LEDGER] stream=unitOwnedCombat phase=Wander::resolve-unit-rng owner='{ws.Monster.Name}#{ws.Monster.EntityId}' alias=room clientObject=EntityManager+0x44 reason=client-unit-manager-alias sourceFunction=Wander::update");
             return roomRng;
         }
 
@@ -380,6 +357,17 @@ namespace DungeonRunners.Combat
             }
             return $"state3Waiting={state3Waiting} state4Due={state4Due} state4Soon={state4Soon} state1Pending={state1Pending} movingState2={movingState2}";
         }
+
+        private PathMap ResolveWanderPathMap(WanderState ws)
+        {
+            if (ws.PathMapResolved) return ws.CachedPathMap;
+            ws.PathMapResolved = true;
+            if (ws.Monster == null) return null;
+            string key = !string.IsNullOrWhiteSpace(ws.Monster.InstanceKey) ? ws.Monster.InstanceKey : ws.Monster.ZoneName;
+            if (string.IsNullOrWhiteSpace(key)) return null;
+            ws.CachedPathMap = PathMapCatalog.Instance.GetPathMap(key);
+            return ws.CachedPathMap;
+        }
     }
 
     public class WanderState
@@ -399,5 +387,16 @@ namespace DungeonRunners.Combat
         public bool HasTarget;
         public int TargetAttempt;
         public int MoveTicksRemaining;
+        public int IdleSubTick;
+        public int FixedX;
+        public int FixedY;
+        public bool FixedInit;
+        public int HeadingFixed;
+        public bool HeadingInit;
+        public PathMap CachedPathMap;
+        public bool PathMapResolved;
+        public int LastLoggedFixedX = int.MinValue;
+        public int LastLoggedFixedY = int.MinValue;
+        public bool HasLoggedClientPos;
     }
 }

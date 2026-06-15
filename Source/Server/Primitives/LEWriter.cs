@@ -4,9 +4,6 @@ using System.Text;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Little-endian binary writer for network protocol
-    /// </summary>
     public class LEWriter
     {
         private readonly List<byte> _buffer = new List<byte>();
@@ -122,7 +119,7 @@ namespace DungeonRunners.Utilities
                 byte[] bytes = Encoding.UTF8.GetBytes(value);
                 _buffer.AddRange(bytes);
             }
-            _buffer.Add(0); // Null terminator
+            _buffer.Add(0);
         }
 
         public byte[] ToArray()

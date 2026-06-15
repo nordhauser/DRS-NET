@@ -7,9 +7,6 @@ using DungeonRunners.Engine;
 
 namespace DungeonRunners.Networking
 {
-    /// <summary>
-    /// Unity-compatible TCP listener that runs on background thread
-    /// </summary>
     public class ServerTcpListener
     {
         private TcpListener _listener;
@@ -36,7 +33,6 @@ namespace DungeonRunners.Networking
 
                 Debug.Log($"TCP Listener started on {ipAddress}:{port}");
 
-                // Start accepting clients on background thread
                 System.Threading.ThreadPool.QueueUserWorkItem(_ => AcceptClientsLoop());
             }
             catch (Exception ex)
@@ -68,7 +64,6 @@ namespace DungeonRunners.Networking
                             _pendingClients.Enqueue(client);
                         }
 
-                        // Notify on main thread
                         Core.MainThreadDispatcher.Enqueue(() =>
                         {
                             TcpClient pendingClient;
@@ -91,7 +86,7 @@ namespace DungeonRunners.Networking
                 {
                     if (_isRunning)
                     {
-                        Debug.LogError($"Error accepting client: {ex}");
+                        Debug.LogError($"[TCP-LISTENER] accept state=failed message='{ex}'");
                     }
                 }
             }

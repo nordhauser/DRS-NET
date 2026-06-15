@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Net.Sockets;
@@ -6,25 +6,17 @@ using System.Text;
 using DungeonRunners.Engine;
 using DungeonRunners.Core;
 using DungeonRunners.Utilities;
-using DungeonRunners.Managers;
-//using Org.BouncyCastle.Crypto.Engines;
-//using Org.BouncyCastle.Crypto.Parameters;
 
 namespace DungeonRunners.Networking
 {
-    /// <summary>
-    /// Authentication server for Dungeon Runners - FINAL VERSION
-    /// </summary>
     public class AuthServer : MonoBehaviour
     {
         [SerializeField] private ServerConfig config;
 
         private ServerTcpListener _listener;
-        private ServerTcpListener _queueListener;  // Queue server on port 2606
+        private ServerTcpListener _queueListener;
         private List<AuthConnection> _connections = new List<AuthConnection>();
 
-        // Queue detection: username of player expecting a queue connection
-        // Set synchronously before TCP write, checked on next accept
         private static string _pendingQueueUser = null;
         private static uint _pendingQueueToken = 0;
         private static string _pendingQueueAdvertisedServerIP = null;
@@ -37,7 +29,6 @@ namespace DungeonRunners.Networking
                 return;
             }
 
-            // Override ScriptableObject values from server.cfg (no rebuild needed)
             config.authServerIP = ServerSettings.GetString("authIP", config.authServerIP);
             config.authServerPort = ServerSettings.Get("authPort", config.authServerPort);
             config.gameServerIP = ServerSettings.GetString("gameIP", config.gameServerIP);
@@ -48,13 +39,12 @@ namespace DungeonRunners.Networking
             _listener.OnClientConnected += OnClientConnected;
             _listener.Start(config.authServerIP, config.authServerPort);
 
-            Debug.Log($"✅ Auth Server started on {config.authServerIP}:{config.authServerPort}");
+            Debug.Log($"[AUTH] started {config.authServerIP}:{config.authServerPort}");
 
-            // Queue listener
             _queueListener = new ServerTcpListener();
             _queueListener.OnClientConnected += OnQueueClientConnected;
             _queueListener.Start(config.authServerIP, queuePort);
-            Debug.Log($"✅ Queue Server started on {config.authServerIP}:{queuePort}");
+            Debug.Log($"[QUEUE] started {config.authServerIP}:{queuePort}");
         }
 
         void OnDestroy()
@@ -71,15 +61,8 @@ namespace DungeonRunners.Networking
 
         void Update()
         {
-            // Bridge polling DISABLED — port 2606 listener handles queue connections directly.
-            // The bridge caused duplicate QueueReceiveAndHandoff: one on the game-port connection
-            // (wrong) and one on the real queue connection (right). Session 50 fix.
         }
 
-        /// <summary>
-        /// Set by AuthConnection.SendGoHandoffToQueue before TCP write.
-        /// Consumed by OnClientConnected when queue connection arrives.
-        /// </summary>
         public static void SetPendingQueueUser(string username, uint token = 0, string advertisedServerIP = null)
         {
             _pendingQueueUser = username;
@@ -89,8 +72,7 @@ namespace DungeonRunners.Networking
 
         private void OnClientConnected(TcpClient client)
         {
-            // Auth port ONLY handles auth connections — queue goes to port 2606
-            Debug.Log($"✅ Auth client connected: {client.Client.RemoteEndPoint}");
+            Debug.Log($"[AUTH] client connected {client.Client.RemoteEndPoint}");
 
             var connection = new AuthConnection(client, config);
             connection.OnDisconnected += () => OnConnectionDisconnected(connection);
@@ -107,7 +89,6 @@ namespace DungeonRunners.Networking
 
         private void OnQueueClientConnected(TcpClient client)
         {
-            // Queue port 2606 — ALWAYS a queue connection
             if (string.IsNullOrWhiteSpace(_pendingQueueUser))
             {
                 Debug.LogError($"[QUEUE] Rejected unexpected queue connection from {client.Client.RemoteEndPoint}");
@@ -121,7 +102,7 @@ namespace DungeonRunners.Networking
             _pendingQueueUser = null;
             _pendingQueueToken = 0;
             _pendingQueueAdvertisedServerIP = null;
-            Debug.LogError($"[QUEUE] ✅ Queue connection on port 2606 for '{queueUser}' from {client.Client.RemoteEndPoint}");
+            Debug.LogError($"[QUEUE] connection port=2606 user='{queueUser}' remote={client.Client.RemoteEndPoint}");
 
             var queueConn = new AuthConnection(client, config);
             queueConn.SetSessionToken(queueToken);
@@ -137,8 +118,8 @@ namespace DungeonRunners.Networking
         private ServerConfig _config;
         private TcpClient _tcpClient;
         private NetworkStream _stream;
-        private string _username; // Store the logged-in username
-        private uint _sessionToken; // Store session token for HandoffToGame
+        private string _username;
+        private uint _sessionToken;
         private string _advertisedServerIP;
 
         public void SetSessionToken(uint token)
@@ -151,8 +132,8 @@ namespace DungeonRunners.Networking
             if (!string.IsNullOrWhiteSpace(advertisedServerIP))
                 _advertisedServerIP = advertisedServerIP;
         }
-        private MonoBehaviour _coroutineRunner; // For delayed sends
-        private bool _handoffSent = false; // Guard against duplicate AboutToPlay
+        private MonoBehaviour _coroutineRunner;
+        private bool _handoffSent = false;
 
         public event Action OnDisconnected;
 
@@ -172,10 +153,8 @@ namespace DungeonRunners.Networking
         {
             _coroutineRunner = coroutineRunner;
 
-            // Send Go welcome packet - this is what the working Go server does
-            SendGoWelcomePacket();
+            SendWelcomePacket();
 
-            // Start receiving encrypted packets
             coroutineRunner.StartCoroutine(ReceiveLoop());
         }
 
@@ -184,10 +163,10 @@ namespace DungeonRunners.Networking
             _client.Disconnect();
         }
 
-        private void SendGoWelcomePacket()
+        private void SendWelcomePacket()
         {
             byte[] welcomePacket = new byte[] { 3, 0, 0 };
-            Debug.Log($"📤 Sent Go welcome packet: [3, 0, 0]");
+            Debug.Log("[AUTH-TX] welcome 03-00-00");
             _stream.Write(welcomePacket, 0, welcomePacket.Length);
         }
 
@@ -257,19 +236,19 @@ namespace DungeonRunners.Networking
 
                 try
                 {
-                    byte[] plainBody = DecryptGoBlowfishEndian(rest, bytesReadTotal);
+                    byte[] plainBody = DecryptBlowfishEndian(rest, bytesReadTotal);
 
                     if (plainBody.Length > 0)
                     {
                         byte msgType = plainBody[0];
-                        Debug.Log($"🔍 Received message type: 0x{msgType:X2}, bodyLen: {plainBody.Length - 1}");
+                        Debug.Log($"[AUTH-RX] type=0x{msgType:X2} bodyLen={plainBody.Length - 1}");
 
                         ProcessMessage(msgType, plainBody);
                     }
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogError($"Process error: {ex.Message}");
+                    Debug.LogError($"[AUTH] process state=failed message='{ex.Message}'");
                     hasError = true;
                 }
             }
@@ -278,7 +257,7 @@ namespace DungeonRunners.Networking
             OnDisconnected?.Invoke();
         }
 
-        private byte[] DecryptGoBlowfishEndian(byte[] encryptedData, int encryptedSize)
+        private byte[] DecryptBlowfishEndian(byte[] encryptedData, int encryptedSize)
         {
             try
             {
@@ -287,9 +266,9 @@ namespace DungeonRunners.Networking
 
                 var blowfish = new BlowfishEncryption(_config.blowfishKey);
 
-                for (int i = 0; i < numBlocks; i++)
+                for (int blockIndex = 0; blockIndex < numBlocks; blockIndex++)
                 {
-                    int start = i * 8;
+                    int start = blockIndex * 8;
                     byte[] block = new byte[8];
                     Array.Copy(encryptedData, start, block, 0, 8);
 
@@ -328,7 +307,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Decrypt error: {ex.Message}");
+                Debug.LogError($"[AUTH] decrypt state=failed message='{ex.Message}'");
                 return new byte[0];
             }
         }
@@ -352,13 +331,13 @@ namespace DungeonRunners.Networking
                         break;
 
                     default:
-                        Debug.LogWarning($"❌ Unknown message: 0x{msgType:X2}");
+                        Debug.LogWarning($"Unknown message: 0x{msgType:X2}");
                         break;
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"ProcessMessage error: {ex.Message}");
+                Debug.LogError($"[AUTH] processMessage state=failed message='{ex.Message}'");
             }
         }
 
@@ -380,41 +359,37 @@ namespace DungeonRunners.Networking
 
                 (string username, string password) = DecodeLogin(loginBlock, tail6);
 
-                Debug.Log($"🔑 Login attempt: {username}");
+                Debug.Log($"[AUTH] login user={username}");
 
-                // Store the username for later use
                 _username = username;
                 _advertisedServerIP = ResolveAdvertisedServerIP(_tcpClient, _config.gameServerIP);
 
-                // Get or create account in SQLite — no password check (matches original server)
                 Database.GameDatabase.Initialize();
                 uint accountId = Database.AccountRepository.GetAccountId(username);
                 if (accountId == 0)
                 {
-                    // First login — auto-create account
                     accountId = Database.AccountRepository.CreateAccount(username, password);
-                    Debug.Log($"🆕 Created account '{username}' (ID: {accountId})");
+                    Debug.Log($"[AUTH] account created user='{username}' id={accountId}");
                 }
                 else
                 {
-                    Debug.Log($"✅ Found account '{username}' (ID: {accountId})");
+                    Debug.Log($"[AUTH] account found user='{username}' id={accountId}");
                 }
 
-                // Ban check — send BlockedAccount packet if banned
                 if (IsAccountBanned(username))
                 {
-                    Debug.LogError($"⛔ Account '{username}' is BANNED — sending BlockedAccount");
-                    SendGoBlockedAccount();
+                    Debug.LogError($"[AUTH] account banned user='{username}' send=BlockedAccount");
+                    SendBlockedAccount();
                     return;
                 }
 
-                SendGoLoginOk(accountId);
-                SendGoServerList();
-                Debug.Log($"📋 ServerListEx sent to {_advertisedServerIP}:{_config.gameServerPort}");
+                SendLoginOk(accountId);
+                SendServerList();
+                Debug.Log($"[AUTH-TX] ServerListEx endpoint={_advertisedServerIP}:{_config.gameServerPort}");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Login error: {ex}");
+                Debug.LogError($"[AUTH] login state=failed message='{ex}'");
             }
         }
 
@@ -427,36 +402,27 @@ namespace DungeonRunners.Networking
             uint hi = reader.ReadUInt32();
             byte serverId = reader.ReadByte();
 
-            Debug.Log($"🎮 AboutToPlay: lo=0x{lo:X8}, hi=0x{hi:X8}, serverId={serverId}");
+            Debug.Log($"[AUTH] AboutToPlay lo=0x{lo:X8} hi=0x{hi:X8} serverId={serverId}");
 
             uint sessionToken = (uint)DateTime.Now.Ticks ^ 0x12345678;
             _sessionToken = sessionToken;
             Core.GlobalSessions.Store(sessionToken, _username ?? "unknown");
-            SessionManager.Instance.SetPlayToken(sessionToken, _username ?? "unknown");
 
-            Debug.Log($"🎫 Generated session token 0x{sessionToken:X8} for user '{_username}'");
+            Debug.Log($"[AUTH] session token=0x{sessionToken:X8} user='{_username}'");
 
-            // CRITICAL TIMING: Set queue username BEFORE sending anything!
             AuthServer.SetPendingQueueUser(_username, sessionToken, _advertisedServerIP);
-            Debug.Log($"🔗 Queue username set for {_username}");
+            Debug.Log($"[QUEUE] username set user='{_username}'");
 
-            // PDB-VERIFIED Session 50:
-            //   - 0x0F was "Unknown msg type: 15" — NOT registered
-            //   - 0x0C = linACHandoffToQueuePacket — the CORRECT type for HandoffToQueue!
-            //   - PlayOk (0x07) causes IMMEDIATE TCP close → can't use it with queue
-            //   - HandoffToQueue (0x0C) should trigger RecvHandoffToQueueMsg@0x61BE00
-            //     which calls ConnectToQueue → connects to server list entry as queue client
-            //   - Server list must point to queue port 2606
-            SendGoHandoffToQueue(sessionToken, serverId);
-            Debug.Log($"🔗 HandoffToQueue (0x0C) sent for {_username}, serverId={serverId}");
+            SendHandoffToQueue(sessionToken, serverId);
+            Debug.Log($"[AUTH-TX] HandoffToQueue user='{_username}' serverId={serverId}");
         }
 
         private void HandleServerListExt()
         {
-            SendGoServerList();
+            SendServerList();
         }
 
-        private void SendGoLoginOk(uint accountId)
+        private void SendLoginOk(uint accountId)
         {
             var writer = new ByteWriter();
             writer.WriteUInt32(0xFFEEFFEE);
@@ -471,18 +437,18 @@ namespace DungeonRunners.Networking
             writer.WriteByte(0x01);
             writer.WriteByte(0x01);
             writer.WriteByte(0x01);
-            Debug.Log($"🎮 PlayOk packet: {BitConverter.ToString(writer.ToArray())}");
-            WriteGoAuthMessage(0x03, writer.ToArray());
-            Debug.Log($"✅ LoginOk sent, accountId={accountId}");
+            Debug.Log($"[AUTH-TX] LoginOk payload={BitConverter.ToString(writer.ToArray())}");
+            WriteAuthMessage(0x03, writer.ToArray());
+            Debug.Log($"[AUTH-TX] LoginOk accountId={accountId}");
         }
 
         private bool IsAccountBanned(string username)
         {
             try
             {
-                using (var conn = Database.GameDatabase.GetConnection())
+                using (var connection = Database.GameDatabase.GetConnection())
                 {
-                    object result = Database.GameDatabase.ExecuteScalar(conn,
+                    object result = Database.GameDatabase.ExecuteScalar(connection,
                         "SELECT is_banned FROM accounts WHERE username = @u",
                         ("@u", username));
                     if (result != null && result != DBNull.Value)
@@ -491,24 +457,20 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[AUTH] Ban check error: {ex.Message}");
+                Debug.LogError($"[AUTH] banCheck state=failed message='{ex.Message}'");
             }
             return false;
         }
 
-        /// <summary>
-        /// Send linACBlockedAccountPacket (wire type 0x02) — triggers "Blocked!" popup on client.
-        /// Binary: RecvBlockedAccount@DRAuthClient @ 0x61B640 → ShowBlockedPopup@LoginUI @ 0x44F4B0
-        /// </summary>
-        private void SendGoBlockedAccount()
+        private void SendBlockedAccount()
         {
             var writer = new ByteWriter();
-            writer.WriteByte(0x00);  // reason code (0 = generic block)
-            WriteGoAuthMessage(0x02, writer.ToArray());
-            Debug.LogError($"⛔ BlockedAccount packet sent (type 0x02)");
+            writer.WriteByte(0x00);
+            WriteAuthMessage(0x02, writer.ToArray());
+            Debug.LogError("[AUTH-TX] BlockedAccount type=0x02");
         }
 
-        private void SendGoServerList()
+        private void SendServerList()
         {
             string advertisedIP = string.IsNullOrWhiteSpace(_advertisedServerIP)
                 ? ResolveAdvertisedServerIP(_tcpClient, _config.gameServerIP)
@@ -520,74 +482,40 @@ namespace DungeonRunners.Networking
             writer.WriteByte(0x01);
             writer.WriteByte(serverId);
 
-            // Server list → queue port 2606.
-            // HandoffToQueue (0x0C) uses serverId to look up server list entry.
-            // Client calls ConnectToQueue with the IP:port from the entry.
             uint queuePort = (uint)ServerSettings.Get("queuePort", 2606);
             writer.WriteByte(serverId);
             writer.WriteUInt32(ipInt);
             writer.WriteUInt32(queuePort);
             writer.WriteByte(0x00);
             writer.WriteByte(0x00);
-            writer.WriteUInt16((ushort)Math.Max(0, QueueConnectionBridge.CurrentPlayers));
-            writer.WriteUInt16((ushort)Math.Max(1, QueueConnectionBridge.MaxPlayers));
+            writer.WriteUInt16((ushort)Math.Max(0, QueueConnection.CurrentPlayers));
+            writer.WriteUInt16((ushort)Math.Max(1, QueueConnection.MaxPlayers));
             writer.WriteByte(0x01);
 
-            WriteGoAuthMessage(0x04, writer.ToArray());
-            Debug.Log($"📋 Server list sent with 1 server (ID 1) → {advertisedIP}:{queuePort}");
+            WriteAuthMessage(0x04, writer.ToArray());
+            Debug.Log($"[AUTH-TX] ServerList count=1 id=1 endpoint={advertisedIP}:{queuePort}");
         }
 
-        private void SendGoPlayOk(uint playToken, byte serverId)
+        private void SendHandoffToQueue(uint playToken, byte serverId)
         {
+
             var writer = new ByteWriter();
             writer.WriteUInt32(playToken);
             writer.WriteUInt32(0x5678DEFA);
             writer.WriteByte(serverId);
 
             byte[] payload = writer.ToArray();
-            Debug.Log($"🎮 PlayOk payload bytes: {BitConverter.ToString(payload).Replace("-", " ")}");
-            Debug.Log($"🎮 PlayOk payload length: {payload.Length} bytes");
-            Debug.Log($"🎮 PlayOk - Token: 0x{playToken:X8}, UID: 0x5678DEFA, ServerID: {serverId}");
+            Debug.Log($"[AUTH-TX] HandoffToQueue payload={BitConverter.ToString(payload)}");
 
-            WriteGoAuthMessage(0x07, payload);
-            Debug.Log($"🎮 PlayOk sent, token=0x{playToken:X8}, serverId={serverId}");
+            WriteAuthMessage(0x0C, payload);
+            Debug.Log($"[AUTH-TX] HandoffToQueue serverId={serverId} user='{_username}'");
         }
 
-        private void SendGoHandoffToQueue(uint playToken, byte serverId)
-        {
-            // PDB-VERIFIED: linACHandoffToQueuePacket ctor sets type = 0x0C (12)
-            // TTD proved 0x0F → "Unknown msg type: 15" — that was WRONG
-            //
-            // Unserialize@0x798DB0 reads 3 fields:
-            //   uint32 → +0x10 (param1 to RecvHandoffToQueueMsg)
-            //   uint32 → +0x14 (param2)
-            //   byte   → +0x18 (param3)
-            //
-            // MsgHandoffToQueue@0x799A10 passes these to:
-            //   RecvHandoffToQueueMsg(this, [ebx+0x10], [ebx+0x14], [ebx+0x18])
-
-            var writer = new ByteWriter();
-            writer.WriteUInt32(playToken);       // field1: playToken
-            writer.WriteUInt32(0x5678DEFA);      // field2: uid
-            writer.WriteByte(serverId);          // field3: serverId
-
-            byte[] payload = writer.ToArray();
-            Debug.Log($"🔗 HandoffToQueue payload (type=0x0C): {BitConverter.ToString(payload)}");
-
-            WriteGoAuthMessage(0x0C, payload); // 0x0C = linACHandoffToQueuePacket type ID!
-            Debug.Log($"🔗 HandoffToQueue sent, serverId={serverId} for {_username}");
-        }
-
-        /// <summary>
-        /// Queue mode: THCSockets protocol (same wire format as game server)
-        /// NOT Go auth encryption — queue uses netTCPConnection + msgRouter
-        /// </summary>
         public void StartQueueMode(MonoBehaviour coroutineRunner, string username)
         {
             _username = username;
             if (string.IsNullOrWhiteSpace(_advertisedServerIP))
                 _advertisedServerIP = ResolveAdvertisedServerIP(_tcpClient, _config.gameServerIP);
-            // NO Go welcome! Queue uses THCSockets, not Go auth protocol.
             coroutineRunner.StartCoroutine(QueueReceiveAndHandoff());
         }
 
@@ -597,77 +525,44 @@ namespace DungeonRunners.Networking
         {
             byte[] buffer = new byte[4096];
 
-            // ══════════════════════════════════════════════════════════════
-            // TTD + PDB VERIFIED Queue Protocol (Session 50):
-            //
-            // LAYER 1 — Transport crypto handshake (netTCPOutConnection):
-            //   1. Server sends: [uint32=36][keyExSz=8][pubSz=8][secSz=8][keyEx][pub][sec]
-            //   2. Client responds: [uint32=12][keyExSz=8]["PUBKEY12"]
-            //   3. State goes 0→4→5→6
-            //   4. Server sends: [uint32=6]["ENC OK"]
-            //   5. State 6→7 (READY!) → 0x03 handshake fires
-            //
-            // LAYER 2 — THCSockets session handshake:
-            //   Client sends 0x03 [peerId 3b]
-            //   Server sends 0x04 [peerId 3b] [pad 4b]
-            //   → QueueMsgConnectOk → OnConnectedToQueue → auth state 6→7
-            //
-            // LAYER 3 — Queue application messages (CompressedA 0x0A):
-            //   Client sends login (type 0x07): [uint32 token][uint32 uid]
-            //   Server sends PositionInQueue (type 0x0D): [uint32 pos][uint32 waitMs]
-            //   Server sends HandoffToGame (type 0x0E): [uint32 IP][uint32 port][uint32 token][uint32 uid]
-            // ══════════════════════════════════════════════════════════════
-
             try
             {
                 _tcpClient.NoDelay = true;
                 Debug.LogError($"[QUEUE] Connection ready, starting protocol...");
             }
-            catch (Exception ex) { Debug.LogError($"[QUEUE] Socket config error: {ex.Message}"); }
+            catch (Exception ex) { Debug.LogError($"[QUEUE] socketConfig state=failed message='{ex.Message}'"); }
 
-            // ─── LAYER 1: Transport crypto handshake ───
-            // TTD VERIFIED: Client transport goes state 0→4 on connect.
-            // State 4 WAITS for server crypto data. SERVER MUST SEND FIRST!
-            // Format: [uint32 keyExchangeSize][uint32 pubKeySize][uint32 secKeySize][keyExchData...]
-            // State 4 handler checks data > 15 bytes → our old 12 zeros were rejected!
             Debug.LogError($"[QUEUE] LAYER 1: Sending crypto init (server sends first)...");
             {
-                // TTD VERIFIED: state 4 checks pubKeySize > 0 at 0x78AF0B
-                // AND secKeySize > 0 at 0x78AF2B — "bad prime" when secKeySz=0!
                 var payload = new ByteWriter();
-                payload.WriteUInt32(8);     // keyExchangeSize = 8
-                payload.WriteUInt32(8);     // publicKeySize = 8
-                payload.WriteUInt32(8);     // secretKeySize = 8 (MUST BE > 0!)
-                // 8 bytes server key exchange data
+                payload.WriteUInt32(8);
+                payload.WriteUInt32(8);
+                payload.WriteUInt32(8);
                 payload.WriteByte(0x53); payload.WriteByte(0x52);
                 payload.WriteByte(0x56); payload.WriteByte(0x4B);
                 payload.WriteByte(0x45); payload.WriteByte(0x59);
                 payload.WriteByte(0x30); payload.WriteByte(0x31);
-                // 8 bytes server public key data
                 payload.WriteByte(0x50); payload.WriteByte(0x55);
                 payload.WriteByte(0x42); payload.WriteByte(0x4B);
                 payload.WriteByte(0x45); payload.WriteByte(0x59);
                 payload.WriteByte(0x53); payload.WriteByte(0x56);
-                // 8 bytes server secret key data
                 payload.WriteByte(0x53); payload.WriteByte(0x45);
                 payload.WriteByte(0x43); payload.WriteByte(0x4B);
                 payload.WriteByte(0x45); payload.WriteByte(0x59);
                 payload.WriteByte(0x53); payload.WriteByte(0x56);
-                byte[] payloadBytes = payload.ToArray(); // 36 bytes
+                byte[] payloadBytes = payload.ToArray();
 
-                // Length-prefixed frame: [uint32 payloadLen][payload]
                 var frame = new ByteWriter();
-                frame.WriteUInt32((uint)payloadBytes.Length); // 20
-                for (int i = 0; i < payloadBytes.Length; i++)
-                    frame.WriteByte(payloadBytes[i]);
-                byte[] frameBytes = frame.ToArray(); // 40 bytes total (4 len + 36 payload)
+                frame.WriteUInt32((uint)payloadBytes.Length);
+                for (int byteIndex = 0; byteIndex < payloadBytes.Length; byteIndex++)
+                    frame.WriteByte(payloadBytes[byteIndex]);
+                byte[] frameBytes = frame.ToArray();
 
                 _stream.Write(frameBytes, 0, frameBytes.Length);
                 _stream.Flush();
                 Debug.LogError($"[QUEUE-TX] Crypto init ({frameBytes.Length}b): {BitConverter.ToString(frameBytes)}");
             }
 
-            // Wait for client's crypto response
             float elapsed = 0f;
             bool gotCrypto = false;
             while (elapsed < 10f && !gotCrypto)
@@ -687,17 +582,14 @@ namespace DungeonRunners.Networking
                         Debug.LogError($"[QUEUE-RX] Crypto response: {bytesRead}b: {BitConverter.ToString(raw)}");
                         Debug.LogError($"[QUEUE] Crypto exchange complete");
 
-                        // State 5 sends client's crypto response back, transitions to state 6.
-                        // State 6 waits for "ENC OK" confirmation (6 bytes, length-prefixed).
-                        // TTD: state 0→4→5→6, stuck at 6 waiting for this.
                         yield return new DungeonRunners.Engine.WaitForSeconds(0.1f);
                         {
                             byte[] encOk = System.Text.Encoding.ASCII.GetBytes("ENC OK");
                             var confirmFrame = new ByteWriter();
-                            confirmFrame.WriteUInt32((uint)encOk.Length); // 6
-                            for (int i = 0; i < encOk.Length; i++)
-                                confirmFrame.WriteByte(encOk[i]);
-                            byte[] confirmBytes = confirmFrame.ToArray(); // 10 bytes
+                            confirmFrame.WriteUInt32((uint)encOk.Length);
+                            for (int byteIndex = 0; byteIndex < encOk.Length; byteIndex++)
+                                confirmFrame.WriteByte(encOk[byteIndex]);
+                            byte[] confirmBytes = confirmFrame.ToArray();
                             _stream.Write(confirmBytes, 0, confirmBytes.Length);
                             _stream.Flush();
                             Debug.LogError($"[QUEUE-TX] ENC OK ({confirmBytes.Length}b): {BitConverter.ToString(confirmBytes)}");
@@ -722,10 +614,6 @@ namespace DungeonRunners.Networking
                 yield break;
             }
 
-            // ─── LAYER 2: Queue messages (length-prefixed, NO THCSockets!) ───
-            // TTD VERIFIED: After "ENC OK", client sends queue login directly as:
-            //   [uint32 frameLen=9][byte type=0x07][uint32 token][uint32 uid]
-            // NO 0x03/0x04 THCSockets! All msgs use [uint32 len][payload] framing.
 
             Debug.LogError($"[QUEUE] LAYER 2: Waiting for queue login...");
             elapsed = 0f;
@@ -770,58 +658,47 @@ namespace DungeonRunners.Networking
             }
 
             if (!gotLogin)
-                Debug.LogError($"[QUEUE] No login received — continuing");
+                Debug.LogError("[QUEUE] no login received - continuing");
 
-            // ═══ QUEUE WAITING LOOP (binary-verified: server controls timing) ═══
-            // Client displays position from PositionInQueue(0x0D) and waits for HandoffToGame(0x0E)
-            // RecvPositionInQueueMsg format: Server(%u) Level(%u) Size(%u) — Size = our position value
             yield return new DungeonRunners.Engine.WaitForSeconds(0.1f);
             float waitTime = 0f;
             while (true)
             {
-                // Check if server has capacity
-                if (QueueConnectionBridge.HasCapacity)
+                if (QueueConnection.HasCapacity)
                 {
-                    // Reserve slot IMMEDIATELY so next player sees correct count
-                    QueueConnectionBridge.PlayerConnected();
+                    QueueConnection.PlayerConnected();
                     SendQueuePosition(1, 0);
-                    Debug.LogError($"[QUEUE] Server has capacity ({QueueConnectionBridge.CurrentPlayers}/{QueueConnectionBridge.MaxPlayers}) — handing off {_username}");
+                    Debug.LogError($"[QUEUE] capacity {QueueConnection.CurrentPlayers}/{QueueConnection.MaxPlayers} - handoff {_username}");
                     break;
                 }
 
-                // Server full — position is 1 (single-queue, not tracking multiple yet)
                 SendQueuePosition(1, (uint)(waitTime * 1000));
-                Debug.LogError($"[QUEUE] Server full ({QueueConnectionBridge.CurrentPlayers}/{QueueConnectionBridge.MaxPlayers}) — {_username} waiting ({waitTime:F0}s)");
+                Debug.LogError($"[QUEUE] full {QueueConnection.CurrentPlayers}/{QueueConnection.MaxPlayers} - user={_username} wait={waitTime:F0}s");
 
-                // Wait 2 seconds then re-check (fast enough to catch disconnect)
                 for (int w = 0; w < 20; w++)
                 {
                     yield return new DungeonRunners.Engine.WaitForSeconds(0.1f);
                     waitTime += 0.1f;
 
-                    // Check if connection dropped
                     try { if (!_tcpClient.Connected) yield break; } catch { yield break; }
 
-                    // Re-check capacity every 100ms so player gets in fast when slot opens
-                    if (QueueConnectionBridge.HasCapacity)
+                    if (QueueConnection.HasCapacity)
                         break;
                 }
             }
 
-            // Send HandoffToGame (type 0x0E): [uint32 IP][uint32 port][uint32 token][uint32 uid]
             yield return new DungeonRunners.Engine.WaitForSeconds(0.3f);
             {
-                // Flag the client IP so game server knows to do crypto handshake
                 try
                 {
                     var ep = (System.Net.IPEndPoint)_tcpClient.Client.RemoteEndPoint;
                     string clientIP = ep.Address.IsIPv4MappedToIPv6
                         ? ep.Address.MapToIPv4().ToString()
                         : ep.Address.ToString();
-                    QueueConnectionBridge.ExpectQueueFromIP(clientIP, _username);
+                    QueueConnection.ExpectQueueFromIP(clientIP, _username);
                     Debug.LogError($"[QUEUE] Flagged IP {clientIP} for queue user {_username}");
                 }
-                catch (Exception ex) { Debug.LogError($"[QUEUE] Flag IP error: {ex.Message}"); }
+                catch (Exception ex) { Debug.LogError($"[QUEUE] flagIp state=failed message='{ex.Message}'"); }
 
                 string advertisedIP = string.IsNullOrWhiteSpace(_advertisedServerIP)
                     ? ResolveAdvertisedServerIP(_tcpClient, _config.gameServerIP)
@@ -830,34 +707,23 @@ namespace DungeonRunners.Networking
                 uint port = (uint)_config.gameServerPort;
 
                 var inner = new ByteWriter();
-                inner.WriteByte(0x0E);      // message type
-                inner.WriteUInt32(ipLE);    // game server IP
-                inner.WriteUInt32(port);    // game server port
-                inner.WriteUInt32(_sessionToken);  // playToken — must match GlobalSessions
+                inner.WriteByte(0x0E);
+                inner.WriteUInt32(ipLE);
+                inner.WriteUInt32(port);
+                inner.WriteUInt32(_sessionToken);
                 Debug.LogError($"[QUEUE-TX] HandoffToGame token=0x{_sessionToken:X8}");
-                inner.WriteUInt32(0);       // uid
+                inner.WriteUInt32(0);
                 byte[] innerBytes = inner.ToArray();
                 var frame = new ByteWriter();
                 frame.WriteUInt32((uint)innerBytes.Length);
-                for (int i = 0; i < innerBytes.Length; i++)
-                    frame.WriteByte(innerBytes[i]);
+                for (int byteIndex = 0; byteIndex < innerBytes.Length; byteIndex++)
+                    frame.WriteByte(innerBytes[byteIndex]);
                 byte[] frameBytes = frame.ToArray();
                 _stream.Write(frameBytes, 0, frameBytes.Length);
                 _stream.Flush();
-                Debug.LogError($"[QUEUE-TX] HandoffToGame ({frameBytes.Length}b): {BitConverter.ToString(frameBytes)} → {advertisedIP}:{_config.gameServerPort}");
+                Debug.LogError($"[QUEUE-TX] HandoffToGame bytes={frameBytes.Length} payload={BitConverter.ToString(frameBytes)} endpoint={advertisedIP}:{_config.gameServerPort}");
             }
 
-            // ═══════════════════════════════════════════════════════════════
-            // POST-HANDOFF: Queue connection is done
-            // ═══════════════════════════════════════════════════════════════
-            // Binary-verified (Session 53): UserManagerClient::start @ 0x601B10
-            // registers at GatewayClient's TChannelManager slot 3 (push 3 @ 0x601B71).
-            // Social messages flow through the GAME TCP connection on CompressedA
-            // channel 3, NOT through the queue connection.
-            // The queue connection's only purpose is the waiting room + handoff.
-            // ═══════════════════════════════════════════════════════════════
-
-            // Brief wait for any trailing data, then close
             yield return new DungeonRunners.Engine.WaitForSeconds(1.0f);
             try
             {
@@ -872,15 +738,10 @@ namespace DungeonRunners.Networking
                     }
                 }
             }
-            catch (Exception ex) { Debug.LogError($"[QUEUE] Post-handoff read error: {ex.Message}"); }
+            catch (Exception ex) { Debug.LogError($"[QUEUE] postHandoffRead state=failed message='{ex.Message}'"); }
             Debug.LogError($"[QUEUE] Queue connection complete for {_username}");
         }
 
-        /// <summary>
-        /// Send a message on the queue TCP connection using CompressedA (0x0A) framing.
-        /// CRITICAL: messageType in the CompressedA header is what the queue dispatch
-        /// at 0x61B640 reads to route messages. type==1 = ConnectOk, type!=1 = other.
-        /// </summary>
         private void SendQueueCompressedA(byte queueMessageType, byte[] innerData)
         {
             try
@@ -888,17 +749,17 @@ namespace DungeonRunners.Networking
                 byte[] compressed = DungeonRunners.Utilities.ZlibUtil.Deflate(innerData);
 
                 var writer = new ByteWriter();
-                writer.WriteByte(0x0A);                              // CompressedA type
+                writer.WriteByte(0x0A);
                 writer.WriteByte((byte)(_queuePeerId & 0xFF));
                 writer.WriteByte((byte)((_queuePeerId >> 8) & 0xFF));
                 writer.WriteByte((byte)((_queuePeerId >> 16) & 0xFF));
-                writer.WriteUInt32((uint)(compressed.Length + 7));    // bodyLen
-                writer.WriteByte(0x00);                              // channel
-                writer.WriteByte(queueMessageType);                  // messageType — routing key!
-                writer.WriteByte(0x00);                              // padding
-                writer.WriteUInt32((uint)innerData.Length);           // uncompressed length
-                for (int i = 0; i < compressed.Length; i++)
-                    writer.WriteByte(compressed[i]);
+                writer.WriteUInt32((uint)(compressed.Length + 7));
+                writer.WriteByte(0x00);
+                writer.WriteByte(queueMessageType);
+                writer.WriteByte(0x00);
+                writer.WriteUInt32((uint)innerData.Length);
+                for (int byteIndex = 0; byteIndex < compressed.Length; byteIndex++)
+                    writer.WriteByte(compressed[byteIndex]);
 
                 byte[] frame = writer.ToArray();
                 Debug.LogError($"[QUEUE-TX] CompressedA msgType={queueMessageType} frame ({frame.Length}b): {BitConverter.ToString(frame)}");
@@ -906,13 +767,13 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[QUEUE-TX] Error: {ex.Message}");
+                Debug.LogError($"[QUEUE-TX] state=failed message='{ex.Message}'");
             }
         }
 
 
 
-        private void WriteGoAuthMessage(byte serverMsgType, byte[] payload)
+        private void WriteAuthMessage(byte serverMsgType, byte[] payload)
         {
             byte[] message = new byte[payload.Length + 1];
             message[0] = serverMsgType;
@@ -930,9 +791,9 @@ namespace DungeonRunners.Networking
             }
 
             uint checksum = 0;
-            for (int i = 0; i < length; i += 4)
+            for (int byteOffset = 0; byteOffset < length; byteOffset += 4)
             {
-                uint value = (uint)(message[i] | (message[i + 1] << 8) | (message[i + 2] << 16) | (message[i + 3] << 24));
+                uint value = (uint)(message[byteOffset] | (message[byteOffset + 1] << 8) | (message[byteOffset + 2] << 16) | (message[byteOffset + 3] << 24));
                 checksum ^= value;
             }
 
@@ -944,7 +805,7 @@ namespace DungeonRunners.Networking
             finalData[length + 2] = (byte)((checksum >> 16) & 0xFF);
             finalData[length + 3] = (byte)((checksum >> 24) & 0xFF);
 
-            byte[] encrypted = EncryptGoBlowfishEndian(finalData, finalData.Length);
+            byte[] encrypted = EncryptBlowfishEndian(finalData, finalData.Length);
 
             int packetLength = encrypted.Length + 2;
             byte[] frame = new byte[packetLength];
@@ -952,11 +813,11 @@ namespace DungeonRunners.Networking
             frame[1] = (byte)((packetLength >> 8) & 0xFF);
             Array.Copy(encrypted, 0, frame, 2, encrypted.Length);
 
-            Debug.Log($"📤 Sent Go encrypted 0x{serverMsgType:X2}, frameLen={frame.Length}");
+            Debug.Log($"[AUTH-TX] encrypted type=0x{serverMsgType:X2} frameLen={frame.Length}");
             _stream.Write(frame, 0, frame.Length);
         }
 
-        private byte[] EncryptGoBlowfishEndian(byte[] data, int length)
+        private byte[] EncryptBlowfishEndian(byte[] data, int length)
         {
             try
             {
@@ -965,9 +826,9 @@ namespace DungeonRunners.Networking
 
                 var blowfish = new BlowfishEncryption(_config.blowfishKey);
 
-                for (int i = 0; i < numBlocks; i++)
+                for (int blockIndex = 0; blockIndex < numBlocks; blockIndex++)
                 {
-                    int start = i * 8;
+                    int start = blockIndex * 8;
                     byte[] block = new byte[8];
                     Array.Copy(data, start, block, 0, 8);
 
@@ -1006,7 +867,7 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Encrypt error: {ex.Message}");
+                Debug.LogError($"[AUTH] encrypt state=failed message='{ex.Message}'");
                 return new byte[0];
             }
         }
@@ -1036,8 +897,8 @@ namespace DungeonRunners.Networking
                 byte[] innerBytes = inner.ToArray();
                 var frame = new ByteWriter();
                 frame.WriteUInt32((uint)innerBytes.Length);
-                for (int i = 0; i < innerBytes.Length; i++)
-                    frame.WriteByte(innerBytes[i]);
+                for (int byteIndex = 0; byteIndex < innerBytes.Length; byteIndex++)
+                    frame.WriteByte(innerBytes[byteIndex]);
                 byte[] frameBytes = frame.ToArray();
                 _stream.Write(frameBytes, 0, frameBytes.Length);
                 _stream.Flush();
@@ -1045,14 +906,14 @@ namespace DungeonRunners.Networking
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[QUEUE-TX] PositionInQueue error: {ex.Message}");
+                Debug.LogError($"[QUEUE-TX] positionInQueue state=failed message='{ex.Message}'");
             }
         }
 
         private static uint IPToUInt32(string ip)
         {
-            var p = ip.Split('.');
-            return (uint)(byte.Parse(p[0]) | (byte.Parse(p[1]) << 8) | (byte.Parse(p[2]) << 16) | (byte.Parse(p[3]) << 24));
+            var octets = ip.Split('.');
+            return (uint)(byte.Parse(octets[0]) | (byte.Parse(octets[1]) << 8) | (byte.Parse(octets[2]) << 16) | (byte.Parse(octets[3]) << 24));
         }
 
         private static string ResolveAdvertisedServerIP(TcpClient client, string configuredIP)

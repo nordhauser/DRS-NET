@@ -7,38 +7,23 @@ using DungeonRunners.Engine;
 
 namespace DungeonRunners.Data
 {
-    // ═══════════════════════════════════════════════════════════════
-    // GC FILE PARSER
-    // Parses Dungeon Runners .gc file format into GCNode trees.
-    // Handles: comments, extends, static, anonymous (*), nested blocks,
-    //          key=value properties, quoted strings
-    // ═══════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// Represents one node in a GC object tree.
-    /// A node has a name, optional parent (extends), properties, and children.
-    /// </summary>
     public class GCNode
     {
         public string Name { get; set; }
-        public string Extends { get; set; }  // full dotted path from extends clause
+        public string Extends { get; set; }
         public bool IsStatic { get; set; }
-        public bool IsAnonymous { get; set; } // * extends ...
+        public bool IsAnonymous { get; set; }
 
-        // Flat properties: Key = Value
         public Dictionary<string, string> Properties { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        // Named child blocks
         public Dictionary<string, GCNode> Children { get; set; } = new Dictionary<string, GCNode>(StringComparer.OrdinalIgnoreCase);
         public List<string> ChildOrder { get; set; } = new List<string>();
 
-        // Anonymous child blocks (* extends ...)
         public List<GCNode> AnonymousChildren { get; set; } = new List<GCNode>();
 
-        // Source file for debugging
         public string SourceFile { get; set; }
 
-        // ── Property Accessors ──
 
         public string GetString(string key, string fallback = "")
         {
@@ -49,7 +34,6 @@ namespace DungeonRunners.Data
         {
             if (Properties.TryGetValue(key, out string val))
             {
-                // Handle values like ".5" or "0.5" or "100"
                 if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out float result))
                     return result;
             }
@@ -60,9 +44,8 @@ namespace DungeonRunners.Data
         {
             if (Properties.TryGetValue(key, out string val))
             {
-                if (int.TryParse(val, out int result))
+                if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out int result))
                     return result;
-                // Try as float and truncate
                 if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out float f))
                     return (int)f;
             }
@@ -83,11 +66,6 @@ namespace DungeonRunners.Data
         public bool HasChild(string name) => Children.ContainsKey(name);
         public GCNode GetChild(string name) => Children.TryGetValue(name, out GCNode c) ? c : null;
 
-        /// <summary>
-        /// Walk a dotted path to find a deeply nested child.
-        /// e.g. "Description.Damage" → Children["Description"].Properties["Damage"]
-        /// Returns the deepest node that matches.
-        /// </summary>
         public GCNode ResolvePath(string dottedPath)
         {
             if (string.IsNullOrEmpty(dottedPath)) return this;
@@ -109,9 +87,6 @@ namespace DungeonRunners.Data
             return current;
         }
 
-        /// <summary>
-        /// Get a property from a nested path. e.g. GetNestedProperty("Description", "Damage")
-        /// </summary>
         public string GetNestedProperty(string childName, string propName)
         {
             var child = GetChild(childName);
@@ -145,10 +120,7 @@ namespace DungeonRunners.Data
         }
     }
 
-    /// <summary>
-    /// Parser for .gc file format. Handles comments, blocks, properties, extends.
-    /// </summary>
-    public static class GCParser
+    public static class GcParser
     {
         public static GCNode ParseFile(string filePath)
         {
@@ -165,7 +137,6 @@ namespace DungeonRunners.Data
             return node;
         }
 
-        // ── Comment stripping ──
 
         private static string StripComments(string text)
         {
@@ -175,7 +146,6 @@ namespace DungeonRunners.Data
 
             while (i < text.Length)
             {
-                // Track quoted strings
                 if (text[i] == '"' && (i == 0 || text[i - 1] != '\\'))
                 {
                     inString = !inString;
@@ -191,19 +161,17 @@ namespace DungeonRunners.Data
                     continue;
                 }
 
-                // Line comment
                 if (i + 1 < text.Length && text[i] == '/' && text[i + 1] == '/')
                 {
                     while (i < text.Length && text[i] != '\n') i++;
                     continue;
                 }
 
-                // Block comment
                 if (i + 1 < text.Length && text[i] == '/' && text[i + 1] == '*')
                 {
                     i += 2;
                     while (i + 1 < text.Length && !(text[i] == '*' && text[i + 1] == '/')) i++;
-                    if (i + 1 < text.Length) i += 2; // skip */
+                    if (i + 1 < text.Length) i += 2;
                     continue;
                 }
 
@@ -214,19 +182,15 @@ namespace DungeonRunners.Data
             return sb.ToString();
         }
 
-        // ── Top-level parsing ──
-        // Format: Name [extends Parent] { ... }
 
         private static GCNode ParseTopLevel(string text, ref int pos, string sourceFile)
         {
             SkipWhitespace(text, ref pos);
 
-            // Read the declaration line up to '{'
             string name = null;
             string extends_ = null;
             bool isStatic = false;
 
-            // Check for 'static' keyword
             if (TryReadWord(text, ref pos, out string firstWord))
             {
                 if (firstWord.Equals("static", StringComparison.OrdinalIgnoreCase))
@@ -245,7 +209,6 @@ namespace DungeonRunners.Data
 
             SkipWhitespace(text, ref pos);
 
-            // Check for 'extends'
             int savedPos = pos;
             if (TryReadWord(text, ref pos, out string maybeExtends))
             {
@@ -256,7 +219,7 @@ namespace DungeonRunners.Data
                 }
                 else
                 {
-                    pos = savedPos; // not extends, rewind
+                    pos = savedPos;
                 }
             }
 
@@ -271,18 +234,15 @@ namespace DungeonRunners.Data
                 SourceFile = sourceFile
             };
 
-            // Parse block body if present
             if (pos < text.Length && text[pos] == '{')
             {
-                pos++; // skip {
+                pos++;
                 ParseBlockBody(text, ref pos, node, sourceFile);
             }
 
             return node;
         }
 
-        // ── Block body parsing ──
-        // Contains: Key = Value; pairs and nested blocks
 
         private static void ParseBlockBody(string text, ref int pos, GCNode parent, string sourceFile)
         {
@@ -291,18 +251,15 @@ namespace DungeonRunners.Data
                 SkipWhitespace(text, ref pos);
                 if (pos >= text.Length) break;
 
-                // End of block
                 if (text[pos] == '}')
                 {
                     pos++;
                     return;
                 }
 
-                // Read first word
                 bool isStatic = false;
                 if (!TryReadWord(text, ref pos, out string word)) break;
 
-                // Check for 'static' modifier
                 if (word.Equals("static", StringComparison.OrdinalIgnoreCase))
                 {
                     isStatic = true;
@@ -313,25 +270,21 @@ namespace DungeonRunners.Data
                 SkipWhitespace(text, ref pos);
                 if (pos >= text.Length) break;
 
-                // Determine what follows the word
                 char next = text[pos];
 
                 if (next == '=')
                 {
-                    // Property: Key = Value;
-                    pos++; // skip =
+                    pos++;
                     SkipWhitespace(text, ref pos);
                     string value = ReadValue(text, ref pos);
                     parent.Properties[word] = value;
                 }
                 else if (next == '{' || IsWord(text, pos, "extends"))
                 {
-                    // Nested block: Name [extends Parent] { ... }
                     string childExtends = null;
 
                     if (IsWord(text, pos, "extends"))
                     {
-                        // Skip "extends"
                         pos += 7;
                         SkipWhitespace(text, ref pos);
                         TryReadWord(text, ref pos, out childExtends);
@@ -349,7 +302,7 @@ namespace DungeonRunners.Data
 
                     if (pos < text.Length && text[pos] == '{')
                     {
-                        pos++; // skip {
+                        pos++;
                         ParseBlockBody(text, ref pos, child, sourceFile);
                     }
 
@@ -366,14 +319,11 @@ namespace DungeonRunners.Data
                 }
                 else
                 {
-                    // Could be a standalone identifier on a line (e.g. Name = value without semicolon)
-                    // or a malformed entry — skip to next line
                     SkipToNextStatement(text, ref pos);
                 }
             }
         }
 
-        // ── Value reading ──
 
         private static string ReadValue(string text, ref int pos)
         {
@@ -384,8 +334,7 @@ namespace DungeonRunners.Data
 
             if (text[pos] == '"')
             {
-                // Quoted string
-                pos++; // skip opening "
+                pos++;
                 while (pos < text.Length && text[pos] != '"')
                 {
                     if (text[pos] == '\\' && pos + 1 < text.Length)
@@ -399,11 +348,10 @@ namespace DungeonRunners.Data
                         pos++;
                     }
                 }
-                if (pos < text.Length) pos++; // skip closing "
+                if (pos < text.Length) pos++;
             }
             else
             {
-                // Unquoted value — read until ; or newline or }
                 while (pos < text.Length && text[pos] != ';' && text[pos] != '\n' && text[pos] != '\r' && text[pos] != '}')
                 {
                     sb.Append(text[pos]);
@@ -411,13 +359,11 @@ namespace DungeonRunners.Data
                 }
             }
 
-            // Skip trailing semicolon
             if (pos < text.Length && text[pos] == ';') pos++;
 
             return sb.ToString().Trim();
         }
 
-        // ── Helpers ──
 
         private static void SkipWhitespace(string text, ref int pos)
         {
@@ -434,7 +380,6 @@ namespace DungeonRunners.Data
             }
 
             int start = pos;
-            // Word characters: letters, digits, underscore, dot/slash path separators, hyphenated item tiers, *, :
             while (pos < text.Length && (char.IsLetterOrDigit(text[pos]) || text[pos] == '_' || text[pos] == '.' || text[pos] == '/' || text[pos] == '\\' || text[pos] == '-' || text[pos] == '*' || text[pos] == ':'))
             {
                 pos++;
@@ -453,11 +398,10 @@ namespace DungeonRunners.Data
         private static bool IsWord(string text, int pos, string word)
         {
             if (pos + word.Length > text.Length) return false;
-            for (int i = 0; i < word.Length; i++)
+            for (int wordIndex = 0; wordIndex < word.Length; wordIndex++)
             {
-                if (char.ToLower(text[pos + i]) != char.ToLower(word[i])) return false;
+                if (char.ToLower(text[pos + wordIndex]) != char.ToLower(word[wordIndex])) return false;
             }
-            // Make sure word boundary
             if (pos + word.Length < text.Length && char.IsLetterOrDigit(text[pos + word.Length])) return false;
             return true;
         }

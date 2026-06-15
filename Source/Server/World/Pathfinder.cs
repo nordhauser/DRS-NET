@@ -3,36 +3,11 @@ using System.Collections.Generic;
 
 namespace DungeonRunners.Core
 {
-    /// <summary>
-    /// Server-side A* pathfinder, ported from client's <c>Pathfinder</c> class
-    /// (constructor 0x005D2620, RequestPath 0x005D2950, UpdateRequest 0x005D2AF0, GetPath 0x005D2F20).
-    /// Phase 4 of Option 1-full.
-    ///
-    /// Algorithm matches the client's per-tick A* expander semantically: same direction table,
-    /// same costs, same Manhattan heuristic, same corner-only waypoint reconstruction.
-    /// Tie-breaking uses grid coords (stable, scope-relaxed per D2 derisk — client uses
-    /// pointer address order which isn't portable).
-    ///
-    /// Usage:
-    /// <code>
-    ///   var pf = new Pathfinder(pathMap);
-    ///   pf.RequestPath(start, goal);
-    ///   while (!pf.IsDone) pf.UpdateRequest(64);  // expand N nodes per call
-    ///   if (pf.GetPath(out var waypoints)) { ... }
-    /// </code>
-    /// </summary>
     public sealed class Pathfinder
     {
-        // ─── Constants ──────────────────────────────────────────────────────
 
-        /// <summary>Goal-direction dot-product gate: skip neighbors whose direction
-        /// deviates more than ~60° from initial direction. Mirrors client check at
-        /// UpdateRequest +offset ("if dot &lt; 0x80 skip"). Disabled here for v1 since
-        /// it requires Fixed32 vector math; preliminary tests show acceptable paths
-        /// without it.</summary>
         private const bool ApplyDirectionGate = false;
 
-        // ─── State ──────────────────────────────────────────────────────────
 
         private readonly PathMap _pathMap;
 
@@ -57,12 +32,7 @@ namespace DungeonRunners.Core
             _pathMap = pathMap ?? throw new ArgumentNullException(nameof(pathMap));
         }
 
-        // ─── RequestPath: seed the open set with the start node ────────────
 
-        /// <summary>
-        /// Initialize a path request. Mirrors client <c>Pathfinder::RequestPath</c> @ 0x005D2950.
-        /// Detects direct reach via <see cref="PathMap.TryCanReachPoint"/> and short-circuits.
-        /// </summary>
         public void RequestPath(PathNode startPathMapNode, PathNode goalPathMapNode)
         {
             if (startPathMapNode == null) throw new ArgumentNullException(nameof(startPathMapNode));
@@ -73,8 +43,6 @@ namespace DungeonRunners.Core
             _startPathMapNode = startPathMapNode;
             _goalPathMapNode = goalPathMapNode;
 
-            // Direct-reach early-out: if start and goal share a straight-line walkable corridor,
-            // emit a 2-waypoint path without running A*.
             if (startPathMapNode != goalPathMapNode)
             {
                 bool tryOK = _pathMap.TryCanReachPoint(
@@ -95,7 +63,6 @@ namespace DungeonRunners.Core
                 return;
             }
 
-            // Seed open set with start node. g=0, h=Manhattan to goal, f=g+h.
             var startNode = new Node
             {
                 PathMapNode = startPathMapNode,
@@ -108,12 +75,7 @@ namespace DungeonRunners.Core
             _bestNode = startNode;
         }
 
-        // ─── UpdateRequest: expand up to N nodes ───────────────────────────
 
-        /// <summary>
-        /// Step the A* search up to <paramref name="maxSteps"/> nodes. Returns count expanded.
-        /// Mirrors client <c>Pathfinder::UpdateRequest</c> @ 0x005D2AF0.
-        /// </summary>
         public int UpdateRequest(int maxSteps)
         {
             if (_done) return 0;
@@ -132,8 +94,6 @@ namespace DungeonRunners.Core
                 _openByPathMapNode.Remove(current.PathMapNode);
                 _closedByPathMapNode[current.PathMapNode] = current;
 
-                // Track best-so-far by lowest f (used by GetPath if open set drains without
-                // hitting goal).
                 if (_bestNode == null || current.F < _bestNode.F)
                     _bestNode = current;
 
@@ -160,7 +120,6 @@ namespace DungeonRunners.Core
 
             for (int dirIndex = 0; dirIndex < 8; dirIndex++)
             {
-                // ConnectionFlags gate (mirrors client: only step direction i if bit i set).
                 if ((connectionFlags & (1 << dirIndex)) == 0) continue;
 
                 var (dx, dy) = PathMap.Directions[dirIndex];
@@ -171,15 +130,12 @@ namespace DungeonRunners.Core
                 int stepCost = PathMap.DirectionCosts[dirIndex];
                 int newG = current.G + stepCost;
 
-                // Skip if neighbor is in closed set with equal-or-better g.
                 if (_closedByPathMapNode.TryGetValue(neighbor, out var closedNode) && closedNode.G <= newG)
                     continue;
 
-                // Skip if neighbor is in open set with equal-or-better g.
                 if (_openByPathMapNode.TryGetValue(neighbor, out var openNode) && openNode.G <= newG)
                     continue;
 
-                // Otherwise create/replace.
                 if (openNode != null)
                 {
                     _openSet.Remove(openNode);
@@ -201,13 +157,7 @@ namespace DungeonRunners.Core
             }
         }
 
-        // ─── GetPath: reconstruct corner-only waypoints ─────────────────────
 
-        /// <summary>
-        /// Reconstruct the path from goal back to start via parent chain. Emits waypoints
-        /// only on direction change (corner-only). Mirrors client <c>Pathfinder::GetPath</c>
-        /// @ 0x005D2F20. Returns false if no path was found.
-        /// </summary>
         public bool GetPath(out List<PathNode> waypoints)
         {
             waypoints = new List<PathNode>();
@@ -220,7 +170,6 @@ namespace DungeonRunners.Core
                 return true;
             }
 
-            // Use the closed node matching the goal if one exists; else best-so-far.
             Node tail = null;
             if (_goalPathMapNode != null && _closedByPathMapNode.TryGetValue(_goalPathMapNode, out var goalNode))
                 tail = goalNode;
@@ -229,8 +178,6 @@ namespace DungeonRunners.Core
 
             if (tail == null) return false;
 
-            // Walk parent chain goal→start, accumulating corner waypoints.
-            // Reverse to start→goal order at the end.
             var reversed = new List<PathNode>();
             int prevDir = -1;
             Node node = tail;
@@ -247,20 +194,17 @@ namespace DungeonRunners.Core
                 }
                 else
                 {
-                    // start node — always include as final entry (which becomes the first
-                    // waypoint after reversal).
                     reversed.Add(node.PathMapNode);
                 }
                 node = node.Parent;
             }
 
-            for (int i = reversed.Count - 1; i >= 0; i--)
-                waypoints.Add(reversed[i]);
+            for (int reverseIndex = reversed.Count - 1; reverseIndex >= 0; reverseIndex--)
+                waypoints.Add(reversed[reverseIndex]);
 
             return waypoints.Count >= 2;
         }
 
-        // ─── Internals ──────────────────────────────────────────────────────
 
         private static int ManhattanHeuristic(PathNode a, PathNode b)
         {
@@ -268,7 +212,7 @@ namespace DungeonRunners.Core
             int dy = a.GridY - b.GridY;
             if (dx < 0) dx = -dx;
             if (dy < 0) dy = -dy;
-            return (dx + dy) * 10; // each grid step is 10 cost units (cardinal); matches mCostTable
+            return (dx + dy) * 10;
         }
 
         private void Reset()
@@ -300,13 +244,10 @@ namespace DungeonRunners.Core
                 if (ReferenceEquals(x, y)) return 0;
                 int c = x.F.CompareTo(y.F);
                 if (c != 0) return c;
-                // Stable tie-break by grid coords (D2 derisk: scope-relaxed from client's
-                // pointer-order tiebreak — ≤1-tile drift acceptable per DoD).
                 c = x.PathMapNode.GridX.CompareTo(y.PathMapNode.GridX);
                 if (c != 0) return c;
                 c = x.PathMapNode.GridY.CompareTo(y.PathMapNode.GridY);
                 if (c != 0) return c;
-                // Distinct nodes must sort to non-zero; fall back to hash.
                 return x.GetHashCode().CompareTo(y.GetHashCode());
             }
         }

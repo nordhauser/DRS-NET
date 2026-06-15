@@ -15,17 +15,17 @@ using System.Runtime.CompilerServices;
 using Org.BouncyCastle.Utilities;
 using Org.BouncyCastle.Crypto.Engines;
 using Org.BouncyCastle.Crypto.Parameters;
-using DungeonRunners.Managers;
+using DungeonRunners.Gameplay;
 using DungeonRunners.Database;
 using DungeonRunners.Engine.Playables;
 using System.Security.Cryptography;
 using DungeonRunners.Combat;
-using DungeonRunners.Networking.Sync;
+using DungeonRunners.Networking.EntitySynchInfo;
 
 namespace DungeonRunners.Networking
 {
     public partial class GameServer
     {
-        private ChatCommandHandler _chatHandler;
+        private ChatCommands _chatCommands;
     }
 }

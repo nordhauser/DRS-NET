@@ -6,44 +6,12 @@ using DungeonRunners.Data;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Loads <c>.tile</c> files (Dungeon Runners tile templates, GC-script text format) and
-    /// flattens their placement tree into <see cref="TilePlacement"/> rows. The output drives
-    /// per-instance PathMap construction: each placement's <see cref="TilePlacement.ExtendsPath"/>
-    /// resolves to a <c>.cobj</c> (via <see cref="TileCobjResolver"/>), and the placement's
-    /// <see cref="TilePlacement.X"/>/<see cref="TilePlacement.Y"/>/<see cref="TilePlacement.Heading"/>
-    /// position the cobj's local-space grid into the tile's frame.
-    ///
-    /// `.tile` structure (excerpted from elmforest_tileset_1n_A.tile):
-    /// <code>
-    ///   * extends base.world
-    ///   {
-    ///       Entities { ... }       // NPC spawn points (usually no .cobj)
-    ///       Map
-    ///       {
-    ///           * extends worldobjectgroup       // container — no Position
-    ///           {
-    ///               Name = terrain;
-    ///               * extends terrain.elmforest.floor.elmforest_floor_40_6
-    ///               {
-    ///                   Heading = 270;
-    ///                   Position = 20,260,50;
-    ///               }
-    ///               ...
-    ///           }
-    ///       }
-    ///   }
-    /// </code>
-    ///
-    /// We flatten by recursive descent: any anonymous block with a <c>Position</c> property is a
-    /// placement. Containers (no Position) just contribute their children to the flat list.
-    /// </summary>
     public static class TileLayoutLoader
     {
         public static TileLayout Load(string filePath)
         {
-            GCNode root = GCParser.ParseFile(filePath);
-            if (root == null) throw new InvalidDataException($"GCParser returned null for {filePath}");
+            GCNode root = GcParser.ParseFile(filePath);
+            if (root == null) throw new InvalidDataException($"GcParser returned null for {filePath}");
 
             var placements = new List<TilePlacement>();
             Collect(root, placements);
@@ -52,8 +20,8 @@ namespace DungeonRunners.Utilities
 
         public static TileLayout LoadFromText(string text, string sourceName = "")
         {
-            GCNode root = GCParser.Parse(text, sourceName);
-            if (root == null) throw new InvalidDataException("GCParser returned null");
+            GCNode root = GcParser.Parse(text, sourceName);
+            if (root == null) throw new InvalidDataException("GcParser returned null");
 
             var placements = new List<TilePlacement>();
             Collect(root, placements);

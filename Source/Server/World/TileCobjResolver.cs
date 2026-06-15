@@ -4,28 +4,14 @@ using System.IO;
 
 namespace DungeonRunners.Utilities
 {
-    /// <summary>
-    /// Resolves GC-script package paths (e.g. <c>terrain.elmforest.walls.elmforest_4_straight_2</c>)
-    /// to their corresponding <c>.cobj</c> files in the unpacked <c>666 game.pki dump/</c> folder.
-    ///
-    /// Resolution rule: take the leaf component of the dotted path and match (case-insensitively)
-    /// against flat filenames in the dump. The dump folder is flat — no subdirectories — so a
-    /// single dictionary lookup suffices.
-    ///
-    /// Many GC paths resolve to no <c>.cobj</c> (visual-only props, encounter spawn points,
-    /// abstract base classes). These return <c>null</c>; callers should treat them as
-    /// non-blocking.
-    ///
-    /// Built lazily on first use. Subsequent lookups are O(1).
-    /// </summary>
     public static class TileCobjResolver
     {
-        private const string DumpEnvVar = "DR_GAME_PKI_DUMP";
-        private const string DumpDefaultPath = @"C:\Users\tippi\Documents\Dungeon Runners\666 game.pki dump";
+        private const string PkiExportEnvVar = "DR_GAME_PKI_EXPORT";
+        private const string PkiExportDefaultPath = @"C:\Users\tippi\Documents\Dungeon Runners\666 game.pki export";
 
         private static readonly object _initLock = new object();
-        private static Dictionary<string, string> _leafToPath; // leaf-name (lowercase, no extension) → absolute .cobj path
-        private static Dictionary<string, string> _tileToPath; // tile-name (lowercase, no extension) → absolute .tile path
+        private static Dictionary<string, string> _leafToPath;
+        private static Dictionary<string, string> _tileToPath;
 
         public static int CobjFileCount
         {
@@ -86,37 +72,51 @@ namespace DungeonRunners.Utilities
             {
                 if (_leafToPath != null) return;
 
-                string dumpDir = ResolveDumpDir();
-                if (dumpDir == null)
-                {
-                    _leafToPath = new Dictionary<string, string>();
-                    _tileToPath = new Dictionary<string, string>();
-                    return;
-                }
-
                 var cobjIndex = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (string file in Directory.GetFiles(dumpDir, "*.cobj"))
-                {
-                    string leaf = Path.GetFileNameWithoutExtension(file).ToLowerInvariant();
-                    cobjIndex[leaf] = file;
-                }
-                _leafToPath = cobjIndex;
-
                 var tileIndex = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (string file in Directory.GetFiles(dumpDir, "*.tile"))
+
+                foreach (string dir in EnumerateCobjSourceDirs())
+                    IndexDir(dir, "*.cobj", cobjIndex);
+                foreach (string dir in EnumerateTileSourceDirs())
                 {
-                    string leaf = Path.GetFileNameWithoutExtension(file).ToLowerInvariant();
-                    tileIndex[leaf] = file;
+                    IndexDir(dir, "*.tile", tileIndex);
+                    IndexDir(dir, "*.gc", tileIndex);
                 }
+
+                _leafToPath = cobjIndex;
                 _tileToPath = tileIndex;
             }
         }
 
-        private static string ResolveDumpDir()
+        private static void IndexDir(string dir, string pattern, Dictionary<string, string> index)
         {
-            string envPath = Environment.GetEnvironmentVariable(DumpEnvVar);
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+            foreach (string file in Directory.GetFiles(dir, pattern))
+            {
+                string leaf = Path.GetFileNameWithoutExtension(file).ToLowerInvariant();
+                index[leaf] = file;
+            }
+        }
+
+        private static IEnumerable<string> EnumerateCobjSourceDirs()
+        {
+            yield return DungeonRunners.Core.DataPaths.CobjDir;
+            string exportDir = ResolveFlatPkiExportDir();
+            if (exportDir != null) yield return exportDir;
+        }
+
+        private static IEnumerable<string> EnumerateTileSourceDirs()
+        {
+            yield return DungeonRunners.Core.DataPaths.GcDir;
+            string exportDir = ResolveFlatPkiExportDir();
+            if (exportDir != null) yield return exportDir;
+        }
+
+        private static string ResolveFlatPkiExportDir()
+        {
+            string envPath = Environment.GetEnvironmentVariable(PkiExportEnvVar);
             if (!string.IsNullOrEmpty(envPath) && Directory.Exists(envPath)) return envPath;
-            if (Directory.Exists(DumpDefaultPath)) return DumpDefaultPath;
+            if (Directory.Exists(PkiExportDefaultPath)) return PkiExportDefaultPath;
             return null;
         }
 
