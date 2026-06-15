@@ -1443,6 +1443,15 @@ namespace DungeonRunners.Networking
                 return;
             }
 
+            // Notify the client it's in the queue: ReadPVPStatus prints "You are now in the queue for: %s"
+            // and starts the finding-match UI/timer. Echo the same match TypeID the client sent.
+            // Group id the client holds at GroupClient+0xD0: the real GroupDirectory group when grouped (the client
+            // gets it via SendGroupConnectedToAll), else the solo-leader id the server hardcodes to 1 in the solo
+            // 0x30+0x35 flow (GameServer.Zone.cs). processChangedPVPStatus drops the status unless this matches.
+            uint pvpGroupId = Gameplay.GroupDirectory.Instance.GetGroupForConn(conn.ConnId)?.GroupId ?? 1u;
+            SendToClient(conn, PVPPackets.BuildPVPMatchStatus(pvpGroupId, 0, 0, Gameplay.PVPMatchmaking.GetGcPath(archetype)));
+            Debug.LogError($"[PVP] {conn.LoginName} now-in-queue status sent ({archetype}, group {pvpGroupId})");
+
             ProcessMatchmakingTick(forceRun: true);
         }
 
@@ -1450,6 +1459,8 @@ namespace DungeonRunners.Networking
         {
             bool removed = Gameplay.PVPMatchmaking.Instance.DequeuePlayer(conn.LoginName);
             Debug.LogError($"[PVP] cancel queue for {conn.LoginName}: {(removed ? "OK" : "was not queued")}");
+            if (removed)
+                SendToClient(conn, PVPPackets.BuildPVPMatchStatus(Gameplay.GroupDirectory.Instance.GetGroupForConn(conn.ConnId)?.GroupId ?? 1u, 0, 0, null));
         }
 
         private void HandleLeavePvp(RRConnection conn)
@@ -1461,6 +1472,7 @@ namespace DungeonRunners.Networking
                 Debug.LogError($"[PVP] {conn.LoginName} forfeited match {match.MatchId}");
                 FinalizeMatchResults(match);
             }
+            SendToClient(conn, PVPPackets.BuildPVPMatchStatus(Gameplay.GroupDirectory.Instance.GetGroupForConn(conn.ConnId)?.GroupId ?? 1u, 0, 0, null));
             if (_zones.TryGetValue(conn.CurrentZoneId, out var z) && IsPvpZone(z.name))
                 ChangeZone(conn, "town", "");
         }

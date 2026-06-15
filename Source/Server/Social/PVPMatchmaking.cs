@@ -55,6 +55,22 @@ namespace DungeonRunners.Gameplay
         public static bool TryParseArchetypeByTypeId(uint typeId, out Archetype a)
             => _archetypeByTypeId.TryGetValue(typeId, out a);
 
+        // The gc TypeID (DJB2) for an archetype — to echo the match back to the client in status packets.
+        public static uint GetTypeId(Archetype a)
+        {
+            foreach (var kv in _archetypeByGcType)
+                if (kv.Value == a) return HashGcType(kv.Key);
+            return 0;
+        }
+
+        // The native gc path for an archetype (e.g. "pvp.GroupDeathMatch") for name-form writeType.
+        public static string GetGcPath(Archetype a)
+        {
+            foreach (var kv in _archetypeByGcType)
+                if (kv.Value == a) return kv.Key;
+            return null;
+        }
+
         public static int RequiredPlayers(Archetype a)
         {
             switch (a)
