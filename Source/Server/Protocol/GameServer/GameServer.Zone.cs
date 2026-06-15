@@ -1507,7 +1507,16 @@ namespace DungeonRunners.Networking
             foreach (var login in match.ParticipantLogins.Concat(new[] { match.WinnerLogin }).Distinct(StringComparer.OrdinalIgnoreCase))
             {
                 bool isWinner = login.Equals(match.WinnerLogin, StringComparison.OrdinalIgnoreCase);
-                int ratingDelta = isRanked ? (isWinner ? +25 : -20) : 0;
+                int ratingDelta = 0;
+                if (isRanked)
+                {
+                    int myRating = match.ParticipantRatings.TryGetValue(login, out var mr) ? mr : 1500;
+                    var opponentRatings = match.ParticipantLogins
+                        .Where(p => !p.Equals(login, StringComparison.OrdinalIgnoreCase))
+                        .Select(p => match.ParticipantRatings.TryGetValue(p, out var or) ? or : 1500)
+                        .ToList();
+                    ratingDelta = Gameplay.PVPMatchmaking.EloDelta(myRating, opponentRatings, isWinner ? 1.0 : 0.0);
+                }
                 try
                 {
                     Database.CharacterRepository.UpdatePvpRecord(login, isWinner, ratingDelta);

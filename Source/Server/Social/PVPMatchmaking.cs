@@ -54,6 +54,18 @@ namespace DungeonRunners.Gameplay
             }
         }
 
+        // Standard Elo: expected score is the mean win-probability against each opponent.
+        // score = 1.0 for a win, 0.0 for a loss. Reduces to classic 1v1 Elo for a single opponent.
+        public static int EloDelta(int rating, List<int> opponentRatings, double score, int k = 32)
+        {
+            if (opponentRatings == null || opponentRatings.Count == 0) return 0;
+            double expected = 0.0;
+            foreach (int opp in opponentRatings)
+                expected += 1.0 / (1.0 + Math.Pow(10.0, (opp - rating) / 400.0));
+            expected /= opponentRatings.Count;
+            return (int)Math.Round(k * (score - expected));
+        }
+
         public string PickZoneForArchetype(Archetype a)
         {
             switch (a)
@@ -102,6 +114,8 @@ namespace DungeonRunners.Gameplay
             public string WinnerLogin;
             public Dictionary<string, int> KillCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             public Dictionary<string, int> DeathCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            // Pre-match rating per participant, captured at match creation (for Elo at match end).
+            public Dictionary<string, int> ParticipantRatings = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             public const int MaxDurationSec = 600;
             public const int SpawnTimeoutSec = 30;
@@ -387,6 +401,7 @@ namespace DungeonRunners.Gameplay
             {
                 _playerToMatch[queueEntry.LoginName] = matchId;
                 queueEntry.AssignedMatchId = matchId;
+                match.ParticipantRatings[queueEntry.LoginName] = queueEntry.PvpRating;
             }
             return match;
         }
