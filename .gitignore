@@ -9,3 +9,7 @@
 # Large game data (sqlite DBs / generated assets — not source)
 /GameData/Database/
 /GameData/Assets/
+
+# Build artifacts (reproducible via dotnet publish / Build.exe)
+/Server.exe
+/Build.exe
