@@ -1,0 +1,11 @@
+# Build outputs
+/bin/
+/obj/
+/logs/
+/BuildTools/_out/
+/BuildTools/bin/
+/BuildTools/obj/
+
+# Large game data (sqlite DBs / generated assets — not source)
+/GameData/Database/
+/GameData/Assets/

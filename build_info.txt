@@ -1,0 +1,6 @@
+Runtime=dotnet
+BuildTag=dungeonrunnersserver-net10-20260530-055737-nogit
+SourceHash=a2dc9cb546791554
+SourceFileCount=131
+BuildSource=DungeonRunnersServer\Source
+BuiltAt=2026-05-30T05:57:50.7268877+02:00
