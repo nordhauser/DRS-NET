@@ -1390,19 +1390,38 @@ namespace DungeonRunners.Networking
                 return;
             }
 
-            string archetypeGcType = TryReadGcTypeString(data);
-            if (string.IsNullOrEmpty(archetypeGcType))
+            Gameplay.PVPMatchmaking.Archetype archetype;
+            byte tag = data[0];
+            if (tag == 0x04 || tag == 0x02 || tag == 0x01)
             {
-                Debug.LogError($"[PVP] Could not parse match archetype from payload (hex: {BitConverter.ToString(data)})");
-                return;
-            }
-            Debug.LogError($"[PVP] {conn.LoginName} requested archetype: '{archetypeGcType}'");
+                // writeType numeric encoding: tag = TypeID byte-width, then little-endian gc TypeID (DJB2).
+                uint typeId;
+                if (tag == 0x04 && data.Length >= 5) typeId = BitConverter.ToUInt32(data, 1);
+                else if (tag == 0x02 && data.Length >= 3) typeId = BitConverter.ToUInt16(data, 1);
+                else if (tag == 0x01 && data.Length >= 2) typeId = data[1];
+                else { Debug.LogError($"[PVP] truncated TypeID payload (hex: {BitConverter.ToString(data)})"); return; }
 
-            if (!Gameplay.PVPMatchmaking.TryParseArchetype(archetypeGcType,
-                    out Gameplay.PVPMatchmaking.Archetype archetype))
+                if (!Gameplay.PVPMatchmaking.TryParseArchetypeByTypeId(typeId, out archetype))
+                {
+                    Debug.LogError($"[PVP] Unknown match TypeID 0x{typeId:X8} (hex: {BitConverter.ToString(data)})");
+                    return;
+                }
+                Debug.LogError($"[PVP] {conn.LoginName} requested archetype: {archetype} (TypeID 0x{typeId:X8})");
+            }
+            else
             {
-                Debug.LogError($"[PVP] Unknown archetype '{archetypeGcType}'");
-                return;
+                string archetypeGcType = TryReadGcTypeString(data);
+                if (string.IsNullOrEmpty(archetypeGcType))
+                {
+                    Debug.LogError($"[PVP] Could not parse match archetype from payload (hex: {BitConverter.ToString(data)})");
+                    return;
+                }
+                Debug.LogError($"[PVP] {conn.LoginName} requested archetype: '{archetypeGcType}'");
+                if (!Gameplay.PVPMatchmaking.TryParseArchetype(archetypeGcType, out archetype))
+                {
+                    Debug.LogError($"[PVP] Unknown archetype '{archetypeGcType}'");
+                    return;
+                }
             }
 
             int rating = 1500;

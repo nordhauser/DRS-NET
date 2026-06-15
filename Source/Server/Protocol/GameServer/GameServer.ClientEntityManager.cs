@@ -2493,6 +2493,22 @@ namespace DungeonRunners.Networking
                     Debug.LogError($"[POSSE] POSSE COMPONENT DONE (cid=0x{npc.PosseOptionComponentId:X4})");
                 }
 
+                // PvP queue access point (e.g. Pwnston L33tenant): the client gates the "Enter the Queue!"
+                // dialog option on a PVPAccessPoint component, exactly like merchant/trainer/bank/posse.
+                // Advertise it as a 0x32 component carrying the nested access-point sub-object (which holds
+                // the MatchType the client reads in onDoPVP). Mirrors the posse component write above.
+                var pvpAccess = GetPvpAccessPoint(npc.GCClass);
+                if (pvpAccess != null)
+                {
+                    ushort pvpComponentId = (ushort)_nextEntityId++;
+                    Debug.LogError($"[PVP-ACCESS] CREATING PVPACCESSPOINT COMPONENT (cid=0x{pvpComponentId:X4}) gc='{pvpAccess.Value.subPath}' match='{pvpAccess.Value.matchType}' for {npc.Name}");
+                    writer.WriteByte(0x32);
+                    writer.WriteUInt16(npcId);
+                    writer.WriteUInt16(pvpComponentId);
+                    WriteGCType(writer, pvpAccess.Value.subPath, preserveCase: true);
+                    writer.WriteByte(0x00);
+                }
+
 
 
 
@@ -2549,6 +2565,42 @@ namespace DungeonRunners.Networking
             if (VerbosePacketLogging) Debug.LogError("");
             if (VerbosePacketLogging) Debug.LogError($"[SEND-ZONE-NPCS] sent={npcs.Count} batch=single");
             if (VerbosePacketLogging) Debug.LogError("");
+        }
+
+        private readonly Dictionary<string, (string subPath, string matchType)?> _pvpAccessPointCache =
+            new Dictionary<string, (string subPath, string matchType)?>(StringComparer.OrdinalIgnoreCase);
+
+        // A PvP queue NPC carries a nested object that `extends PVPAccessPoint` with a MatchType,
+        // e.g. world.pvp.npc.TownLieutenant.PVP -> pvp.GroupDeathMatch. The client's NPCDialog gates the
+        // "Enter the Queue!" option on a PVPAccessPoint component (like merchant/trainer/posse). Read the
+        // access point straight from the authored gc class so there are no hardcoded NPC names.
+        private (string subPath, string matchType)? GetPvpAccessPoint(string gcType)
+        {
+            if (string.IsNullOrEmpty(gcType)) return null;
+            if (_pvpAccessPointCache.TryGetValue(gcType, out var cached)) return cached;
+
+            (string subPath, string matchType)? result = null;
+            try
+            {
+                var node = GCDatabase.Instance?.ResolveWithInheritance(gcType);
+                if (node != null)
+                {
+                    foreach (var kv in node.Children)
+                    {
+                        var child = kv.Value;
+                        if (child != null && !string.IsNullOrEmpty(child.Extends)
+                            && child.Extends.IndexOf("PVPAccessPoint", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            result = (gcType + "." + kv.Key, child.GetString("MatchType"));
+                            break;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Debug.LogError($"[PVP-ACCESS] resolve failed for '{gcType}': {ex.Message}"); }
+
+            _pvpAccessPointCache[gcType] = result;
+            return result;
         }
 
 

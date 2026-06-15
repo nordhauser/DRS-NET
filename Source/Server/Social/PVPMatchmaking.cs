@@ -17,17 +17,43 @@ namespace DungeonRunners.Gameplay
             GroupDeathMatchUnrated,
         }
 
+        // Native gc paths (the access points reference MatchType = pvp.GroupDeathMatch, etc.).
         private static readonly Dictionary<string, Archetype> _archetypeByGcType =
             new Dictionary<string, Archetype>(StringComparer.OrdinalIgnoreCase)
             {
-                { "world.matches.GroupDuelMatch",         Archetype.GroupDuelMatch },
-                { "world.matches.GroupPracticeMatch",     Archetype.GroupPracticeMatch },
-                { "world.matches.GroupDeathMatch",        Archetype.GroupDeathMatch },
-                { "world.matches.GroupDeathMatchUnrated", Archetype.GroupDeathMatchUnrated },
+                { "pvp.GroupDuelMatch",         Archetype.GroupDuelMatch },
+                { "pvp.GroupPracticeMatch",     Archetype.GroupPracticeMatch },
+                { "pvp.GroupDeathMatch",        Archetype.GroupDeathMatch },
+                { "pvp.GroupDeathMatchUnrated", Archetype.GroupDeathMatchUnrated },
             };
+
+        // The client's requestPVPMatch (GroupClient '*' = 0x2A) sends the PVPMatch class as a gc TypeID:
+        // GCClassRegistry::writeType emits tag 0x04 + little-endian DJB2(lowercased gc path). Map those
+        // hashes back to archetypes. Live-verified: DJB2("pvp.GroupDeathMatch") == 0xE2998129 (the wire value).
+        private static readonly Dictionary<uint, Archetype> _archetypeByTypeId = BuildTypeIdMap();
+
+        private static Dictionary<uint, Archetype> BuildTypeIdMap()
+        {
+            var map = new Dictionary<uint, Archetype>();
+            foreach (var kv in _archetypeByGcType)
+                map[HashGcType(kv.Key)] = kv.Value;
+            return map;
+        }
+
+        // DJB2 over the lowercased gc path — matches GCObject.HashDjb2 and the client's class TypeID.
+        public static uint HashGcType(string gcPath)
+        {
+            uint h = 5381;
+            if (!string.IsNullOrEmpty(gcPath))
+                foreach (char c in gcPath.ToLowerInvariant()) h = ((h << 5) + h) + (uint)c;
+            return h;
+        }
 
         public static bool TryParseArchetype(string gcType, out Archetype a)
             => _archetypeByGcType.TryGetValue(gcType ?? "", out a);
+
+        public static bool TryParseArchetypeByTypeId(uint typeId, out Archetype a)
+            => _archetypeByTypeId.TryGetValue(typeId, out a);
 
         public static int RequiredPlayers(Archetype a)
         {
