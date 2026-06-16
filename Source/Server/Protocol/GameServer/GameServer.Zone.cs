@@ -1434,8 +1434,15 @@ namespace DungeonRunners.Networking
             catch (Exception ex) { Debug.LogError($"[PVP] Could not load PvP rating: {ex.Message}"); }
 
             uint charSqlId = conn.CharSqlId;
+            // Matchmaking unit: a queued group shares one team key; a solo player is their own team, so two
+            // solo queuers form a 1v1. Only the requester is enqueued here (the client sends requestPVPMatch
+            // leader-only) -- enqueuing the leader's whole group for a proper 2v2 is a follow-up.
+            var pvpGroup = Gameplay.GroupDirectory.Instance.GetGroupForConn(conn.ConnId);
+            string teamKey = (pvpGroup != null && pvpGroup.Members.Count(m => m.IsOnline) > 1)
+                ? "grp:" + pvpGroup.GroupId
+                : "solo:" + conn.LoginName;
             bool ok = Gameplay.PVPMatchmaking.Instance.EnqueuePlayer(
-                conn.LoginName, charSqlId, archetype, rating);
+                conn.LoginName, charSqlId, archetype, rating, teamKey);
 
             if (!ok)
             {
@@ -1474,7 +1481,7 @@ namespace DungeonRunners.Networking
             }
             SendToClient(conn, PVPPackets.BuildPVPMatchStatus(Gameplay.GroupDirectory.Instance.GetGroupForConn(conn.ConnId)?.GroupId ?? 1u, 0, 0, null));
             if (_zones.TryGetValue(conn.CurrentZoneId, out var z) && IsPvpZone(z.name))
-                ChangeZone(conn, "town", "");
+                ChangeZone(conn, "pvp_start", "respawn"); // back to the Pwnston PvP hub, not townstone
         }
 
         public void ProcessMatchmakingTick(bool forceRun = false)
@@ -1519,8 +1526,19 @@ namespace DungeonRunners.Networking
                 var pConn = _connections.Values.FirstOrDefault(c =>
                     c.LoginName?.Equals(login, StringComparison.OrdinalIgnoreCase) == true);
                 if (pConn == null) { Debug.LogError($"[PVP-MATCH] {login} not connected"); continue; }
-                Debug.LogError($"[PVP-MATCH] Spawning {login} into {match.ZoneName}#{match.InstanceId}");
-                ChangeZone(pConn, match.ZoneName, "");
+
+                // Tell the client its match is ready BEFORE moving it: in ReadPVPStatus the B field (3rd u32)
+                // going 0->nonzero prints "Your %s session is ready. Joining..." and calls enterPVPZone().
+                // The leading group id must still match the client's GroupClient+0xD0 (solo => 1).
+                uint grp = Gameplay.GroupDirectory.Instance.GetGroupForConn(pConn.ConnId)?.GroupId ?? 1u;
+                SendToClient(pConn, PVPPackets.BuildPVPMatchStatus(
+                    grp, 0, (uint)match.InstanceId, Gameplay.PVPMatchmaking.GetGcPath(match.Archetype)));
+
+                // Spawn at the player's team entry point (authored red_team_start/blue_team_start waypoints),
+                // not the zone default -- otherwise players land outside the arena.
+                string entryPoint = match.IsRed(login) ? "red_team_start" : "blue_team_start";
+                Debug.LogError($"[PVP-MATCH] Spawning {login} into {match.ZoneName}#{match.InstanceId} @ {entryPoint}");
+                ChangeZone(pConn, match.ZoneName, entryPoint, (uint)match.InstanceId);
             }
             Gameplay.PVPMatchmaking.Instance.MarkMatchStarted(match.MatchId);
         }
@@ -1555,7 +1573,7 @@ namespace DungeonRunners.Networking
                     var pConn = _connections.Values.FirstOrDefault(c =>
                         c.LoginName?.Equals(login, StringComparison.OrdinalIgnoreCase) == true);
                     if (pConn != null && _zones.TryGetValue(pConn.CurrentZoneId, out var z) && IsPvpZone(z.name))
-                        ChangeZone(pConn, "town", "");
+                        ChangeZone(pConn, "pvp_start", "respawn"); // back to the Pwnston PvP hub, not townstone
                 }
                 catch (Exception ex) { Debug.LogError($"[PVP-MATCH] Failed record for {login}: {ex.Message}"); }
             }
@@ -3425,6 +3443,17 @@ namespace DungeonRunners.Networking
                 conn.PendingSpawnY = 0;
                 conn.PendingSpawnZ = 0;
                 Debug.LogError($"[SPAWN] Using CHECKPOINT position: ({spawnX}, {spawnY}, {spawnZ})");
+            }
+            else if (!string.IsNullOrEmpty(conn.PendingSpawnPoint)
+                     && DatabaseLoader.GetWaypointsForZone(conn.CurrentZoneName ?? "")
+                            .FirstOrDefault(w => w.name != null && w.name.Equals(conn.PendingSpawnPoint, StringComparison.OrdinalIgnoreCase)) is { } namedWp)
+            {
+                spawnX = (float)namedWp.posX;
+                spawnY = (float)namedWp.posY;
+                spawnZ = (float)namedWp.posZ;
+                conn.PlayerHeading = (float)namedWp.heading;
+                Debug.LogError($"[SPAWN] Named waypoint '{namedWp.name}' in {conn.CurrentZoneName}: ({spawnX}, {spawnY}, {spawnZ}) h={conn.PlayerHeading}");
+                conn.PendingSpawnPoint = "";
             }
             else if (_zones.TryGetValue(conn.CurrentZoneId, out Zone currentZone) && (currentZone.spawnX != 0 || currentZone.spawnY != 0))
             {
@@ -6077,7 +6106,14 @@ namespace DungeonRunners.Networking
                         if (other.InstanceId != conn.InstanceId) continue;
 
                         uint otherAvatarId = GetPlayerAvatarId(other.LoginName);
-                        if (otherAvatarId != 0)
+                        // Skip if conn already holds other's avatar (a redundant re-spawn, e.g. the PvP
+                        // match-found enterPVPZone re-entry into the shared instance): re-sending the same
+                        // EntityID makes the client abort with "EntityID already exists" ->
+                        // SyncErrorRespawnDialog "Zone communication error. Code 5". _remoteBehaviorIds is
+                        // cleared by BroadcastEntityRemove on a real zone change, so fresh entries still send.
+                        bool connAlreadyHasOther = _remoteBehaviorIds.TryGetValue(conn.LoginName, out var connRemoteMap)
+                            && connRemoteMap.ContainsKey(other.LoginName);
+                        if (otherAvatarId != 0 && !connAlreadyHasOther)
                         {
                             byte[] otherSpawn = BuildOtherPlayerSpawnPacket(other, otherAvatarId, conn);
                             if (otherSpawn != null)
@@ -6089,7 +6125,9 @@ namespace DungeonRunners.Networking
                         }
 
                         uint myAvatarId = GetPlayerAvatarId(conn.LoginName);
-                        if (myAvatarId != 0)
+                        bool otherAlreadyHasConn = _remoteBehaviorIds.TryGetValue(other.LoginName, out var otherRemoteMap)
+                            && otherRemoteMap.ContainsKey(conn.LoginName);
+                        if (myAvatarId != 0 && !otherAlreadyHasConn)
                         {
                             byte[] mySpawn = BuildOtherPlayerSpawnPacket(conn, myAvatarId, other);
                             if (mySpawn != null)

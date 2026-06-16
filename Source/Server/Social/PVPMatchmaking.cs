@@ -71,19 +71,66 @@ namespace DungeonRunners.Gameplay
             return null;
         }
 
-        public static int RequiredPlayers(Archetype a)
+        // Authored match rules, transcribed verbatim from the original gc data
+        // (Database/gc/{GroupDeathMatch,GroupDeathMatchUnrated,GroupDuelMatch,GroupPracticeMatch}.gc).
+        // Times in seconds; Zones = candidate arena instances (one picked per match).
+        public struct MatchRules
+        {
+            public int MinGroupCount;
+            public int MaxGroupCount;
+            public int SetupTimeSec;
+            public int CombatTimeSec;
+            public int RewardTimeSec;
+            public int StartingRatingTolerance;
+            public double RatingToleranceIncrement;
+            public string[] Zones;
+            public bool FreeForAll;
+        }
+
+        public static MatchRules Rules(Archetype a)
         {
             switch (a)
             {
-                case Archetype.GroupDuelMatch:
-                case Archetype.GroupPracticeMatch:
-                    return 2;
                 case Archetype.GroupDeathMatch:
+                    return new MatchRules {
+                        MinGroupCount = 2, MaxGroupCount = 2,
+                        SetupTimeSec = 15, CombatTimeSec = 300, RewardTimeSec = 120,
+                        StartingRatingTolerance = 60, RatingToleranceIncrement = 1.0235,
+                        Zones = new[] { "DeathMatch01", "DeathMatch02", "DeathMatch03", "DeathMatch04" },
+                        FreeForAll = false };
                 case Archetype.GroupDeathMatchUnrated:
-                    return 4;
-                default: return 2;
+                    return new MatchRules {
+                        MinGroupCount = 2, MaxGroupCount = 2,
+                        SetupTimeSec = 30, CombatTimeSec = 420, RewardTimeSec = 0,
+                        StartingRatingTolerance = 60, RatingToleranceIncrement = 1.0235,
+                        Zones = new[] { "DeathMatchUnrated01", "DeathMatchUnrated02", "DeathMatchUnrated03", "DeathMatchUnrated04" },
+                        FreeForAll = false };
+                case Archetype.GroupDuelMatch:
+                    return new MatchRules {
+                        MinGroupCount = 2, MaxGroupCount = 2,
+                        SetupTimeSec = 30, CombatTimeSec = 420, RewardTimeSec = 0,
+                        StartingRatingTolerance = 50, RatingToleranceIncrement = 1.0235,
+                        Zones = new[] { "PVPGroupDuelMatch" },
+                        FreeForAll = false };
+                case Archetype.GroupPracticeMatch:
+                    // CombatTime/SetupTime are NOT authored on this class -- they inherit from the PVPMatch base
+                    // (not present in the data dump). Left 0 = "no server-side timer" until the base is pinned.
+                    return new MatchRules {
+                        MinGroupCount = 1, MaxGroupCount = 1,
+                        SetupTimeSec = 0, CombatTimeSec = 0, RewardTimeSec = 0,
+                        StartingRatingTolerance = 0, RatingToleranceIncrement = 1.0,
+                        Zones = new[] { "PVPGroupPracticeZone" },
+                        FreeForAll = true };
+                default:
+                    return new MatchRules {
+                        MinGroupCount = 2, MaxGroupCount = 2,
+                        SetupTimeSec = 30, CombatTimeSec = 420,
+                        Zones = new[] { "PVPGroupDuelMatch" } };
             }
         }
+
+        // Distinct teams (queued groups) needed to start a match -- the authored MinGroupCount.
+        public static int MinGroupCount(Archetype a) => Rules(a).MinGroupCount;
 
         public static bool IsRanked(Archetype a)
         {
@@ -110,18 +157,11 @@ namespace DungeonRunners.Gameplay
 
         public string PickZoneForArchetype(Archetype a)
         {
-            switch (a)
-            {
-                case Archetype.GroupDuelMatch:
-                case Archetype.GroupPracticeMatch:
-                    return "PVPGroupDuelMatch";
-                case Archetype.GroupDeathMatch:
-                    return "PVPGroupDeathMatch";
-                case Archetype.GroupDeathMatchUnrated:
-                    int n = System.Threading.Interlocked.Increment(ref _dmRoundRobin);
-                    return $"DeathMatch0{((n & 3) + 1)}";
-                default: return "PVPGroupDuelMatch";
-            }
+            var zones = Rules(a).Zones;
+            if (zones == null || zones.Length == 0) return null;
+            if (zones.Length == 1) return zones[0];
+            int n = System.Threading.Interlocked.Increment(ref _dmRoundRobin);
+            return zones[((n % zones.Length) + zones.Length) % zones.Length];
         }
         private int _dmRoundRobin;
 
@@ -141,6 +181,9 @@ namespace DungeonRunners.Gameplay
             public DateTime QueuedAt;
             public int PvpRating;
             public string AssignedMatchId;
+            // Matchmaking unit: buddies queued together share one TeamKey; a solo player gets a unique
+            // "solo:<login>" key so two solo queuers count as two teams (a 1v1).
+            public string TeamKey;
         }
 
         public class Match
@@ -159,14 +202,20 @@ namespace DungeonRunners.Gameplay
             // Pre-match rating per participant, captured at match creation (for Elo at match end).
             public Dictionary<string, int> ParticipantRatings = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-            public const int MaxDurationSec = 600;
-            public const int SpawnTimeoutSec = 30;
+            // Team composition: RedTeam = anchor team, BlueTeam = the matched team (solo 1v1 -> one login each).
+            public List<string> RedTeamLogins = new List<string>();
+            public List<string> BlueTeamLogins = new List<string>();
+            public bool IsRed(string login) => RedTeamLogins.Contains(login, StringComparer.OrdinalIgnoreCase);
 
-            public bool IsExpired => StartedAt.HasValue
-                && (DateTime.UtcNow - StartedAt.Value).TotalSeconds > MaxDurationSec;
+            // Native (from MatchRules): combat duration and setup/spawn window. 0 = no timer.
+            public int CombatTimeSec;
+            public int SetupTimeSec;
 
-            public bool SpawnTimedOut => !StartedAt.HasValue
-                && (DateTime.UtcNow - CreatedAt).TotalSeconds > SpawnTimeoutSec;
+            public bool IsExpired => StartedAt.HasValue && CombatTimeSec > 0
+                && (DateTime.UtcNow - StartedAt.Value).TotalSeconds > CombatTimeSec;
+
+            public bool SpawnTimedOut => !StartedAt.HasValue && SetupTimeSec > 0
+                && (DateTime.UtcNow - CreatedAt).TotalSeconds > SetupTimeSec;
         }
 
         private readonly Dictionary<string, QueueEntry> _queue =
@@ -182,7 +231,7 @@ namespace DungeonRunners.Gameplay
         private int _nextInstanceId = 100000;
 
 
-        public bool EnqueuePlayer(string loginName, uint charSqlId, Archetype archetype, int pvpRating)
+        public bool EnqueuePlayer(string loginName, uint charSqlId, Archetype archetype, int pvpRating, string teamKey)
         {
             lock (_lock)
             {
@@ -204,6 +253,7 @@ namespace DungeonRunners.Gameplay
                     Archetype = archetype,
                     QueuedAt = DateTime.UtcNow,
                     PvpRating = pvpRating,
+                    TeamKey = teamKey ?? ("solo:" + loginName),
                 };
                 Debug.LogError($"[PVP-MATCH] {loginName} queued for {archetype} (rating {pvpRating}). " +
                                $"Queue size for archetype: {_queue.Values.Count(e => e.Archetype == archetype)}");
@@ -253,38 +303,41 @@ namespace DungeonRunners.Gameplay
             {
                 foreach (Archetype a in Enum.GetValues(typeof(Archetype)))
                 {
-                    var pool = _queue.Values
-                        .Where(e => e.Archetype == a && e.AssignedMatchId == null)
-                        .OrderBy(e => e.QueuedAt)
-                        .ToList();
+                    int minTeams = MinGroupCount(a);
 
-                    int needed = RequiredPlayers(a);
-                    while (pool.Count >= needed)
+                    while (true)
                     {
-                        List<QueueEntry> chosen;
-                        if (IsRanked(a))
-                        {
-                            var anchor = pool[0];
-                            chosen = new List<QueueEntry> { anchor };
-                            chosen.AddRange(pool.Skip(1)
-                                .OrderBy(e => Math.Abs(e.PvpRating - anchor.PvpRating))
-                                .Take(needed - 1));
-                        }
-                        else
-                        {
-                            chosen = pool.Take(needed).ToList();
-                        }
+                        // A "team" is a queued group: buddies share a TeamKey, a solo player is a team of one.
+                        // Two solo teams -> 1v1, two duo teams -> 2v2. Practice (MinGroupCount=1) starts alone.
+                        var teams = _queue.Values
+                            .Where(e => e.Archetype == a && e.AssignedMatchId == null)
+                            .GroupBy(e => e.TeamKey ?? ("solo:" + e.LoginName))
+                            .Select(g => new Team(g.Key, g.ToList()))
+                            .OrderBy(t => t.QueuedAt)
+                            .ToList();
 
-                        if (chosen.Count < needed) break;
+                        if (teams.Count < minTeams) break;
 
-                        var match = CreateMatch(a, chosen);
+                        var anchor = teams[0];
+                        var chosen = new List<Team> { anchor };
+                        var rest = teams.Skip(1);
+                        chosen.AddRange(IsRanked(a)
+                            ? rest.OrderBy(t => Math.Abs(t.AvgRating - anchor.AvgRating)).Take(minTeams - 1)
+                            : rest.Take(minTeams - 1));
+
+                        if (chosen.Count < minTeams) break;
+
+                        var participants = chosen.SelectMany(t => t.Members).ToList();
+                        var match = CreateMatch(a, participants);
+                        if (chosen.Count >= 1) match.RedTeamLogins.AddRange(chosen[0].Members.Select(m => m.LoginName));
+                        if (chosen.Count >= 2) match.BlueTeamLogins.AddRange(chosen[1].Members.Select(m => m.LoginName));
                         newMatches.Add(match);
 
-                        foreach (var queueEntry in chosen)
-                        {
-                            pool.Remove(queueEntry);
+                        Debug.LogError($"[PVP-MATCH] formed {a}: " +
+                            string.Join(" vs ", chosen.Select(t => string.Join("+", t.Members.Select(m => m.LoginName)))));
+
+                        foreach (var queueEntry in participants)
                             _queue.Remove(queueEntry.LoginName);
-                        }
                     }
                 }
             }
@@ -294,6 +347,22 @@ namespace DungeonRunners.Gameplay
                                string.Join(", ", m.ParticipantLogins));
 
             return newMatches;
+        }
+
+        // A matchmaking unit: one queued group (or a single solo player).
+        private sealed class Team
+        {
+            public readonly string Key;
+            public readonly List<QueueEntry> Members;
+            public readonly DateTime QueuedAt;
+            public readonly int AvgRating;
+            public Team(string key, List<QueueEntry> members)
+            {
+                Key = key;
+                Members = members;
+                QueuedAt = members.Min(m => m.QueuedAt);
+                AvgRating = (int)members.Average(m => m.PvpRating);
+            }
         }
 
         public void MarkMatchStarted(string matchId)
@@ -327,7 +396,7 @@ namespace DungeonRunners.Gameplay
                 Debug.LogError($"[PVP-MATCH] {killerLogin} killed {victimLogin} in match {matchId} " +
                                $"(K/D: {killerLogin}={match.KillCounts[killerLogin]}, victim deaths={match.DeathCounts[victimLogin]})");
 
-                bool isOneVsOne = RequiredPlayers(match.Archetype) == 2;
+                bool isOneVsOne = match.ParticipantLogins.Count == 2;
                 if (isOneVsOne)
                 {
                     match.WinnerLogin = killerLogin;
@@ -404,7 +473,7 @@ namespace DungeonRunners.Gameplay
                 if (_playerToMatch.TryGetValue(loginName, out var matchId)
                     && _activeMatches.TryGetValue(matchId, out var match))
                 {
-                    if (RequiredPlayers(match.Archetype) == 2)
+                    if (match.ParticipantLogins.Count == 2)
                     {
                         match.WinnerLogin = match.ParticipantLogins
                             .FirstOrDefault(p => !p.Equals(loginName, StringComparison.OrdinalIgnoreCase));
@@ -429,6 +498,7 @@ namespace DungeonRunners.Gameplay
         {
             var matchId = Guid.NewGuid().ToString("N").Substring(0, 12);
             var instanceId = System.Threading.Interlocked.Increment(ref _nextInstanceId);
+            var rules = Rules(a);
             var match = new Match
             {
                 MatchId = matchId,
@@ -437,6 +507,8 @@ namespace DungeonRunners.Gameplay
                 InstanceId = instanceId,
                 CreatedAt = DateTime.UtcNow,
                 ParticipantLogins = participants.Select(queueEntry => queueEntry.LoginName).ToList(),
+                CombatTimeSec = rules.CombatTimeSec,
+                SetupTimeSec = rules.SetupTimeSec,
             };
             _activeMatches[matchId] = match;
             foreach (var queueEntry in participants)

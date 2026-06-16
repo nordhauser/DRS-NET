@@ -1324,9 +1324,9 @@ namespace DungeonRunners.Networking
                 }
                 catch { }
 
-                bool ok = Gameplay.PVPMatchmaking.Instance.EnqueuePlayer(conn.LoginName, conn.CharSqlId, atype, rating);
+                bool ok = Gameplay.PVPMatchmaking.Instance.EnqueuePlayer(conn.LoginName, conn.CharSqlId, atype, rating, "solo:" + conn.LoginName);
                 sendMessage(conn, ok
-                    ? $"[PVP] Queued for {atype} (rating {rating}). Need {Gameplay.PVPMatchmaking.RequiredPlayers(atype)} total."
+                    ? $"[PVP] Queued for {atype} (rating {rating}). Need {Gameplay.PVPMatchmaking.MinGroupCount(atype)} teams."
                     : "[PVP] Could not queue (already queued or in match).");
                 return true;
             }

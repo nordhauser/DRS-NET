@@ -1935,7 +1935,7 @@ namespace DungeonRunners.Networking
         }
 
 
-        private void ChangeZone(RRConnection conn, string targetZone, string spawnPoint)
+        private void ChangeZone(RRConnection conn, string targetZone, string spawnPoint, uint? forcedInstanceId = null)
         {
             BlingGnomeRuntime.Instance.SetServer(this);
             BlingGnomeRuntime.Instance.CleanupForZoneTransition(conn.ConnId);
@@ -2000,7 +2000,19 @@ namespace DungeonRunners.Networking
 
             Debug.LogError($"[ZONE] CurrentZoneGcType set to: {conn.CurrentZoneGcType}");
             Debug.LogError($"[ZONE] CurrentZoneName set to: {conn.CurrentZoneName}");
-            AssignInstanceId(conn);
+            if (forcedInstanceId.HasValue)
+            {
+                // PvP match: force all participants onto the match's shared instance so they see each other.
+                // DeathMatch zones are non-public, so AssignInstanceId would otherwise give each player a
+                // distinct SOLO instance (>= 0x80000000) and the InstanceId visibility filter would hide them.
+                conn.InstanceId = forcedInstanceId.Value;
+                StampRuntimeInstanceKey(conn, "pvp-match");
+                Debug.LogError($"[INSTANCE] {conn.LoginName} -> PVP MATCH '{conn.CurrentZoneName}' (forced instance {conn.InstanceId:X8})");
+            }
+            else
+            {
+                AssignInstanceId(conn);
+            }
 
             if (_selectedCharacter.TryGetValue(conn.LoginName, out var zoneChangeChar2))
             {

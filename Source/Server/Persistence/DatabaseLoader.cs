@@ -284,6 +284,43 @@ public static class DatabaseLoader
                 if (!WaypointsByZone.ContainsKey(zoneKey)) WaypointsByZone[zoneKey] = new List<ZoneWaypointData>();
                 WaypointsByZone[zoneKey].Add(waypoint);
             }
+        SeedPvpArenaWaypoints();
+    }
+
+    // PvP arena team spawn waypoints, verbatim from `666 game.pki dump\<zone>.world` entity placements
+    // (the wp_<name> gc exposes Name=<name>, so the "wp_" prefix is dropped to the resolvable name). The
+    // shipped zone_waypoints table omits these, so seed them into the in-memory map after load.
+    private static void SeedPvpArenaWaypoints()
+    {
+        // zone : red_team_start (x,y,z,heading) : blue_team_start (x,y,z,heading)
+        var arenas = new (string zone, float rx, float ry, float rz, float rh, float bx, float by, float bz, float bh)[]
+        {
+            ("DeathMatch01",  480f, 160f, 20f,  90f,  -480f, 160f, 10f, 270f),
+            ("DeathMatch02",  435f, 140f, 10f,  90f,  -440f, 140f, 10f, 270f),
+            ("DeathMatch03",  300f, 160f, 10f,  90f,  -300f, 160f, 10f, 270f),
+            ("DeathMatch04", -140f, 305f, 40f, 180f,   260f,-250f, 40f,   0f),
+        };
+        foreach (var a in arenas)
+        {
+            AddWaypointIfAbsent(a.zone, "red_team_start",  a.rx, a.ry, a.rz, a.rh);
+            AddWaypointIfAbsent(a.zone, "blue_team_start", a.bx, a.by, a.bz, a.bh);
+        }
+    }
+
+    private static void AddWaypointIfAbsent(string zone, string name, float x, float y, float z, float heading)
+    {
+        string key = zone.ToLower();
+        if (!WaypointsByZone.TryGetValue(key, out var list))
+        {
+            list = new List<ZoneWaypointData>();
+            WaypointsByZone[key] = list;
+        }
+        foreach (var existing in list)
+            if (existing.name != null && existing.name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                return;
+        var wp = new ZoneWaypointData { zone = zone, name = name, posX = x, posY = y, posZ = z, heading = heading };
+        list.Add(wp);
+        ZoneWaypoints.Add(wp);
     }
 
     private static void LoadZoneCheckpoints()
