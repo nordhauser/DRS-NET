@@ -1290,11 +1290,50 @@ namespace DungeonRunners.Networking
             return clone;
         }
 
+        // Per-login list of gate entity IDs spawned for that client (SendZoneWorldEntities runs per-conn, so
+        // each client gets its OWN entity IDs for the same gate). Used at battle-start to drop the right gates.
+        private readonly Dictionary<string, List<ushort>> _pvpGateIdsByLogin =
+            new Dictionary<string, List<ushort>>(StringComparer.OrdinalIgnoreCase);
+
+        // Deferred King's Coin rewards (login -> coin count). Granting the reward item mid-arena is wiped by the
+        // inventory reload on the zone change back to pvp_start, so we stash it and grant once the player is
+        // settled back in the pvp_start hub.
+        private readonly Dictionary<string, int> _pendingKingsCoins =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        // Logins whose PVPMatchController has been spawned (this match). The mutual avatar-spawn must not run
+        // until BOTH players' controllers are up, or the second joiner receives the first's avatar before its
+        // controller registers -> OnUnitAdded never fires -> "second joiner doesn't register the first".
+        private readonly HashSet<string> _pvpControllerReady =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Per-login time at which that client's arena gates should drop. The client runs its OWN setup countdown
+        // (from when its controller spawns), so a single match-level gate drop can't match both clients (they
+        // enter at different times). We drop each client's gates SetupTime after ITS controller spawned, so the
+        // gate aligns with that client's on-screen countdown reaching zero.
+        private readonly Dictionary<string, DateTime> _pvpGateDropDue =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        // Per-login PVPMatchController entity id, so we can re-target the controller after spawn to DRIVE its FSM
+        // server-side (SETUP->COMBAT at the real SetupTime, COMBAT->END at the real CombatTime). The client otherwise
+        // self-runs the FSM at ~10Hz while its timers assume 30Hz, so its countdown/transition lag ~3x; driving the
+        // transition from the server's real clock makes match-start/end server-timed (see SendPVPControllerTransition).
+        private readonly Dictionary<string, ushort> _pvpControllerIdByLogin =
+            new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase);
+
+        // Per-login queue of server-sent combat-time reminders (due time + the exact authentic string), scheduled
+        // when that client's combat begins and drained in the match tick. See ScheduleCombatTimeReminders.
+        private readonly Dictionary<string, List<(DateTime due, string msg)>> _pvpCombatReminders =
+            new Dictionary<string, List<(DateTime, string)>>(StringComparer.OrdinalIgnoreCase);
+
         private void SendZoneWorldEntities(RRConnection conn)
         {
             if (WorldEntitySpawner.Instance == null) return;
             string zoneName = conn.CurrentZoneName;
             if (string.IsNullOrEmpty(zoneName)) return;
+
+            // Stale gate IDs from a prior zone are invalid now; rebuilt below for the new zone.
+            if (conn.LoginName != null) _pvpGateIdsByLogin.Remove(conn.LoginName);
 
             var entities = WorldEntitySpawner.Instance.GetEntitiesForZone(zoneName);
             if (entities.Count == 0) return;
@@ -1313,6 +1352,13 @@ namespace DungeonRunners.Networking
 
                 WorldEntitySpawner.WriteEntitySpawn(writer, entId, behaviorId, data);
                 WorldEntitySpawner.Instance.TrackSpawnedEntity(entId, data);
+
+                if (data.IsGate && conn.LoginName != null)
+                {
+                    if (!_pvpGateIdsByLogin.TryGetValue(conn.LoginName, out var gids))
+                        _pvpGateIdsByLogin[conn.LoginName] = gids = new List<ushort>();
+                    gids.Add(entId);
+                }
 
                 _allEntityPositions[entId] = (data.PosX, data.PosY, data.PosZ);
 
@@ -1505,11 +1551,78 @@ namespace DungeonRunners.Networking
                 }
             }
 
-            var (newMatches, endedMatches) = Gameplay.PVPMatchmaking.Instance.Tick();
+            var (newMatches, endedMatches, enteringCombat) = Gameplay.PVPMatchmaking.Instance.Tick();
             foreach (var match in newMatches)
                 SpawnMatchParticipants(match);
+            foreach (var match in enteringCombat)
+                BeginPvpCombat(match);
             foreach (var match in endedMatches)
                 FinalizeMatchResults(match);
+
+            // Per-client arena gate drop: drop each client's gates once SetupTime has elapsed since ITS
+            // controller spawned, so the gate aligns with that client's own on-screen countdown (rather than one
+            // shared match moment that can only match one of the two clients).
+            if (_pvpGateDropDue.Count > 0)
+            {
+                var nowUtc = DateTime.UtcNow;
+                foreach (var kv in _pvpGateDropDue.ToList())
+                {
+                    if (nowUtc < kv.Value) continue;
+                    var gConn = _connections.Values.FirstOrDefault(c => c.IsConnected && c.IsSpawned
+                        && c.LoginName?.Equals(kv.Key, StringComparison.OrdinalIgnoreCase) == true);
+                    if (gConn != null)
+                    {
+                        DropPvpGatesFor(gConn);
+                        // Battle begins: drive the client controller SETUP(0x15)->COMBAT(0x17) from the server's
+                        // real SetupTime so "The battle has begun!" + the combat clock fire in sync with the gate
+                        // drop, instead of ~3x late on the client's slow self-run timer.
+                        SendPVPControllerTransition(gConn, 0x17);
+                        ScheduleCombatTimeReminders(gConn);
+                    }
+                    _pvpGateDropDue.Remove(kv.Key);
+                }
+            }
+
+            // Combat-time reminders ("The battle will end in N minutes!"): the client's own copies
+            // (ClientDisplayCombatTimeReminder@0x609830) self-run on its ~10Hz clock and no longer fire before the
+            // server-forced END at the real CombatTime, so the server sends the authentic strings at the real times.
+            if (_pvpCombatReminders.Count > 0)
+            {
+                var nowUtc = DateTime.UtcNow;
+                foreach (var kv in _pvpCombatReminders.ToList())
+                {
+                    var list = kv.Value;
+                    while (list.Count > 0 && nowUtc >= list[0].due)
+                    {
+                        var rConn = _connections.Values.FirstOrDefault(c => c.IsConnected && c.IsSpawned
+                            && c.LoginName?.Equals(kv.Key, StringComparison.OrdinalIgnoreCase) == true
+                            && _zones.TryGetValue(c.CurrentZoneId, out var rz) && IsPvpZone(rz.name));
+                        if (rConn != null) SendSystemMessage(rConn, list[0].msg);
+                        list.RemoveAt(0);
+                    }
+                    if (list.Count == 0) _pvpCombatReminders.Remove(kv.Key);
+                }
+            }
+
+            // Grant deferred King's Coin rewards once the player is settled back in the pvp_start hub (granting
+            // them in the arena gets wiped by the inventory reload on the zone change back).
+            if (_pendingKingsCoins.Count > 0)
+            {
+                foreach (var kv in _pendingKingsCoins.ToList())
+                {
+                    var rConn = _connections.Values.FirstOrDefault(c => c.IsConnected && c.IsSpawned
+                        && c.LoginName?.Equals(kv.Key, StringComparison.OrdinalIgnoreCase) == true
+                        && string.Equals(c.CurrentZoneName, "pvp_start", StringComparison.OrdinalIgnoreCase));
+                    if (rConn == null) continue;
+                    int coins = kv.Value;
+                    GiveStackedItem(rConn, "QuestItemPAL.Token", coins, 100);
+                    SendSystemMessage(rConn, coins >= 10
+                        ? "You received ten King's Coins for this match."
+                        : "You received five King's Coins for this match.");
+                    _pendingKingsCoins.Remove(kv.Key);
+                    Debug.LogError($"[PVP-MATCH] {kv.Key} granted {coins} King's Coins in pvp_start (deferred)");
+                }
+            }
         }
 
         private void SpawnMatchParticipants(Gameplay.PVPMatchmaking.Match match)
@@ -1527,12 +1640,13 @@ namespace DungeonRunners.Networking
                     c.LoginName?.Equals(login, StringComparison.OrdinalIgnoreCase) == true);
                 if (pConn == null) { Debug.LogError($"[PVP-MATCH] {login} not connected"); continue; }
 
-                // Tell the client its match is ready BEFORE moving it: in ReadPVPStatus the B field (3rd u32)
-                // going 0->nonzero prints "Your %s session is ready. Joining..." and calls enterPVPZone().
-                // The leading group id must still match the client's GroupClient+0xD0 (solo => 1).
-                uint grp = Gameplay.GroupDirectory.Instance.GetGroupForConn(pConn.ConnId)?.GroupId ?? 1u;
-                SendToClient(pConn, PVPPackets.BuildPVPMatchStatus(
-                    grp, 0, (uint)match.InstanceId, Gameplay.PVPMatchmaking.GetGcPath(match.Archetype)));
+                // NOTE: we deliberately do NOT send a B-nonzero match-found status here. In ReadPVPStatus the
+                // B field going 0->nonzero calls enterPVPZone(), which makes the client load the arena a SECOND
+                // time on top of our server-driven ChangeZone below -> two zone entries per player. Each entry
+                // runs BroadcastEntityRemove (clearing _remoteBehaviorIds) then re-creates every avatar, so the
+                // opponent's avatar is created 2-3x and ends up in an inconsistent render state (one client
+                // sees the body, the other doesn't). ChangeZone is the real teleport, and the controller links
+                // the match from +0xc0 which the queue status already delivered, so the status is redundant.
 
                 // Spawn at the player's team entry point (authored red_team_start/blue_team_start waypoints),
                 // not the zone default -- otherwise players land outside the arena.
@@ -1543,11 +1657,192 @@ namespace DungeonRunners.Networking
             Gameplay.PVPMatchmaking.Instance.MarkMatchStarted(match.MatchId);
         }
 
+        // Battle-start (SETUP->COMBAT, fired by PVPMatchmaking.Tick after SetupTime). Drops the arena gates
+        // for every participant. SendZoneWorldEntities runs per-conn so each client got its OWN gate entity
+        // IDs (tracked in _pvpGateIdsByLogin); send each the BossGate open packet 0x03 [id] 0x0A 0x00 -- the
+        // same mechanism dungeon boss gates use (GameServer.Combat.cs).
+        // Server-side combat-start marker. The gate drop is NOT done here -- it's per-client on each client's
+        // own SetupTime schedule (in the match tick) so the gate matches that client's countdown, not one shared
+        // moment (the two clients start their countdowns at different times).
+        private void BeginPvpCombat(Gameplay.PVPMatchmaking.Match match)
+        {
+            Debug.LogError($"[PVP-MATCH] BeginPvpCombat {match.ZoneName}#{match.InstanceId} (combat phase begun)");
+        }
+
+        // Drop one client's arena gates (BossGate open: 0x03 [id] 0x0A 0x00). Called per-client when its
+        // SetupTime has elapsed since its controller spawned, so the gate aligns with its on-screen countdown.
+        private void DropPvpGatesFor(RRConnection conn)
+        {
+            if (conn?.LoginName == null) return;
+            if (!_pvpGateIdsByLogin.TryGetValue(conn.LoginName, out var gateIds) || gateIds.Count == 0)
+            {
+                Debug.LogError($"[PVP-GATES] no tracked gates for {conn.LoginName} (zone={conn.CurrentZoneName})");
+                return;
+            }
+            foreach (var gid in gateIds)
+            {
+                var w = new LEWriter();
+                w.WriteByte(0x03);
+                w.WriteUInt16(gid);
+                w.WriteByte(0x0A);
+                w.WriteByte(0x00);
+                conn.MessageQueue.Enqueue(w.ToArray());
+            }
+            Debug.LogError($"[PVP-GATES] dropped {gateIds.Count} gates for {conn.LoginName} (per-client, synced to countdown)");
+        }
+
+        // Spawn the PVPMatchController entity onto a client (entity-create on the 0x07 entity channel, same
+        // framing as BroadcastEntityRemove). The controller is a gc-class Entity named "PVPMatchController"
+        // (parent Entity); on its processInited it registers at ZoneClient+0xa18, after which every unit-init
+        // in the zone fires PVPMatchController::OnUnitAdded -> the "X has joined the <Team>" line + the
+        // Welcome/countdown banner. It links the match client-side from the match the 0x4E status packet
+        // already delivered (the client never reads PVPMatch off this entity-create -- verified: IsKindOf
+        // <PVPMatch> only in ReadPVPStatus).
+        private void SendPVPMatchControllerSpawn(RRConnection conn)
+        {
+            if (conn == null) return;
+            var match = Gameplay.PVPMatchmaking.Instance.GetMatchForPlayer(conn.LoginName);
+            ushort controllerId = (ushort)_nextEntityId++;
+            var w = new LEWriter();
+            w.WriteByte(0x07);   // client entity-manager channel
+            w.WriteByte(0x01);   // create entity
+            w.WriteUInt16(controllerId);
+            WriteGCType(w, "PVPMatchController", preserveCase: true);
+
+            // init (PVPMatchController::readInit@0x60ad00): [u32 +0xc0][u8 flag +0xc4]
+            //   [StateMachine::ReadMessage: 1 flag byte, 0x00 = no FSM state][u8 teamCount][teamCount x TeamScore].
+            // TeamScore (TeamScore::ReadMessage@0x60af60): [6 x u32 scores][3 x u8 flags][PVPTeam writeType].
+            // The team list this populates (controller+0xb0) is what OnUnitAdded scans to print the join line.
+            w.WriteByte(0x02);   // init
+            w.WriteUInt16(controllerId);
+            w.WriteUInt32(0);    // +0xc0 (ctor default 0)
+            w.WriteByte(0x00);   // +0xc4 flag
+            // StateMachine flag = 0x00: send NO FSM-state override. Leave the ctor default (+0xa2 = 0xffff).
+            // The premature "stalemate" was NOT a missing state -- ServerClientUpdateWins@0x609ce0 is called from
+            // OnUnitRemoved/OnAvatarDied, and the enterPVPZone double-entry's spurious avatar removals fired
+            // OnUnitRemoved -> stalemate. That root is fixed by removing the double-entry (above). Forcing the
+            // state to 0x15 (active) was harmful: it made ServerClientUpdateWins early-return on EVERY real death
+            // (no victory ever awarded) and put the score dialog in "combat" mode (countdown vanished).
+            // CONFIRMED via Ghidra (PVPMatchController::update@0x609568): the CLIENT self-runs the FSM. On the
+            // first update with +0xa2 == 0xffff it sets next=0x15 and runs setup->combat->end autonomously, using
+            // durations from controller+0xcc (= GetArchetype<PVPMatch>; SetupTime @+0x7c, CombatTime @+0x74, x30
+            // ticks). So we MUST leave +0xa2 = 0xffff (no override) for the client to start its own countdown, and
+            // the 300s no-kill stalemate is driven client-side too (end fires with no winner). The server's only
+            // job is to mirror those durations: drop each client's gate SetupTime after ITS controller spawned.
+            w.WriteByte(0x00);   // StateMachine flag = 0 (no state read)
+            if (match != null && match.Archetype == Gameplay.PVPMatchmaking.Archetype.GroupPracticeMatch)
+            {
+                w.WriteByte(0x01);                       // FFA: a single team
+                WritePVPTeamScore(w, "pvp.FFATeam");
+            }
+            else
+            {
+                string teamList = (match != null && match.Archetype == Gameplay.PVPMatchmaking.Archetype.GroupDuelMatch)
+                    ? "pvp.DuelTeamList" : "pvp.DefaultTeamList";
+                w.WriteByte(0x02);                       // Red + Blue
+                WritePVPTeamScore(w, teamList + ".RedTeam");
+                WritePVPTeamScore(w, teamList + ".BlueTeam");
+            }
+
+            w.WriteByte(0x06);   // end of entity stream
+            SendToClient(conn, w.ToArray());
+            if (conn.LoginName != null)
+            {
+                _pvpControllerReady.Add(conn.LoginName);
+                _pvpControllerIdByLogin[conn.LoginName] = controllerId;   // remember it to drive its FSM later
+                // Schedule this client's gate drop SetupTime after ITS controller spawned, to match its own
+                // client-run countdown (the client started counting the moment its controller arrived).
+                int setupSec = match?.SetupTimeSec ?? 15;
+                _pvpGateDropDue[conn.LoginName] = DateTime.UtcNow.AddSeconds(setupSec);
+            }
+            Debug.LogError($"[PVP-MATCH] Sent PVPMatchController entity {controllerId} (+team scores) to {conn.LoginName} (zone={conn.CurrentZoneName})");
+
+            // Once BOTH clients have their controller, start the server-side SETUP countdown so the gate-drop /
+            // combat-start timer aligns with the clients' on-screen countdown (which starts at controller spawn).
+            if (match != null && match.ParticipantLogins.All(l => _pvpControllerReady.Contains(l)))
+                Gameplay.PVPMatchmaking.Instance.BeginSetupPhase(match.MatchId);
+        }
+
+        // One PVPMatchController::TeamScore in the controller init's team list: 6 u32 scores + 3 u8 flag bytes
+        // + the team via writeType (name form 0xFF + gc path, e.g. pvp.DefaultTeamList.RedTeam).
+        private void WritePVPTeamScore(LEWriter w, string teamGcPath)
+        {
+            for (int i = 0; i < 6; i++) w.WriteUInt32(0);
+            w.WriteByte(0x00); w.WriteByte(0x00); w.WriteByte(0x00);
+            w.WriteByte(0xFF); w.WriteCString(teamGcPath);
+        }
+
+        // Drive the client's PVPMatchController FSM to a new state from the SERVER's real clock, so match phases
+        // are server-timed instead of relying on the client's ~10Hz self-run timers (which lag ~3x). Mechanism
+        // (Ghidra): re-send the controller init (PVPMatchController::readInit@0x60ad00) -> its StateMachine portion
+        // is read by StateMachine::ReadMessage@0x5f0c70 (vtable slot 1). A flag byte of 0x09 sets bit0 (the
+        // "changed" flag @SM+0x18) + bit3 (read next-state @SM+0x14). On the NEXT client update(), Process@0x5f0980
+        // sees the changed flag and runs States(EXIT, currentState) then States(ENTER, nextState) -- a clean
+        // transition (fires "The battle has begun!" + the combat timer for 0x17, or wins/release for 0x16). We do
+        // NOT set the current state (the client already holds it) and send teamCount=0 so the team list is left
+        // untouched (no duplication). Valid nextState: 0x17 = COMBAT, 0x16 = END.
+        private void SendPVPControllerTransition(RRConnection conn, ushort nextState)
+        {
+            if (conn?.LoginName == null) return;
+            if (!_pvpControllerIdByLogin.TryGetValue(conn.LoginName, out var controllerId)) return;
+            var w = new LEWriter();
+            w.WriteByte(0x07);              // client entity-manager channel
+            w.WriteByte(0x02);              // init (re-init the existing controller entity)
+            w.WriteUInt16(controllerId);
+            w.WriteUInt32(0);               // +0xc0
+            w.WriteByte(0x00);              // +0xc4 flag
+            w.WriteByte(0x09);              // StateMachine::ReadMessage flag: bit0 changed + bit3 next-state
+            w.WriteUInt16(nextState);       // next state (read into SM+0x14 = controller+0xa4)
+            w.WriteByte(0x00);              // teamCount = 0 (leave the team list as-is)
+            w.WriteByte(0x06);              // end of entity stream
+            SendToClient(conn, w.ToArray());
+            Debug.LogError($"[PVP-MATCH] Drove controller {controllerId} -> FSM next-state 0x{nextState:X2} for {conn.LoginName} (server-timed)");
+        }
+
+        // Queue the combat-time reminders for one client, timed from when ITS combat begins (this is called right
+        // after we drive that client SETUP->COMBAT). Mirrors the client's authentic cadence: a reminder every 60s
+        // showing whole minutes remaining ("The battle will end in N minute(s)!"), for CombatTime - 60k > 0.
+        private void ScheduleCombatTimeReminders(RRConnection conn)
+        {
+            if (conn?.LoginName == null) return;
+            var match = Gameplay.PVPMatchmaking.Instance.GetMatchForPlayer(conn.LoginName);
+            int combatSec = match?.CombatTimeSec ?? 300;
+            var now = DateTime.UtcNow;
+            var list = new List<(DateTime, string)>();
+            for (int elapsed = 60; elapsed < combatSec; elapsed += 60)
+            {
+                int remMin = (combatSec - elapsed) / 60;
+                if (remMin < 1) continue;
+                string msg = remMin == 1
+                    ? "The battle will end in 1 minute!"
+                    : $"The battle will end in {remMin} minutes!";
+                list.Add((now.AddSeconds(elapsed), msg));
+            }
+            if (list.Count > 0) _pvpCombatReminders[conn.LoginName] = list;
+        }
+
         private void FinalizeMatchResults(Gameplay.PVPMatchmaking.Match match)
         {
+            // Cancel any pending combat-time reminders for this match's players (a forfeit/early end must not keep
+            // firing "N minutes remaining" after the match is over).
+            foreach (var login in match.ParticipantLogins) _pvpCombatReminders.Remove(login);
+
             if (string.IsNullOrEmpty(match.WinnerLogin))
             {
-                Debug.LogError($"[PVP-MATCH] Match {match.MatchId} ended with no winner");
+                Debug.LogError($"[PVP-MATCH] Match {match.MatchId} ended with no winner (stalemate) - driving END card");
+                // Time-limit STALEMATE (#3): the match ran the full CombatTime with no winner. Drive each client's
+                // controller COMBAT(0x17)->END(0x16) from the server's real clock so "It's a stalemate!" shows NOW
+                // (instead of ~3x late on the client's self-run timer). END(0x16) ENTER runs ServerClientUpdateWins
+                // (scores 0-0 -> stalemate) + ServerClientReleaseSession (enables the Leave button); the player
+                // exits via the card (0x2C -> HandleLeavePvp's own teleport), so no auto-teleport here.
+                foreach (var login in match.ParticipantLogins)
+                {
+                    var sConn = _connections.Values.FirstOrDefault(c =>
+                        c.LoginName?.Equals(login, StringComparison.OrdinalIgnoreCase) == true);
+                    if (sConn != null && sConn.IsConnected && sConn.IsSpawned
+                        && _zones.TryGetValue(sConn.CurrentZoneId, out var sz) && IsPvpZone(sz.name))
+                        SendPVPControllerTransition(sConn, 0x16);
+                }
                 return;
             }
 
@@ -1556,24 +1851,62 @@ namespace DungeonRunners.Networking
             foreach (var login in match.ParticipantLogins.Concat(new[] { match.WinnerLogin }).Distinct(StringComparer.OrdinalIgnoreCase))
             {
                 bool isWinner = login.Equals(match.WinnerLogin, StringComparison.OrdinalIgnoreCase);
+                // Base the Elo on the PRE-MATCH rating, which already defaults to 1500 for an unrated character
+                // (the stored pvp_rating starts at 0). newRating is the absolute result, so ratings climb from
+                // 1500 instead of 0 (0+16=16 looked like "rating shows 0").
+                int preMatchRating = match.ParticipantRatings.TryGetValue(login, out var mr) ? mr : 1500;
                 int ratingDelta = 0;
+                int newRating = preMatchRating;
                 if (isRanked)
                 {
-                    int myRating = match.ParticipantRatings.TryGetValue(login, out var mr) ? mr : 1500;
                     var opponentRatings = match.ParticipantLogins
                         .Where(p => !p.Equals(login, StringComparison.OrdinalIgnoreCase))
                         .Select(p => match.ParticipantRatings.TryGetValue(p, out var or) ? or : 1500)
                         .ToList();
-                    ratingDelta = Gameplay.PVPMatchmaking.EloDelta(myRating, opponentRatings, isWinner ? 1.0 : 0.0);
+                    ratingDelta = Gameplay.PVPMatchmaking.EloDelta(preMatchRating, opponentRatings, isWinner ? 1.0 : 0.0);
+                    newRating = System.Math.Max(0, System.Math.Min(3000, preMatchRating + ratingDelta));
                 }
                 try
                 {
-                    Database.CharacterRepository.UpdatePvpRecord(login, isWinner, ratingDelta);
-                    Debug.LogError($"[PVP-MATCH] {login}: {(isWinner ? "WIN" : "LOSS")}, rating  {ratingDelta:+#;-#;0}");
+                    // NOTE: dropped CharacterRepository.UpdatePvpRecord -- its raw cross-table UPDATE kept hitting
+                    // DB-lock "SQLite errors". We persist via the in-memory character (below) + the normal
+                    // SaveCharacter path (which writes pvp_wins/pvp_rating and is triggered by the reward's
+                    // SavePlayerInventory and the zone-change save), the same path the working win-count uses.
+                    Debug.LogError($"[PVP-MATCH] {login}: {(isWinner ? "WIN" : "LOSS")}, rating {preMatchRating}->{newRating} ({ratingDelta:+#;-#;0})");
                     var pConn = _connections.Values.FirstOrDefault(c =>
                         c.LoginName?.Equals(login, StringComparison.OrdinalIgnoreCase) == true);
-                    if (pConn != null && _zones.TryGetValue(pConn.CurrentZoneId, out var z) && IsPvpZone(z.name))
-                        ChangeZone(pConn, "pvp_start", "respawn"); // back to the Pwnston PvP hub, not townstone
+
+                    // Bump the IN-MEMORY character too. The player-spawn packet (hover/inspect) reads
+                    // SavedCharacter.pvpWins/pvpRating; UpdatePvpRecord only wrote the DB, so without this the new
+                    // win/rating wouldn't show until relog. Kept consistent with the DB (+1 win / +ratingDelta).
+                    var sc = pConn != null ? GetActiveCharacter(pConn) : null;
+                    if (sc != null)
+                    {
+                        if (isWinner) sc.pvpWins += 1;
+                        if (isRanked) sc.pvpRating = newRating;   // absolute, 1500-based
+                        // Persist immediately (the cached char gets invalidated/reloaded on the zone change back,
+                        // which would otherwise drop this in-memory bump). Simple by-id SET, no flaky JOIN.
+                        Database.CharacterRepository.SetPvpStats((long)sc.id, sc.pvpWins, sc.pvpRating);
+                    }
+                    // King's Coin reward (ranked only). Amounts confirmed via Ghidra (ServerClientUpdateWins
+                    // @0x60a2c0: bit-0 "won" -> "ten King's Coins", else -> "five"): winner=10, loser=5.
+                    // King's Coins are the "QuestItemPAL.Token" stacked item (what the Token Masters collect).
+                    // DEFERRED: granting here (still in the arena) gets wiped by the inventory reload on the zone
+                    // change back to pvp_start, so stash it and grant once the player is in the hub (match tick).
+                    if (isRanked)
+                    {
+                        _pendingKingsCoins[login] = isWinner ? 10 : 5;
+                        Debug.LogError($"[PVP-MATCH] {login} pending {(isWinner ? 10 : 5)} King's Coins (granted on return to pvp_start)");
+                    }
+                    // On a FORFEIT (opponent disconnected OR chose "exit PVP Zone" 0x2C) do NOT instant-teleport
+                    // the remaining winner. When the opponent's avatar despawns, PVPMatchController::OnUnitRemoved
+                    // @0x60b49d fires "X has left the match" + ServerClientUpdateWins -> the victory card
+                    // (Ghidra-confirmed), and the player exits via the card's leave button (0x2C -> HandleLeavePvp,
+                    // which has its own teleport). NOTE: a context-menu leaver stays CONNECTED, so we key on the
+                    // match's EndedByForfeit flag, not on whether the opponent is still connected. Only auto-
+                    // teleport on a clean (time-limit) end, which has no card-on-removal trigger.
+                    if (pConn != null && !match.EndedByForfeit && _zones.TryGetValue(pConn.CurrentZoneId, out var z) && IsPvpZone(z.name))
+                        ChangeZone(pConn, "pvp_start", "respawn"); // clean end: back to the Pwnston PvP hub
                 }
                 catch (Exception ex) { Debug.LogError($"[PVP-MATCH] Failed record for {login}: {ex.Message}"); }
             }
@@ -2331,6 +2664,16 @@ namespace DungeonRunners.Networking
                 return tutorialZone ?? _zones.Values.FirstOrDefault();
             }
 
+            // Logged out inside a PvP arena (DeathMatch instance)? That instance is match-only and is gone now,
+            // so respawning there strands the player outside the playable map. Send them to the Pwnston PvP hub
+            // graveyard (pvp_start / "respawn") instead.
+            if (IsPvpZone(savedZone.name) && TryFindZoneByName("pvp_start", out Zone pvpHub))
+            {
+                reason = "saved-pvp-arena-redirect:pvp_start";
+                conn.PendingSpawnPoint = "respawn"; // Pwnston graveyard spawn point
+                return pvpHub;
+            }
+
             if (IsPublicZone(savedZone.name))
             {
                 reason = "saved-public-zone";
@@ -2964,7 +3307,19 @@ namespace DungeonRunners.Networking
             writer.WriteUInt32(GetCharSqlId(playerConn));
             writer.WriteUInt32(remoteChar != null ? (uint)remoteChar.pvpWins : 0);
             writer.WriteUInt32(remoteChar != null ? (uint)remoteChar.pvpRating : 0);
-            writer.WriteByte(0x00);
+            // PVPTeam (writeType; Player::readInit stores it at unit+0xA4): the player's match team, so the
+            // client's PVPMatchController renders the Red/Blue team-join when this unit is added. Null (0x00)
+            // when not in a PvP match.
+            var remotePvpMatch = Gameplay.PVPMatchmaking.Instance.GetMatchForPlayer(playerConn.LoginName);
+            if (remotePvpMatch != null)
+            {
+                string remoteTeamPath = Gameplay.PVPMatchmaking.TeamGcPath(remotePvpMatch.Archetype, remotePvpMatch.IsRed(playerConn.LoginName));
+                writer.WriteByte(0xFF); writer.WriteCString(remoteTeamPath);
+            }
+            else
+            {
+                writer.WriteByte(0x00);
+            }
             writer.WriteCString(remoteChar?.posseName ?? "");
             writer.WriteUInt32(0x00);
 
@@ -3211,6 +3566,10 @@ namespace DungeonRunners.Networking
             _remoteBehaviorIds.Remove(leavingConn.LoginName);
             _remoteAvatarIds.Remove(leavingConn.LoginName);
             _remotePlayerIds.Remove(leavingConn.LoginName);
+            _pvpControllerReady.Remove(leavingConn.LoginName);
+            _pvpControllerIdByLogin.Remove(leavingConn.LoginName);
+            _pvpGateDropDue.Remove(leavingConn.LoginName);
+            _pvpCombatReminders.Remove(leavingConn.LoginName);
 
             var keysToRemove = new List<string>();
             foreach (var key in _remoteSessionIds.Keys)
@@ -3609,6 +3968,15 @@ namespace DungeonRunners.Networking
                     Debug.LogError($"[OP4]  Loaded character {savedChar.name} ({savedChar.className}) from JSON");
                 }
                 string spawnConnIdKey = conn.ConnId.ToString();
+
+                // PvP: create the match controller on this client BEFORE its avatars init, so the client's
+                // PVPMatchController exists (ZoneClient+0xa18) and Unit::processInited fires OnUnitAdded ->
+                // team-join + the Welcome/countdown banner. Gated to PvP arena entry while in a match.
+                {
+                    var pvpMatchForSpawn = Gameplay.PVPMatchmaking.Instance.GetMatchForPlayer(conn.LoginName);
+                    if (pvpMatchForSpawn != null && _zones.TryGetValue(conn.CurrentZoneId, out var pvpSpawnZone) && IsPvpZone(pvpSpawnZone.name))
+                        SendPVPMatchControllerSpawn(conn);
+                }
                 Debug.LogError($"[SPAWN] Initializing PlayerState with key='{spawnConnIdKey}' for conn.ConnId={conn.ConnId}");
                 PlayerState playerState = GetPlayerState(spawnConnIdKey);
 
@@ -4180,7 +4548,18 @@ namespace DungeonRunners.Networking
                 writer.WriteUInt32(_pvpWins);
                 writer.WriteUInt32(_pvpRating);
 
-                writer.WriteByte(0x00);
+                // PVPTeam (writeType; Player::readInit -> unit+0xA4): this player's OWN match team, so the
+                // local client's PVPMatchController fires OnUnitAdded for the local avatar too (self join line).
+                var selfPvpMatch = Gameplay.PVPMatchmaking.Instance.GetMatchForPlayer(conn.LoginName);
+                if (selfPvpMatch != null)
+                {
+                    string selfTeamPath = Gameplay.PVPMatchmaking.TeamGcPath(selfPvpMatch.Archetype, selfPvpMatch.IsRed(conn.LoginName));
+                    writer.WriteByte(0xFF); writer.WriteCString(selfTeamPath);
+                }
+                else
+                {
+                    writer.WriteByte(0x00);
+                }
 
                 string op3PosseName = savedChar.posseName ?? "";
                 writer.WriteCString(op3PosseName);
@@ -6104,6 +6483,19 @@ namespace DungeonRunners.Networking
                         if (!other.IsSpawned) continue;
                         if (other.CurrentZoneGcType != conn.CurrentZoneGcType) continue;
                         if (other.InstanceId != conn.InstanceId) continue;
+
+                        // In a PvP match, defer the avatar exchange until BOTH controllers are up. Otherwise the
+                        // first joiner's loop sends its avatar to the second joiner before the second joiner's
+                        // controller exists -> the avatar inits with no registered controller -> OnUnitAdded
+                        // never fires -> the second joiner never registers/sees the first. The later-spawning
+                        // client's loop runs after both controllers are spawned and does the full exchange.
+                        bool pvpMatch = Gameplay.PVPMatchmaking.Instance.GetMatchForPlayer(conn.LoginName) != null;
+                        if (pvpMatch && (!_pvpControllerReady.Contains(conn.LoginName)
+                                         || !_pvpControllerReady.Contains(other.LoginName)))
+                        {
+                            Debug.LogError($"[MULTIPLAYER] deferring {conn.LoginName}<->{other.LoginName} avatar exchange (controllers not both ready yet)");
+                            continue;
+                        }
 
                         uint otherAvatarId = GetPlayerAvatarId(other.LoginName);
                         // Skip if conn already holds other's avatar (a redundant re-spawn, e.g. the PvP

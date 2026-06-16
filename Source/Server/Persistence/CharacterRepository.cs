@@ -897,6 +897,26 @@ namespace DungeonRunners.Database
             return checkpoints;
         }
 
+        // Persist absolute PvP wins/rating by character id. Simple single-table UPDATE by primary key -- avoids
+        // the cross-table JOIN/subquery + increment that UpdatePvpRecord used (which kept throwing DB-lock
+        // "SQLite errors"). Caller passes the already-computed in-memory values.
+        public static void SetPvpStats(long characterId, int wins, int rating)
+        {
+            try
+            {
+                using (var connection = GameDatabase.GetConnection())
+                {
+                    GameDatabase.ExecuteNonQuery(connection,
+                        "UPDATE characters SET pvp_wins = @w, pvp_rating = @r WHERE id = @id",
+                        ("@w", wins), ("@r", rating), ("@id", characterId));
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError($"[CharacterRepository.SetPvpStats] char {characterId}: {ex.Message}");
+            }
+        }
+
         public static void UpdatePvpRecord(string accountName, bool isWin, int ratingDelta)
         {
             try

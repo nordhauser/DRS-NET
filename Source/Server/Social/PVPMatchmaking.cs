@@ -71,6 +71,17 @@ namespace DungeonRunners.Gameplay
             return null;
         }
 
+        // The PVPTeam gc path for a participant's side. Written as a writeType in the player entity init
+        // (Player::readInit reads it into unit+0xA4); the client's PVPMatchController then renders the
+        // team-join when the unit is added. GroupDuelMatch uses pvp.DuelTeamList; others use the default
+        // Red/Blue list; Practice is FFA (single team). Paths verified present in the client gc registry.
+        public static string TeamGcPath(Archetype a, bool isRed)
+        {
+            if (a == Archetype.GroupPracticeMatch) return "pvp.FFATeam";
+            string list = a == Archetype.GroupDuelMatch ? "pvp.DuelTeamList" : "pvp.DefaultTeamList";
+            return list + (isRed ? ".RedTeam" : ".BlueTeam");
+        }
+
         // Authored match rules, transcribed verbatim from the original gc data
         // (Database/gc/{GroupDeathMatch,GroupDeathMatchUnrated,GroupDuelMatch,GroupPracticeMatch}.gc).
         // Times in seconds; Zones = candidate arena instances (one picked per match).
@@ -211,11 +222,30 @@ namespace DungeonRunners.Gameplay
             public int CombatTimeSec;
             public int SetupTimeSec;
 
-            public bool IsExpired => StartedAt.HasValue && CombatTimeSec > 0
-                && (DateTime.UtcNow - StartedAt.Value).TotalSeconds > CombatTimeSec;
+            // Match phase (the server-side mirror of PVPMatchController's FSM 0x15 setup -> 0x17 combat ->
+            // 0x16 end). On spawn -> Setup (SetupTime countdown, gates closed). After SetupTime -> Combat
+            // (gates drop, battle begins). After CombatTime (from CombatStartedAt) -> Ended.
+            public enum MatchPhase { Setup, Combat, Ended }
+            public MatchPhase Phase = MatchPhase.Setup;
+            public DateTime? CombatStartedAt;
 
-            public bool SpawnTimedOut => !StartedAt.HasValue && SetupTimeSec > 0
-                && (DateTime.UtcNow - CreatedAt).TotalSeconds > SetupTimeSec;
+            // True when the match ended because a player left (disconnect OR "exit PVP Zone" 0x2C) rather than a
+            // clean time-limit end. On a forfeit the remaining winner gets the victory card via OnUnitRemoved and
+            // exits via the card's leave button, so FinalizeMatchResults must NOT auto-teleport them.
+            public bool EndedByForfeit;
+
+            // Setup window elapsed -> begin combat (drop gates). Phase guard makes it fire once.
+            public bool SetupElapsed => Phase == MatchPhase.Setup && StartedAt.HasValue
+                && (DateTime.UtcNow - StartedAt.Value).TotalSeconds >= Math.Max(0, SetupTimeSec);
+
+            // Combat duration elapsed -> end. Timed from CombatStartedAt so setup isn't counted against it.
+            public bool IsExpired => Phase == MatchPhase.Combat && CombatStartedAt.HasValue && CombatTimeSec > 0
+                && (DateTime.UtcNow - CombatStartedAt.Value).TotalSeconds > CombatTimeSec;
+
+            // StartedAt is now set at client-ready (not spawn), so allow a generous client-load window before
+            // giving up on a match whose clients never finished loading.
+            public bool SpawnTimedOut => !StartedAt.HasValue
+                && (DateTime.UtcNow - CreatedAt).TotalSeconds > 90;
         }
 
         private readonly Dictionary<string, QueueEntry> _queue =
@@ -371,8 +401,26 @@ namespace DungeonRunners.Gameplay
             {
                 if (_activeMatches.TryGetValue(matchId, out var m) && !m.StartedAt.HasValue)
                 {
+                    m.Phase = Match.MatchPhase.Setup;
+                    // NOTE: StartedAt (the SETUP countdown clock) is intentionally NOT set here. It's set by
+                    // BeginSetupPhase once BOTH clients have their controller, so the server's 15s timer aligns
+                    // with the clients' on-screen countdown (which only starts when the controller spawns, ~10s
+                    // after this point while the client loads the arena). Starting it here desyncs by that load.
+                    Debug.LogError($"[PVP-MATCH] Match {matchId} SPAWNED ({m.ParticipantLogins.Count} players) - awaiting both clients ready");
+                }
+            }
+        }
+
+        // Start the SETUP countdown clock. Called once both clients have spawned their PVPMatchController, so the
+        // server's setup/combat timers line up with the clients' on-screen countdown. Idempotent.
+        public void BeginSetupPhase(string matchId)
+        {
+            lock (_lock)
+            {
+                if (_activeMatches.TryGetValue(matchId, out var m) && !m.StartedAt.HasValue)
+                {
                     m.StartedAt = DateTime.UtcNow;
-                    Debug.LogError($"[PVP-MATCH] Match {matchId} STARTED with {m.ParticipantLogins.Count} players");
+                    Debug.LogError($"[PVP-MATCH] Match {matchId} SETUP countdown started ({m.SetupTimeSec}s) - both clients ready");
                 }
             }
         }
@@ -432,9 +480,10 @@ namespace DungeonRunners.Gameplay
             }
         }
 
-        public (List<Match> newMatches, List<Match> endedMatches) Tick()
+        public (List<Match> newMatches, List<Match> endedMatches, List<Match> enteringCombat) Tick()
         {
             var ended = new List<Match>();
+            var enteringCombat = new List<Match>();
             lock (_lock)
             {
                 foreach (var kv in _activeMatches.ToList())
@@ -442,26 +491,35 @@ namespace DungeonRunners.Gameplay
                     var m = kv.Value;
                     if (m.SpawnTimedOut)
                     {
+                        m.Phase = Match.MatchPhase.Ended;
                         ended.Add(m);
                         _activeMatches.Remove(kv.Key);
                         foreach (var login in m.ParticipantLogins) _playerToMatch.Remove(login);
                         Debug.LogError($"[PVP-MATCH] Match {kv.Key} EXPIRED (spawn timeout)");
                     }
+                    else if (m.SetupElapsed)
+                    {
+                        m.Phase = Match.MatchPhase.Combat;
+                        m.CombatStartedAt = DateTime.UtcNow;
+                        enteringCombat.Add(m);
+                        Debug.LogError($"[PVP-MATCH] Match {kv.Key} SETUP->COMBAT (battle begins, combat {m.CombatTimeSec}s)");
+                    }
                     else if (m.IsExpired)
                     {
+                        m.Phase = Match.MatchPhase.Ended;
                         m.EndedAt = DateTime.UtcNow;
                         if (m.WinnerLogin == null && m.KillCounts.Count > 0)
                             m.WinnerLogin = m.KillCounts.OrderByDescending(x => x.Value).First().Key;
                         ended.Add(m);
                         _activeMatches.Remove(kv.Key);
                         foreach (var login in m.ParticipantLogins) _playerToMatch.Remove(login);
-                        Debug.LogError($"[PVP-MATCH] Match {kv.Key} EXPIRED (time limit)");
+                        Debug.LogError($"[PVP-MATCH] Match {kv.Key} EXPIRED (combat time limit)");
                     }
                 }
             }
 
             var newMatches = RunMatchmaking();
-            return (newMatches, ended);
+            return (newMatches, ended, enteringCombat);
         }
 
         public Match HandleDisconnect(string loginName)
@@ -477,7 +535,8 @@ namespace DungeonRunners.Gameplay
                     {
                         match.WinnerLogin = match.ParticipantLogins
                             .FirstOrDefault(p => !p.Equals(loginName, StringComparison.OrdinalIgnoreCase));
-                        return EndMatch(matchId, $"{loginName} disconnected");
+                        match.EndedByForfeit = true;
+                        return EndMatch(matchId, $"{loginName} forfeited (disconnect/leave)");
                     }
                     else
                     {
@@ -486,6 +545,7 @@ namespace DungeonRunners.Gameplay
                         if (match.ParticipantLogins.Count <= 1)
                         {
                             match.WinnerLogin = match.ParticipantLogins.FirstOrDefault();
+                            match.EndedByForfeit = true;
                             return EndMatch(matchId, "all but one player left");
                         }
                     }

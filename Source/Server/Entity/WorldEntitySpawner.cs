@@ -199,6 +199,59 @@ namespace DungeonRunners.Gameplay
             _spawnedEntities.Clear();
         }
 
+        // Add an entity to a zone's spawn list in-memory (not from the DB). Used to seed entities the
+        // ingested zone_world_entities table is missing.
+        public void SeedZoneEntity(WorldEntityData data)
+        {
+            if (data == null || string.IsNullOrEmpty(data.Zone)) return;
+            string key = data.Zone.ToLower();
+            if (!_entitiesByZone.ContainsKey(key))
+                _entitiesByZone[key] = new List<WorldEntityData>();
+            _entitiesByZone[key].Add(data);
+        }
+
+        // Seed the PvP arena laser-wall gates (red/blue) into each DeathMatch zone. The arena .world files
+        // were never ingested into zone_world_entities, so without this the arenas have no barriers ("gates
+        // open the whole time"). Positions are the authored <zone>.world placements (666 game.pki dump).
+        // EntityType="gate" => WriteEntitySpawn emits the closed-door form at zone entry; they are dropped at
+        // battle-start (SETUP->COMBAT) via the BossGate 0x03 [id] 0x0A 0x00 packet.
+        public void SeedPvpArenaGates()
+        {
+            void Gate(string zone, string side, float x, float y, float z, float heading)
+            {
+                SeedZoneEntity(new WorldEntityData
+                {
+                    Zone = zone,
+                    Name = "pvp_" + side + "_gate",
+                    GCType = "world.pvp.data.pvp_" + side + "_gate",
+                    EntityType = "gate",
+                    Label = "pvp_" + side + "_gate",
+                    PosX = x, PosY = y, PosZ = z, Heading = heading,
+                    // Flags: GATE-DUMP showed the SOLID/blocking dungeon BossGate=7 vs the passable town PvPGate=6
+                    // (bit 0 = solid/closed). Flags=6 renders the barrier but lets players walk through; Flags=7
+                    // renders AND makes it solid so it actually holds players in their start area during setup.
+                    // Dropped at battle-start via BossGate 0x03 0x0A 0x00.
+                    Flags = 7,
+                    AllowMultiple = true
+                });
+            }
+            Gate("DeathMatch01", "blue", -380, 160, 10, 0);
+            Gate("DeathMatch01", "red", 340, 160, 10, 0);
+            Gate("DeathMatch02", "blue", -300, 140, 10, 0);
+            Gate("DeathMatch02", "red", 300, 135, 10, 0);
+            Gate("DeathMatch03", "blue", -260, 250, 10, 0);
+            Gate("DeathMatch03", "blue", -260, 70, 10, 0);
+            Gate("DeathMatch03", "red", 260, 70, 10, 0);
+            Gate("DeathMatch03", "red", 260, 250, 10, 0);
+            Gate("DeathMatch04", "blue", 264, -185, 41, 90);
+            Gate("DeathMatch04", "red", -140, 246, 41, 90);
+
+            int total = 0;
+            foreach (var z in new[] { "deathmatch01", "deathmatch02", "deathmatch03", "deathmatch04" })
+                if (_entitiesByZone.TryGetValue(z, out var l)) total += l.Count(e => e.IsGate);
+            Debug.LogError($"[PVP-GATES] seeded {total} arena gate entities across DeathMatch01-04 (Flags=6)");
+        }
+
 
         private static void WriteGCType(LEWriter writer, string typeName)
         {

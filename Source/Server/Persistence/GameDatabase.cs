@@ -41,6 +41,12 @@ namespace DungeonRunners.Database
                 command.ExecuteNonQuery();
                 command.CommandText = "PRAGMA synchronous=NORMAL";
                 command.ExecuteNonQuery();
+                // Without a busy timeout, two connections writing at the same instant (e.g. the PvP match-end
+                // doing UpdatePvpRecord + the inventory save for the King's Coin reward) fail immediately with
+                // "database is locked" -> rating/wins silently don't persist and the reward item can fail to
+                // save. Wait for the lock instead of erroring.
+                command.CommandText = "PRAGMA busy_timeout=5000";
+                command.ExecuteNonQuery();
             }
             return connection;
         }
@@ -160,6 +166,10 @@ namespace DungeonRunners.Database
                 try { ExecuteNonQuery(connection, "ALTER TABLE characters ADD COLUMN respec_count INTEGER DEFAULT 0"); Debug.LogError("[DB-MIGRATE] Added respec_count"); } catch { Debug.LogError("[DB-MIGRATE] respec_count already exists"); }
                 try { ExecuteNonQuery(connection, "ALTER TABLE characters ADD COLUMN pvp_wins INTEGER DEFAULT 0"); Debug.LogError("[DB-MIGRATE] Added pvp_wins"); } catch { Debug.LogError("[DB-MIGRATE] pvp_wins already exists"); }
                 try { ExecuteNonQuery(connection, "ALTER TABLE characters ADD COLUMN pvp_rating INTEGER DEFAULT 0"); Debug.LogError("[DB-MIGRATE] Added pvp_rating"); } catch { Debug.LogError("[DB-MIGRATE] pvp_rating already exists"); }
+                // Normalize bogus PvP ratings to the 1500 Elo base. Early logic climbed from 0 (and 0 = unrated),
+                // leaving tiny values like 16. A real 1500-based rating won't sit below 1000 without ~16 net
+                // losses, so resetting sub-1000 ratings to 1500 is safe and gives everyone a clean baseline.
+                try { ExecuteNonQuery(connection, "UPDATE characters SET pvp_rating = 1500 WHERE pvp_rating < 1000"); Debug.LogError("[DB-MIGRATE] Normalized sub-1000 pvp_rating to 1500"); } catch { }
 
                 try { ExecuteNonQuery(connection, "ALTER TABLE accounts ADD COLUMN current_character_id INTEGER DEFAULT 0"); Debug.LogError("[DB-MIGRATE] Added current_character_id"); } catch { }
                 try { ExecuteNonQuery(connection, "UPDATE accounts SET current_character_id = 0"); } catch { }

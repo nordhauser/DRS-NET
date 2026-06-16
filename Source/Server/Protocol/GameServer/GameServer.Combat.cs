@@ -3675,8 +3675,12 @@ namespace DungeonRunners.Networking
                                 WritePlayerEntitySynch(conn, ackMessage);
                                 conn.MessageQueue.Enqueue(ackMessage.ToArray());
 
-                                SendSystemMessage(conn, "The gate is sealed. Defeat the boss to open it.");
-                                Debug.LogError($"[WORLD-ENTITY] gate state=closed reason=boss-alive label={weData.Label}");
+                                bool isPvpGate = weData.GCType != null &&
+                                    weData.GCType.IndexOf("pvp", StringComparison.OrdinalIgnoreCase) >= 0;
+                                SendSystemMessage(conn, isPvpGate
+                                    ? "This gate will open once the PVP match begins."
+                                    : "The gate is sealed. Defeat the boss to open it.");
+                                Debug.LogError($"[WORLD-ENTITY] gate state=closed reason={(isPvpGate ? "pvp-setup" : "boss-alive")} label={weData.Label}");
                             }
                             else
                             {

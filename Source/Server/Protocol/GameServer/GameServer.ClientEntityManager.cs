@@ -1215,6 +1215,7 @@ namespace DungeonRunners.Networking
             DungeonMazeSpawner.RunStartupManifestCheck();
             GCObjectGeneratorTable.Instance.Initialize();
             WorldEntitySpawner.Instance.Initialize();
+            WorldEntitySpawner.Instance.SeedPvpArenaGates();
 
             Debug.LogError("[SERVER] Loading class configuration...");
             Debug.LogError("[SERVER] Loading class configuration...");
