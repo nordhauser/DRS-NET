@@ -219,9 +219,13 @@ namespace DungeonRunners.Gameplay
         {
             void Gate(string zone, string side, float x, float y, float z, float heading)
             {
+                // The unrated arenas (DeathMatchUnratedNN, entered at Pwnston Commander) are byte-for-byte
+                // identical maps to their rated twins (verified against the .world dumps), so the gates sit
+                // at the same positions -- seed both. Without this the unrated zones get no setup barriers.
+                foreach (var z2 in new[] { zone, zone.Replace("DeathMatch", "DeathMatchUnrated") })
                 SeedZoneEntity(new WorldEntityData
                 {
-                    Zone = zone,
+                    Zone = z2,
                     Name = "pvp_" + side + "_gate",
                     GCType = "world.pvp.data.pvp_" + side + "_gate",
                     EntityType = "gate",
@@ -247,9 +251,10 @@ namespace DungeonRunners.Gameplay
             Gate("DeathMatch04", "red", -140, 246, 41, 90);
 
             int total = 0;
-            foreach (var z in new[] { "deathmatch01", "deathmatch02", "deathmatch03", "deathmatch04" })
+            foreach (var z in new[] { "deathmatch01", "deathmatch02", "deathmatch03", "deathmatch04",
+                                      "deathmatchunrated01", "deathmatchunrated02", "deathmatchunrated03", "deathmatchunrated04" })
                 if (_entitiesByZone.TryGetValue(z, out var l)) total += l.Count(e => e.IsGate);
-            Debug.LogError($"[PVP-GATES] seeded {total} arena gate entities across DeathMatch01-04 (Flags=6)");
+            Debug.LogError($"[PVP-GATES] seeded {total} arena gate entities across rated + unrated DeathMatch zones (Flags=7)");
         }
 
 

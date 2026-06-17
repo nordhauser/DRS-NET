@@ -662,6 +662,25 @@ namespace DungeonRunners.Networking
         {
             if (questData == null) return;
 
+            // Town King's-Coin trades (Wishing Well + Token Masters) are ROLL-ONLY: they deliver
+            // their own rarity-correct reward (ground drop / gold roll) and must NOT also pay the
+            // generic quest gold/XP. Handle + return before the standard reward logic.
+            // See GameServer.TownContent.cs.
+            if (!string.IsNullOrEmpty(questData.rewardItemGenerator))
+            {
+                string townGen = questData.rewardItemGenerator;
+                if (townGen.Equals("TokenMaster", StringComparison.OrdinalIgnoreCase))
+                {
+                    ApplyTokenMasterReward(conn, questData);
+                    return;
+                }
+                if (townGen.IndexOf("WishingWell", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    ApplyWishingWellReward(conn, questData);
+                    return;
+                }
+            }
+
             float questGoldPerLevel = GCDatabase.Instance.GetKnob("QuestGoldPerLevel", 250f);
             float questXPPerLevel = GCDatabase.Instance.GetKnob("QuestExperiencePerLevel", 100f);
             float memberGoldMod = GCDatabase.Instance.GetKnob("MemberGoldMod", 1.15f);

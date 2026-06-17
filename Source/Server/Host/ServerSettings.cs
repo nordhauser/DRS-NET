@@ -30,7 +30,8 @@ namespace DungeonRunners.Core
             "motd",
             "motdColor",
             "announceColor",
-            "announceEffect"
+            "announceEffect",
+            "relayPlayerSwings"
         };
 
         public static bool IsRuntimeMutableKey(string key)

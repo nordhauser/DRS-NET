@@ -51,6 +51,9 @@ namespace DungeonRunners.Networking
         private const uint MSG_DEST = 0x000F01;
         private const uint MSG_SOURCE = 0x000F01;
         private static bool VerbosePacketLogging => ServerSettings.GetBool("verbosePacketLogging", false);
+        // Relay a player's actions (weapon swings) to nearby peers so they see the attack animation.
+        // Temporary validation toggle (default on); fold into the always-on relay once confirmed in-game.
+        private static bool RelayPlayerSwings => ServerSettings.GetBool("relayPlayerSwings", true);
         private bool _allowFlush = false;
         private UdpClient _udpListener;
         private bool _isRunning;

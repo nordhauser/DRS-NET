@@ -334,7 +334,15 @@ namespace DungeonRunners.Networking
             }
         }
 
-        public uint MaxHPWire => ClampWire((long)_baseHPWire + _allocatedHPBonusWire + _equipmentHPBonusWire + _modifierHPBonusWire + _passiveHPBonusWire);
+        // PvP "Pumped" remap (pvp.Modifiers.Pumped / PVPBalanceModifier): when in a PvP arena the player's
+        // max HP is remapped to a flat, level-independent value so the server matches the client's locally
+        // applied EntryModifier. 0 = not in a PvP arena (normal stat-based max HP). See PvpBalance.
+        private uint _pvpRemapMaxHpWire = 0;
+        public void SetPvpRemap(uint maxHpWire) => _pvpRemapMaxHpWire = maxHpWire;
+        public uint PvpRemapMaxHpWire => _pvpRemapMaxHpWire;
+
+        public uint MaxHPWire => _pvpRemapMaxHpWire > 0 ? _pvpRemapMaxHpWire
+            : ClampWire((long)_baseHPWire + _allocatedHPBonusWire + _equipmentHPBonusWire + _modifierHPBonusWire + _passiveHPBonusWire);
         public uint CurrentHPWire => _currentHPWire;
         public uint MaxManaWire => ClampWire((long)_baseManaWire + _equipmentManaBonusWire + _passiveManaBonusWire);
         public uint CurrentManaWire => _currentManaWire;

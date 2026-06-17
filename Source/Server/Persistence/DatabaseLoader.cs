@@ -302,8 +302,16 @@ public static class DatabaseLoader
         };
         foreach (var a in arenas)
         {
-            AddWaypointIfAbsent(a.zone, "red_team_start",  a.rx, a.ry, a.rz, a.rh);
-            AddWaypointIfAbsent(a.zone, "blue_team_start", a.bx, a.by, a.bz, a.bh);
+            // The unrated arenas (DeathMatchUnratedNN, entered at Pwnston Commander) are byte-for-byte
+            // identical maps to their rated twins (verified against the 666 game.pki dump .world files),
+            // so their team spawns are at the same coordinates -- seed both. Without this the unrated
+            // zones have no red_team_start/blue_team_start waypoints and players land at the zone default,
+            // outside the arena.
+            foreach (var zone in new[] { a.zone, a.zone.Replace("DeathMatch", "DeathMatchUnrated") })
+            {
+                AddWaypointIfAbsent(zone, "red_team_start",  a.rx, a.ry, a.rz, a.rh);
+                AddWaypointIfAbsent(zone, "blue_team_start", a.bx, a.by, a.bz, a.bh);
+            }
         }
     }
 

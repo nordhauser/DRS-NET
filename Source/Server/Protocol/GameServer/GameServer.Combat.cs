@@ -1250,11 +1250,37 @@ namespace DungeonRunners.Networking
             return (int)value;
         }
 
-        private void RecalculateHotbarPassiveBonuses(RRConnection conn, SavedCharacter savedChar, bool sendModifiers = true)
+        private void RecalculateHotbarPassiveBonuses(RRConnection conn, SavedCharacter savedChar, bool sendModifiers = true, bool keepPvpPassive = false)
         {
             if (conn == null) return;
 
+            // PvP HP sync (x32dbg-confirmed 2026-06-17): the native client does NOT self-apply the "Pumped"
+            // level/HP remap on arena entry — the avatar stays its real level with NORMAL no-passive base HP
+            // (read live: level=1, HP=68096/266). The Pumped remap is server-authoritative and would have to be
+            // REPLICATED to the client (a modifier-add we don't send yet); imposing it server-side alone just
+            // mismatches. The only thing the client omits vs our server is the PASSIVE HP penalty, so report
+            // the player's no-passive base HP (== MaxHPWireWithoutPassives == exactly what the client computes)
+            // -> EntitySynchInfo::Validate passes. Equip/levelup callers pass keepPvpPassive:true (no mid-match
+            // heal). The full Pumped remap (see PvpBalance) is a later feature once we replicate the modifier.
+            if (!keepPvpPassive && IsPvpZone(conn.CurrentZoneName))
+            {
+                PlayerState pvpState = GetPlayerState(conn.ConnId.ToString());
+                if (pvpState != null)
+                {
+                    uint baseHpWire = pvpState.MaxHPWireWithoutPassives;
+                    pvpState.SetPvpRemap(baseHpWire);
+                    pvpState.RestoreToFull();
+                    Debug.LogError($"[PVP-BALANCE] {conn.LoginName}: no-passive base maxHP={pvpState.MaxHPWire} (display={pvpState.MaxHPWire / 256}) zone={conn.CurrentZoneName}");
+                }
+                return;
+            }
+
             PlayerState playerState = GetPlayerState(conn.ConnId.ToString());
+            // Drop the PvP remap ONLY when actually outside a PvP arena. A keepPvpPassive recompute (equip/
+            // levelup) while still IN the arena falls through to here too — clearing the remap there let the
+            // passive HP penalty come back (68096 -> 51968) and re-broke Validate. Keep it sticky in-arena.
+            if (playerState != null && playerState.PvpRemapMaxHpWire > 0 && !IsPvpZone(conn.CurrentZoneName))
+                playerState.SetPvpRemap(0);
             if (playerState != null)
                 playerState.AdvanceEntitySynchInfoHP(Time.time, "passive-recompute-pre");
             PlayerHPPreserve hpPreserve = CapturePlayerHPPreserve(conn, playerState, savedChar, "passive", false);
@@ -3435,6 +3461,8 @@ namespace DungeonRunners.Networking
                             QuestManager.Instance.HandleAcceptConfirmed(conn, npcEntityId, questHash);
                             if (DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var acceptedQuest1) && !string.IsNullOrEmpty(acceptedQuest1.onAcceptItem))
                                 GiveOnAcceptItem(conn, acceptedQuest1.onAcceptItem);
+                            // Wishing Well / Token Master: accepting the quest IS the whole interaction.
+                            TryAutoCompleteWellTokenQuest(conn, questHash);
                         }
                     }
                 }
@@ -3454,6 +3482,8 @@ namespace DungeonRunners.Networking
                             QuestManager.Instance.HandleAcceptConfirmed(conn, npcEntityId, questHash);
                             if (DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var acceptedQuest2) && !string.IsNullOrEmpty(acceptedQuest2.onAcceptItem))
                                 GiveOnAcceptItem(conn, acceptedQuest2.onAcceptItem);
+                            // Wishing Well / Token Master: accepting the quest IS the whole interaction.
+                            TryAutoCompleteWellTokenQuest(conn, questHash);
                         }
                         else
                         {
@@ -3528,6 +3558,8 @@ namespace DungeonRunners.Networking
                             QuestManager.Instance.HandleAcceptConfirmed(conn, npcEntityId, questHash);
                             if (DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var acceptedQuest3) && !string.IsNullOrEmpty(acceptedQuest3.onAcceptItem))
                                 GiveOnAcceptItem(conn, acceptedQuest3.onAcceptItem);
+                            // Wishing Well / Token Master: accepting the quest IS the whole interaction.
+                            TryAutoCompleteWellTokenQuest(conn, questHash);
                             SavePlayerQuests(conn);
                         }
                         else if (conn.PendingTurnInInstanceId != 0)
@@ -3588,6 +3620,18 @@ namespace DungeonRunners.Networking
                         conn.MessageQueue.Enqueue(msg52.ToArray());
                         Debug.LogError("[SPELL-0x52] action=enqueue target=actionResponse queue=MessageQueue");
 
+                        // Relay the self-cast (buff/heal) to nearby peers so they see the cast animation.
+                        // 0x52 is a registered Action class; same wire format as the caster's confirmation,
+                        // self-targeted (no target id), re-addressed per-peer to the caster's ReplicaBehaviorId.
+                        if (RelayPlayerSwings && componentId < 50000)
+                        {
+                            var selfCastPayload = new LEWriter();
+                            selfCastPayload.WriteByte(responseId);
+                            selfCastPayload.WriteByte(0x52);
+                            selfCastPayload.WriteByte(spellSessionID);
+                            selfCastPayload.WriteByte(slotID);
+                            RelayComponentUpdateToPeers(conn, 0x01, selfCastPayload.ToArray(), "MP-SELFCAST");
+                        }
 
                         if (componentId < 50000)
                         {
@@ -4026,6 +4070,21 @@ namespace DungeonRunners.Networking
                         }
                         ClearZoneSpawnInvulnerability(conn, $"ACTION-0x{actionType:X2}");
                         conn.MessageQueue.Enqueue(positionActionResponseMessage.ToArray());
+                        // Relay the attack-at-position swing/cast to nearby peers so they see the animation.
+                        // Same wire format as the attacker's confirmation above; position is world-space so it
+                        // is valid for every viewer, re-addressed per-peer to the attacker's ReplicaBehaviorId.
+                        if (RelayPlayerSwings && componentId < 50000)
+                        {
+                            var swingPayload = new LEWriter();
+                            swingPayload.WriteByte(responseId);
+                            swingPayload.WriteByte(0x51);
+                            swingPayload.WriteByte(manipulatorId);
+                            swingPayload.WriteByte(actionID);
+                            swingPayload.WriteUInt32((uint)posX);
+                            swingPayload.WriteUInt32((uint)posY);
+                            swingPayload.WriteUInt32((uint)posZ);
+                            RelayComponentUpdateToPeers(conn, 0x01, swingPayload.ToArray(), "MP-SWING-POS");
+                        }
                         StartActiveSkillBusy(conn, componentId, actionID, resolvedSpell, state);
                         Debug.LogError("[SPELL-0x51] action=enqueue target=actionResponse queue=MessageQueue");
 
@@ -4149,7 +4208,7 @@ namespace DungeonRunners.Networking
                             lock (conn.SendLock)
                             {
                                 if (IsPassiveSkill(removedSkill))
-                                    RecalculateHotbarPassiveBonuses(conn, savedChar);
+                                    RecalculateHotbarPassiveBonuses(conn, savedChar, keepPvpPassive: true);
                                 WritePlayerEntitySynch(conn, hotbarRemoveMessage);
                                 hotbarRemoveMessage.WriteByte(0x06);
                                 SendCompressedE(conn, hotbarRemoveMessage.ToArray());
@@ -4158,7 +4217,7 @@ namespace DungeonRunners.Networking
                         }
                         else if (IsPassiveSkill(removedSkill))
                         {
-                            RecalculateHotbarPassiveBonuses(conn, savedChar);
+                            RecalculateHotbarPassiveBonuses(conn, savedChar, keepPvpPassive: true);
                         }
                     }
                     else if (subMessage == 0x35 && reader.Remaining >= 9)
@@ -4252,7 +4311,7 @@ namespace DungeonRunners.Networking
                                 lock (conn.SendLock)
                                 {
                                     if (skillIsPassive || IsPassiveSkill(displacedSkill))
-                                        RecalculateHotbarPassiveBonuses(conn, savedChar);
+                                        RecalculateHotbarPassiveBonuses(conn, savedChar, keepPvpPassive: true);
                                     WritePlayerEntitySynch(conn, hotbarAddMessage);
                                     hotbarAddMessage.WriteByte(0x06);
                                     SendCompressedE(conn, hotbarAddMessage.ToArray());
@@ -4261,7 +4320,7 @@ namespace DungeonRunners.Networking
                             }
                             else if (IsPassiveSkill(skillGcClass) || IsPassiveSkill(displacedSkill))
                             {
-                                RecalculateHotbarPassiveBonuses(conn, savedChar);
+                                RecalculateHotbarPassiveBonuses(conn, savedChar, keepPvpPassive: true);
                             }
                         }
                         else
@@ -5143,6 +5202,20 @@ namespace DungeonRunners.Networking
                 return;
             }
             conn.MessageQueue.Enqueue(attackResponseMessage.ToArray());
+            // Relay the swing to nearby peers so they see the attack animation. Same wire format as the
+            // attacker's confirmation above (actionType 0x50 = the action classId createAction() expects),
+            // re-addressed per-peer to the attacker's ReplicaBehaviorId. targetId is the monster's shared
+            // entity id, valid in every viewer's instance, so no per-peer remap is needed here.
+            if (RelayPlayerSwings && componentId < 50000)
+            {
+                var swingPayload = new LEWriter();
+                swingPayload.WriteByte(responseId);
+                swingPayload.WriteByte(0x50);
+                swingPayload.WriteByte(manipulatorId);
+                swingPayload.WriteByte(useFlags);
+                swingPayload.WriteUInt16(targetId);
+                RelayComponentUpdateToPeers(conn, 0x01, swingPayload.ToArray(), "MP-SWING");
+            }
             if (!zoneInvulnerabilityBlocking && conn?.Avatar != null && monster.IsAlive)
                 Combat.CombatRuntime.Instance.SetPlayerActiveClientAttack((uint)conn.Avatar.Id, true, monster.EntityId);
             if (!string.IsNullOrEmpty(responseKey))

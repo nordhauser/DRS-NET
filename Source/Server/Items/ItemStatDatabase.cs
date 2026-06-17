@@ -214,6 +214,17 @@ namespace DungeonRunners.Data
                 LoadWireMods(conn);
                 LoadGCDictionary();
 
+                // Keep the MG generator cache alive at runtime so GetWrapperIGWireMods can
+                // synthesize the class+rarity mod chain for items NOT explicitly in the wire-mods
+                // table (named-Unique armor, gap-coverage weapons → otherwise render 1 mod). When
+                // the DB is already populated, PopulateFromGCFiles (which parses MG files) is
+                // skipped, so parse them here.
+                if (_modGenerators.Count == 0)
+                {
+                    ParseAllMGFiles();
+                    Debug.LogError($"[ITEM-STAT-DB] boot-time MG cache: {_modGenerators.Count} generators ready for synthesis fallback");
+                }
+
                 IsLoaded = true;
 
                 Debug.LogError($"[ITEM-STAT-DB] loaded pools={_pools.Count} items={_itemMods.Count} mods={_itemMods.Values.Sum(v => v.Count)} wireItems={_itemWireMods.Count} gcClassNames={_gcClassNames.Count}");
@@ -380,7 +391,7 @@ namespace DungeonRunners.Data
             _directItemIGEntries.Clear();
             _directItemIGCountByRarity.Clear();
             _wrapperIGEntries.Clear();
-            _modGenerators.Clear();
+            // _modGenerators retained at runtime for the GetWrapperIGWireMods synthesis fallback.
             _modGeneratorParents.Clear();
         }
 
@@ -1162,7 +1173,72 @@ namespace DungeonRunners.Data
             string key = string.IsNullOrEmpty(authoredRarity) ? "" : $"{normalized}:{authoredRarity}";
             if (_itemWireMods.TryGetValue(key, out var list))
                 return new List<(int, string)>(list);
-            return new List<(int, string)>();
+
+            // Synthetic class+rarity fallback for items not in the wire-mods table — pulls the same
+            // 4-generator chain (pre/binder/rare/superior) the wrapper IGs use. Deterministic per
+            // (class, rarity) so items stay stable across relog/zone. Ported from the Unity build.
+            return SynthesizeClassRarityMods(normalized, rarity);
+        }
+
+        // Maps an item's PAL name to its armor/weapon class for MG-pool lookup.
+        private static string ClassFromGCClass(string normalizedLower)
+        {
+            if (normalizedLower.Contains("plate") || normalizedLower.Contains("scale") || normalizedLower.Contains("crystal"))
+                return "Fighter";
+            if (normalizedLower.Contains("chain") || normalizedLower.Contains("splint"))
+                return "Fighter"; // Fighter heavy armor families
+            if (normalizedLower.Contains("leather"))
+                return "Ranger";
+            if (normalizedLower.Contains("mage") && (normalizedLower.Contains("body") || normalizedLower.Contains("helm")
+                || normalizedLower.Contains("boots") || normalizedLower.Contains("gloves")
+                || normalizedLower.Contains("shoulder") || normalizedLower.Contains("shield")))
+                return "Mage";
+            if (normalizedLower.Contains("bow") || normalizedLower.Contains("crossbow") || normalizedLower.Contains("gun") || normalizedLower.Contains("cannon"))
+                return "Ranger";
+            if (normalizedLower.Contains("staff"))
+                return "Mage";
+            if (normalizedLower.Contains("axe") || normalizedLower.Contains("sword") || normalizedLower.Contains("mace")
+                || normalizedLower.Contains("pick") || normalizedLower.Contains("club")
+                || normalizedLower.Contains("katana") || normalizedLower.Contains("polearm"))
+                return "Fighter";
+            return null;
+        }
+
+        private List<(int Slot, string ModRef)> SynthesizeClassRarityMods(string normalizedLower, string rarity)
+        {
+            string klass = ClassFromGCClass(normalizedLower);
+            if (klass == null) return new List<(int, string)>();
+
+            // Native generator chain per rarity tier (mirrors Rare/Unique*BodyIG structure):
+            // Rare/Unique = 4-gen (pre + binder + rare + superior); Magic = 3-gen; Superior = 2-gen.
+            string[] generators;
+            string r = rarity.ToLowerInvariant();
+            string pre;
+            switch (r)
+            {
+                case "rare":     pre = "MagicPreMG";   break;
+                case "unique":   pre = "UniquePreMG";  break;
+                case "magical":
+                case "magic":    pre = "MagicPreMG";   break;
+                case "superior": pre = null;           break;
+                default: return new List<(int, string)>(); // Normal/Mythic handled elsewhere
+            }
+            if (r == "superior")
+                generators = new[] { $"{klass}MG.BinderPostMG", $"{klass}MG.SupPostMG" };
+            else if (r == "magical" || r == "magic")
+                generators = new[] { $"{klass}MG.{pre}", $"{klass}MG.BinderPostMG", $"{klass}MG.SupPostMG" };
+            else
+                generators = new[] { $"{klass}MG.{pre}", $"{klass}MG.BinderPostMG", $"{klass}MG.RarePostMG", $"{klass}MG.SupPostMG" };
+
+            var result = new List<(int, string)>();
+            int slot = 1;
+            foreach (var genKey in generators)
+            {
+                if (_modGenerators != null && _modGenerators.TryGetValue(genKey, out var modList) && modList.Count > 0)
+                    result.Add((slot, modList[0]));
+                slot++;
+            }
+            return result;
         }
 
         public bool HasItem(string gcClass, int rarity = -1)

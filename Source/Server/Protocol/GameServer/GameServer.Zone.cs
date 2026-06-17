@@ -3545,7 +3545,13 @@ namespace DungeonRunners.Networking
             writer.WriteUInt16(remoteModId);
             WriteGCType(writer, "modifiers", preserveCase: false);
             writer.WriteByte(0x01);
-            var remoteClassPassives = remoteChar != null
+            // PvP HP sync: in a PvP arena send NO passive modifiers for the remote avatar — matching the
+            // own-avatar spawn, which always passes null here. Otherwise the client applies the passive HP
+            // penalty ONLY to remote avatars (own avatar gets none), computing their maxHP = base-passive
+            // (51968) and clamping the server's no-passive PvP suffix (68096) down -> EntitySynchInfo::Validate
+            // fails. With null, the client computes the remote avatar's no-passive base (68096), matching both
+            // the own avatar and the server's PvP-remapped suffix. (x32dbg-confirmed: own=68096, remote=51968.)
+            var remoteClassPassives = (remoteChar != null && !IsPvpZone(playerConn.CurrentZoneName))
                 ? CollectPassiveManipulators(remoteChar).Where(p => p.Skill != null && p.Skill.EndsWith("ClassPassive", StringComparison.OrdinalIgnoreCase)).ToList()
                 : null;
             WritePassiveModifiersComponent(writer, remoteClassPassives, (ushort)avatarEntityId);

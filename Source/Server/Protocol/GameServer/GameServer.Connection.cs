@@ -416,6 +416,40 @@ namespace DungeonRunners.Networking
                     $"remoteBehavior={remoteBehaviorId} moveCount={relayMoveCount} hp={GetPlayerState(conn.ConnId.ToString())?.EntitySynchInfoHP ?? 0} srcPos=({conn.PlayerPosX:F1},{conn.PlayerPosY:F1}) relayPos=({conn.LastRelayPosX:F1},{conn.LastRelayPosY:F1})");
             }
         }
+        // Generic peer relay: forward a component sub-message from `source`'s avatar to every nearby
+        // peer's replica view of that avatar. Mirrors BroadcastPlayerMovement's addressing (the peer's
+        // ReplicaBehaviorId via _remoteBehaviorIds) and appends the remote-avatar EntitySynchInfo suffix.
+        // Movement uses subMessage 0x65; player actions (weapon swings) use 0x01.
+        private void RelayComponentUpdateToPeers(RRConnection source, byte subMessage, byte[] payload, string tag)
+        {
+            if (source == null) return;
+
+            int relayedTo = 0;
+            foreach (var other in _connections.Values)
+            {
+                if (other == source) continue;
+                if (!other.IsSpawned) continue;
+                if (other.CurrentZoneGcType != source.CurrentZoneGcType) continue;
+                if (other.InstanceId != source.InstanceId) continue;
+
+                if (!_remoteBehaviorIds.TryGetValue(other.LoginName, out var playerMap)) continue;
+                if (!playerMap.TryGetValue(source.LoginName, out ushort remoteBehaviorId)) continue;
+
+                var message = new LEWriter();
+                message.WriteByte(0x35);
+                message.WriteUInt16(remoteBehaviorId);
+                message.WriteByte(subMessage);
+                if (payload != null && payload.Length > 0)
+                    message.WriteBytes(payload);
+                if (!TryWriteRemoteAvatarEntitySynchInfo(source, message, remoteBehaviorId, subMessage, tag))
+                    continue;
+                other.MessageQueue.Enqueue(message.ToArray());
+                relayedTo++;
+            }
+            if (VerbosePacketLogging)
+                Debug.LogError($"[{tag}] src={source.LoginName} sub=0x{subMessage:X2} payload={payload?.Length ?? 0}b relayedToPeers={relayedTo}");
+        }
+
         public void SendCompressedPublic(RRConnection conn, byte dest, byte messageType, byte[] data)
             => SendCompressedA(conn, dest, messageType, data);
     }
