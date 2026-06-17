@@ -12,11 +12,6 @@ namespace DungeonRunners.Core
     {
         private static readonly object LogLock = new object();
         private static bool _started;
-        private static bool _logHooked;
-        private static StreamWriter _logWriter;
-        private static string _logPath;
-        private static DateTime _lastLogFlushUtc = DateTime.MinValue;
-        private static int _pendingLogLines;
         private static bool _focusedFilterInstalled;
         private static ILogHandler _originalLogHandler;
         private static Mutex _singleInstanceMutex;
@@ -70,19 +65,6 @@ namespace DungeonRunners.Core
         {
             lock (LogLock)
             {
-                if (_logHooked)
-                {
-                    Application.logMessageReceivedThreaded -= OnLogMessage;
-                    _logHooked = false;
-                }
-
-                if (_logWriter != null)
-                {
-                    _logWriter.Flush();
-                    _logWriter.Dispose();
-                    _logWriter = null;
-                }
-
                 if (_focusedFilterInstalled)
                 {
                     DungeonRunners.Engine.Debug.logger.logHandler = _originalLogHandler;
@@ -92,6 +74,7 @@ namespace DungeonRunners.Core
 
                 ReleaseSingleInstanceMutex();
             }
+            ClosePlayerLogWriters();
         }
 
         private static void OnProcessExit(object sender, EventArgs e)
@@ -124,34 +107,13 @@ namespace DungeonRunners.Core
         {
             try
             {
-                string logDir = ResolveClientLogsDir();
                 int pid = Process.GetCurrentProcess().Id;
-                _logPath = ResolveServerLogPath(logDir);
-                string targetDir = Path.GetDirectoryName(_logPath);
-                if (!string.IsNullOrWhiteSpace(targetDir))
-                    Directory.CreateDirectory(targetDir);
-                try
-                {
-                    if (File.Exists(_logPath) && new FileInfo(_logPath).Length > 0)
-                    {
-                        string prevPath = Path.Combine(targetDir, Path.GetFileNameWithoutExtension(_logPath) + ".prev" + Path.GetExtension(_logPath));
-                        File.Copy(_logPath, prevPath, true);
-                    }
-                }
-                catch { }
-                _logWriter = new StreamWriter(new FileStream(_logPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));
-                _logWriter.AutoFlush = false;
-                _lastLogFlushUtc = DateTime.UtcNow;
-                _pendingLogLines = 0;
-                _logHooked = true;
-                Application.logMessageReceivedThreaded += OnLogMessage;
-                WriteLogLine("[RUNTIME-EVIDENCE] pid=" + pid + " log=" + _logPath);
-                DungeonRunners.Engine.Debug.LogError("[RUNTIME-EVIDENCE] Mirroring server log to " + _logPath);
-                LogBuildBinding("mirror");
+                DungeonRunners.Engine.Debug.LogError("[RUNTIME-EVIDENCE] pid=" + pid + " log=" + ResolveServerLogPath(null));
+                LogBuildBinding("startup");
             }
             catch (Exception ex)
             {
-                DungeonRunners.Engine.Debug.LogError("[RUNTIME-EVIDENCE] Server log mirror failed: " + ex.Message);
+                DungeonRunners.Engine.Debug.LogError("[RUNTIME-EVIDENCE] Server log binding failed: " + ex.Message);
             }
         }
 
@@ -181,6 +143,61 @@ namespace DungeonRunners.Core
                 DungeonRunners.Engine.Debug.LogError($"[FALLBACK-HIT] area={area} key={key} count={count}{suffix}");
             }
             return count;
+        }
+
+        private static readonly object PlayerLogLock = new object();
+        private static readonly Dictionary<string, StreamWriter> PlayerLogWriters = new Dictionary<string, StreamWriter>(StringComparer.OrdinalIgnoreCase);
+        private static readonly bool PerPlayerLogsDisabled = IsTruthy(Environment.GetEnvironmentVariable("DR_SERVER_DISABLE_PER_PLAYER_LOGS"));
+
+        public static void LogForPlayer(string player, string marker, string body)
+        {
+            string token = NormalizeLogToken(player, "unknown");
+            DungeonRunners.Engine.Debug.LogError($"{marker} player={token} {body}");
+            WritePlayerLine(token, $"{marker} {body}");
+        }
+
+        public static void LogForPlayerPair(string src, string dst, string marker, string body)
+        {
+            string srcToken = NormalizeLogToken(src, "unknown");
+            string dstToken = NormalizeLogToken(dst, "unknown");
+            string line = $"{marker} src={srcToken} dst={dstToken} {body}";
+            DungeonRunners.Engine.Debug.LogError(line);
+            WritePlayerLine(srcToken, line);
+            if (!string.Equals(srcToken, dstToken, StringComparison.OrdinalIgnoreCase))
+                WritePlayerLine(dstToken, line);
+        }
+
+        private static void WritePlayerLine(string token, string line)
+        {
+            if (PerPlayerLogsDisabled) return;
+            try
+            {
+                lock (PlayerLogLock)
+                {
+                    if (!PlayerLogWriters.TryGetValue(token, out var writer))
+                    {
+                        string dir = Path.GetDirectoryName(ResolveServerLogPath(ResolveClientLogsDir()));
+                        if (string.IsNullOrWhiteSpace(dir)) return;
+                        Directory.CreateDirectory(dir);
+                        writer = new StreamWriter(new FileStream(Path.Combine(dir, "player_" + token + ".log"), FileMode.Create, FileAccess.Write, FileShare.Read)) { AutoFlush = true };
+                        PlayerLogWriters[token] = writer;
+                    }
+                    writer.WriteLine(line);
+                }
+            }
+            catch { }
+        }
+
+        private static void ClosePlayerLogWriters()
+        {
+            lock (PlayerLogLock)
+            {
+                foreach (var writer in PlayerLogWriters.Values)
+                {
+                    try { writer.Flush(); writer.Dispose(); } catch { }
+                }
+                PlayerLogWriters.Clear();
+            }
         }
 
         private static string NormalizeLogToken(string value, string fallback)
@@ -217,7 +234,7 @@ namespace DungeonRunners.Core
                 }
 
                 int pid = Process.GetCurrentProcess().Id;
-                string args = "-NoProfile -ExecutionPolicy Bypass -File " + Quote(scriptPath) + " -Single -Name server-auto -OwnerPid " + pid + " -StopWhenOwnerExits";
+                string args = "-NoProfile -ExecutionPolicy Bypass -File " + Quote(scriptPath) + " -Single -Name wireshark.log -OwnerPid " + pid + " -StopWhenOwnerExits";
                 var psi = new ProcessStartInfo
                 {
                     FileName = "powershell.exe",
@@ -237,7 +254,7 @@ namespace DungeonRunners.Core
 
                     if (!proc.WaitForExit(1000))
                     {
-                        DungeonRunners.Engine.Debug.LogError("[RUNTIME-EVIDENCE] Packet capture launch requested for DR_Server.exe pid=" + pid + " name=server-auto path=" + Path.Combine(ResolveClientLogsDir(), "server-auto.pcapng"));
+                        DungeonRunners.Engine.Debug.LogError("[RUNTIME-EVIDENCE] Packet capture launch requested for DR_Server.exe pid=" + pid + " name=wireshark.log path=" + Path.Combine(repoRoot, "DungeonRunnersServer", "logs", "wireshark.log"));
                         return;
                     }
 
@@ -247,7 +264,7 @@ namespace DungeonRunners.Core
                         return;
                     }
 
-                    DungeonRunners.Engine.Debug.LogError("[RUNTIME-EVIDENCE] Packet capture attached to DR_Server.exe pid=" + pid + " name=server-auto");
+                    DungeonRunners.Engine.Debug.LogError("[RUNTIME-EVIDENCE] Packet capture attached to DR_Server.exe pid=" + pid + " name=wireshark.log");
                 }
             }
             catch (Exception ex)
@@ -383,18 +400,6 @@ namespace DungeonRunners.Core
             return false;
         }
 
-        private static void OnLogMessage(string condition, string stackTrace, LogType type)
-        {
-            if (!ShouldMirrorLog(condition, type))
-                return;
-
-            string severity = type == LogType.Error ? "" : " [" + type + "]";
-            string line = ServerLocalTimestamp() + severity + " " + condition;
-            if (!string.IsNullOrWhiteSpace(stackTrace) && (type == LogType.Exception || type == LogType.Assert))
-                line += Environment.NewLine + stackTrace;
-            WriteLogLine(line);
-        }
-
         private static string ResolveBuildBinding()
         {
             try
@@ -426,23 +431,6 @@ namespace DungeonRunners.Core
             {
             }
             return AppDomain.CurrentDomain.BaseDirectory;
-        }
-
-        private static void WriteLogLine(string line)
-        {
-            lock (LogLock)
-            {
-                if (_logWriter == null) return;
-                _logWriter.WriteLine(line);
-                _pendingLogLines++;
-                DateTime now = DateTime.UtcNow;
-                if (_pendingLogLines >= 64 || (now - _lastLogFlushUtc).TotalSeconds >= 1.0)
-                {
-                    _logWriter.Flush();
-                    _pendingLogLines = 0;
-                    _lastLogFlushUtc = now;
-                }
-            }
         }
 
         private static bool ShouldMirrorLog(string condition, LogType type)
@@ -797,6 +785,10 @@ namespace DungeonRunners.Core
             string overridePath = Environment.GetEnvironmentVariable("DR_SERVER_LOG_FILE");
             if (!string.IsNullOrWhiteSpace(overridePath))
                 return overridePath;
+
+            string repoRoot = ResolveRepoRoot();
+            if (!string.IsNullOrWhiteSpace(repoRoot))
+                return Path.Combine(repoRoot, "DungeonRunnersServer", "logs", "server.log");
 
             return Path.Combine(fallbackLogDir, "server.log");
         }

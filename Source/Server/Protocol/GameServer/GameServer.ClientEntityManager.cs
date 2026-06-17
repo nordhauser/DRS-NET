@@ -279,9 +279,7 @@ namespace DungeonRunners.Networking
             foreach (var zoneConn in _connections.Values)
             {
                 if (zoneConn == null || !zoneConn.IsConnected || !zoneConn.IsSpawned) continue;
-                string zoneKey = GetInstanceZoneKey(zoneConn);
-                if (!string.Equals(zoneKey, monster.ZoneName, StringComparison.OrdinalIgnoreCase) &&
-                    !string.Equals(zoneConn.CurrentZoneName, monster.ZoneName, StringComparison.OrdinalIgnoreCase))
+                if (!string.Equals(zoneConn.RuntimeInstanceKey, monster.InstanceKey, StringComparison.OrdinalIgnoreCase))
                     continue;
                 SendCompressedA(zoneConn, 0x01, 0x0f, packet);
             }
@@ -298,6 +296,20 @@ namespace DungeonRunners.Networking
                 if (conn == null || !conn.IsConnected) continue;
                 if (conn.InstanceId != ownerConn.InstanceId) continue;
                 if (!string.Equals(conn.CurrentZoneGcType, ownerConn.CurrentZoneGcType, StringComparison.OrdinalIgnoreCase)) continue;
+                recipients.Add(conn);
+            }
+            return recipients;
+        }
+
+        internal List<RRConnection> GetInstanceRecipients(RRConnection origin)
+        {
+            var recipients = new List<RRConnection>();
+            if (origin == null) return recipients;
+            foreach (var conn in _connections.Values)
+            {
+                if (conn == null || !conn.IsConnected || !conn.IsSpawned || !conn.AllowFlush) continue;
+                if (conn.InstanceId != origin.InstanceId) continue;
+                if (!string.Equals(conn.CurrentZoneGcType, origin.CurrentZoneGcType, StringComparison.OrdinalIgnoreCase)) continue;
                 recipients.Add(conn);
             }
             return recipients;
@@ -351,7 +363,13 @@ namespace DungeonRunners.Networking
         {
             if (conn == null || monster == null) return false;
             string hpState = CombatRuntime.Instance != null ? CombatRuntime.Instance.DescribeMonsterHPState(monster) : "state=<missing>";
-            Debug.LogError($"[MON-HP-PRIMER] suffix current {monster.Name}#{monster.EntityId} hp={hpWire / 256f:F2}/{monster.MaxHPWire / 256f:F2} source={source} {hpState}");
+            if (VerboseMonsterDiag) Debug.LogError($"[MON-HP-PRIMER] suffix current {monster.Name}#{monster.EntityId} hp={hpWire / 256f:F2}/{monster.MaxHPWire / 256f:F2} source={source} {hpState}");
+            string key = $"{conn.ConnId}\u001f{monster.EntityId}";
+            if (_monsterEntityInitHPState.TryGetValue(key, out uint current) && current == hpWire)
+                return true;
+            byte[] packet = CombatPackets.BuildMonsterEntityInitHPRefreshPacket(monster, hpWire);
+            conn.MessageQueue.Enqueue(packet);
+            _monsterEntityInitHPState[key] = hpWire;
             return true;
         }
 
@@ -455,7 +473,7 @@ namespace DungeonRunners.Networking
             }
             ResolvedEntitySynchInfo entitySynchInfo = decision.ToResolved(target.EntityId, componentId, 0x04, GetCombatNow(), "PLAYER-STUN-ACTION sourceFunction=KnockBack::writeData@0x0052A320");
             byte[] packet = CombatPackets.BuildPlayerStunActionPacket(componentId, action.ActionClassId, action.HeadingWire, action.StrengthWire, entitySynchInfo);
-            bool sent = SendCompressedA(targetConn, 0x01, 0x0F, packet, EntitySynchInfoContext.PlayerActionResponse, "PLAYER-STUN-ACTION");
+            bool sent = QueueClientEntityStream(targetConn, packet);
             Debug.LogError($"[PLAYER-STUN-ACTION] sent={sent} monster={monster?.Name ?? "monster"}#{monster?.EntityId ?? 0} player={target.Name}#{target.EntityId} component=0x{componentId:X4} action={action.ActionClassName} actionId=0x{action.ActionClassId:X2} heading={action.HeadingWire} strengthWire={action.StrengthWire} authoredStrength={action.AuthoredStrength} knockDownPlayerBranch={action.KnockDownPlayerBranch} hp={entitySynchInfo.HPWire} chanceRaw=0x{action.ChanceRaw:X8} chanceRoll={action.ChanceRoll} stunResistWire={action.StunResistWire} stunRaw=0x{action.StunRaw:X8} stunRoll={action.StunRoll} source={action.Source ?? "unknown"} sourceFunction=Behavior::processUpdate@0x00515620 KnockBack::writeData@0x0052A320");
         }
 
@@ -493,7 +511,7 @@ namespace DungeonRunners.Networking
             byte[] packet = mod.Add
                 ? CombatPackets.BuildPlayerModifierAddPacket(componentId, mod.GCType, mod.ModifierId, mod.Level, mod.PowerLevel, mod.DurationTicks, mod.SourceIsSelf, entitySynchInfo)
                 : CombatPackets.BuildPlayerModifierRemovePacket(componentId, mod.ModifierId, entitySynchInfo);
-            bool sent = SendCompressedA(targetConn, 0x01, 0x0F, packet, EntitySynchInfoContext.PlayerActionResponse, packetName);
+            bool sent = QueueClientEntityStream(targetConn, packet);
             string lifecycle = mod.Lifecycle != null && mod.Lifecycle.HasClientLocalLifecycle
                 ? $"visual={mod.Lifecycle.Visual ?? ""} initSound={mod.Lifecycle.InitSound ?? ""} initEffect={mod.Lifecycle.InitEffect ?? ""} removeEffect={mod.Lifecycle.RemoveEffect ?? ""} overlay={mod.Lifecycle.OverlayIcon ?? ""} overlayDuration={mod.Lifecycle.OverlayDuration}"
                 : "none";
@@ -563,7 +581,7 @@ namespace DungeonRunners.Networking
             }
             playerDeathControlMessage.WriteByte(0x06);
 
-            SendCompressedA(conn, 0x01, 0x0F, playerDeathControlMessage.ToArray(), EntitySynchInfoContext.ControlAck, "PLAYER-DEATH-CONTROL");
+            QueueClientEntityStream(conn, playerDeathControlMessage.ToArray());
             BroadcastPlayerDeath(conn);
             Debug.LogError($"[PLAYER-DEATH] Sent local control release player={target?.Name ?? conn.LoginName ?? conn.ConnId.ToString()} monster={monster?.Name ?? "unknown"}#{monster?.EntityId ?? 0} component=0x{componentId:X4} hp={hpWire}");
         }
@@ -676,17 +694,10 @@ namespace DungeonRunners.Networking
                 return;
             if (!_monsterBehaviorIds.TryGetValue(monster.EntityId, out var behaviorId))
                 return;
-            float now = Time.time;
-            if (_lastMonsterMoveSentAt.TryGetValue(monster.EntityId, out float lastSent) && now - lastSent < MONSTER_MOVE_SEND_INTERVAL)
-                return;
-            _lastMonsterMoveSentAt[monster.EntityId] = now;
             RRConnection ownerConn = null;
             if (_monsterOwnerConnId.TryGetValue(monster.EntityId, out int ownerConnId) && _connections.TryGetValue(ownerConnId, out var foundConn))
                 ownerConn = foundConn;
             if (ownerConn == null) return;
-            var target = CombatRuntime.Instance.GetPlayer(monster.TargetId);
-            float targetX = target != null ? target.PosX : monster.PosX;
-            float targetY = target != null ? target.PosY : monster.PosY;
             if (!monster.IsAlive || CombatRuntime.Instance.PeekMonsterCurrentHPWire(monster) == 0)
                 return;
 
@@ -697,11 +708,10 @@ namespace DungeonRunners.Networking
                 BehaviorId = behaviorId,
                 ConnId = ownerConn.ConnId,
                 TargetEntityId = monster.TargetId,
-                TargetX = targetX,
-                TargetY = targetY,
+                TargetX = monster.PosX,
+                TargetY = monster.PosY,
                 QueuedAt = GetCombatNow()
             }, "MON-MOVE");
-            Debug.LogError($"[MON-MOVE-QUEUE] {monster.Name}#{monster.EntityId} behavior={behaviorId} target={monster.TargetId} pos=({monster.PosX:F1},{monster.PosY:F1}) dest=({targetX:F1},{targetY:F1})");
         }
 
         private void QueuePendingMonsterBehaviorUpdate(PendingMonsterBehaviorUpdate update, string packetName)
@@ -716,7 +726,7 @@ namespace DungeonRunners.Networking
                 _ => update.EntityId
             };
             _pendingMonsterBehaviorUpdates[queueKey] = update;
-            Debug.LogError($"[MON-BEHAVIOR-QUEUE] packet={packetName} entity={update.EntityId} behavior={update.BehaviorId} kind={update.Kind} conn={update.ConnId} target={update.TargetEntityId} queuedAt={update.QueuedAt:F3}");
+            if (VerboseMonsterDiag) Debug.LogError($"[MON-BEHAVIOR-QUEUE] packet={packetName} entity={update.EntityId} behavior={update.BehaviorId} kind={update.Kind} conn={update.ConnId} target={update.TargetEntityId} queuedAt={update.QueuedAt:F3}");
         }
 
         private void FlushPendingMonsterBehaviorUpdates(float writerNow, uint writerTick)
@@ -743,21 +753,34 @@ namespace DungeonRunners.Networking
             }
         }
 
+        private ushort ResolveRemoteAvatarEntityId(RRConnection recipient, RRConnection targetOwnerConn, uint canonicalTargetId)
+        {
+            if (recipient == null || targetOwnerConn == null) return 0;
+            if (recipient.ConnId == targetOwnerConn.ConnId) return (ushort)canonicalTargetId;
+            if (_remoteAvatarIds.TryGetValue(recipient.LoginName, out var avatarMap)
+                && avatarMap.TryGetValue(targetOwnerConn.LoginName, out ushort remoteAvatarTargetId))
+                return remoteAvatarTargetId;
+            return 0;
+        }
+
         private void FlushPendingMonsterFollowUpdate(PendingMonsterBehaviorUpdate update, float writerNow, uint writerTick)
         {
             Monster monster = CombatRuntime.Instance.GetMonster(update.EntityId);
             if (monster == null || !monster.IsAlive || CombatRuntime.Instance.PeekMonsterCurrentHPWire(monster) == 0)
                 return;
+            RRConnection targetOwnerConn = FindConnectionByAvatarEntityId(update.TargetEntityId);
             foreach (var recipient in GetMonsterInstanceRecipients(update.EntityId))
             {
                 if (recipient == null || !recipient.IsConnected) continue;
+                ushort remoteAvatarTargetId = ResolveRemoteAvatarEntityId(recipient, targetOwnerConn, update.TargetEntityId);
+                if (remoteAvatarTargetId == 0) continue;
                 EntitySynchInfoDecision decision = ResolveMonsterBehaviorWriterHPDecision(recipient, monster, (ushort)update.BehaviorId, 0x04, EntitySynchInfoContext.MonsterAction, "MON-FOLLOW", writerNow, writerTick);
                 if (decision.HPWire == 0) continue;
                 if ((decision.Flags & 0x02) != 0 && !TryPrimeMonsterHPBeforeSynch(recipient, monster, decision.HPWire, "MON-FOLLOW"))
                     continue;
-                var packet = CombatPackets.BuildMonsterFollowPacket(update.BehaviorId, (ushort)update.TargetEntityId, decision.ToResolved(monster.EntityId, update.BehaviorId, 0x04, writerNow, "MON-FOLLOW client-writer"));
+                var packet = CombatPackets.BuildMonsterFollowPacket(update.BehaviorId, remoteAvatarTargetId, decision.ToResolved(monster.EntityId, update.BehaviorId, 0x04, writerNow, "MON-FOLLOW client-writer"));
                 recipient.MessageQueue.Enqueue(packet);
-                Debug.LogError($"[MON-FOLLOW-FLUSH] {monster.Name}#{monster.EntityId} behavior={update.BehaviorId} target={update.TargetEntityId} hp={decision.HPWire} conn={recipient.ConnId} sourceFunction=Follow::readData@0x5227A0");
+                if (VerboseMonsterDiag) Debug.LogError($"[MON-FOLLOW-FLUSH] {monster.Name}#{monster.EntityId} behavior={update.BehaviorId} target={update.TargetEntityId} remoteTarget={remoteAvatarTargetId} hp={decision.HPWire} conn={recipient.ConnId} sourceFunction=Follow::readData@0x5227A0");
             }
         }
 
@@ -783,15 +806,18 @@ namespace DungeonRunners.Networking
                 }
                 if ((decision.Flags & 0x02) != 0 && !TryPrimeMonsterHPBeforeSynch(recipient, monster, decision.HPWire, "MON-MOVE"))
                     continue;
-                int headingWire = (int)(Mathf.Atan2(update.TargetY - monster.PosY, update.TargetX - monster.PosX) * Mathf.Rad2Deg * 256f);
-                var packet = CombatPackets.BuildMonsterMovePacket(monster.EntityId, update.BehaviorId, update.TargetX, update.TargetY, headingWire, decision.ToResolved(monster.EntityId, update.BehaviorId, 0x65, writerNow, "MON-MOVE client-writer"), false);
+                var chasePlayer = CombatRuntime.Instance.GetPlayer(monster.TargetId);
+                float headingDX = (chasePlayer != null ? chasePlayer.PosX : monster.PosX) - monster.PosX;
+                float headingDY = (chasePlayer != null ? chasePlayer.PosY : monster.PosY) - monster.PosY;
+                int headingWire = (headingDX == 0f && headingDY == 0f) ? 0 : (int)(Mathf.Atan2(headingDY, headingDX) * Mathf.Rad2Deg * 256f);
+                var packet = CombatPackets.BuildMonsterMovePacket(monster.EntityId, update.BehaviorId, monster.PosFixedX, monster.PosFixedY, headingWire, decision.ToResolved(monster.EntityId, update.BehaviorId, 0x65, writerNow, "MON-MOVE client-writer"), false);
                 recipient.MessageQueue.Enqueue(packet);
                 if (!recorded)
                 {
-                    CombatRuntime.Instance.RecordMonsterMoveClientVisible(monster, update.TargetX, update.TargetY, writerNow, "MON-MOVE");
+                    CombatRuntime.Instance.RecordMonsterMoveClientVisible(monster, monster.PosX, monster.PosY, writerNow, "MON-MOVE");
                     recorded = true;
                 }
-                Debug.LogError($"[MON-MOVE-FLUSH] {monster.Name}#{monster.EntityId} behavior={update.BehaviorId} target={update.TargetEntityId} dest=({update.TargetX:F1},{update.TargetY:F1}) hp={decision.HPWire} conn={recipient.ConnId} queuedAt={update.QueuedAt:F3} writer={writerTick}@{writerNow:F3} queue={recipient.MessageQueue.Count}");
+                if (VerboseMonsterDiag) Debug.LogError($"[MON-MOVE-FLUSH] {monster.Name}#{monster.EntityId} behavior={update.BehaviorId} target={update.TargetEntityId} dest=({update.TargetX:F1},{update.TargetY:F1}) hp={decision.HPWire} conn={recipient.ConnId} queuedAt={update.QueuedAt:F3} writer={writerTick}@{writerNow:F3} queue={recipient.MessageQueue.Count}");
             }
         }
 
@@ -845,9 +871,19 @@ namespace DungeonRunners.Networking
             foreach (var recipient in GetMonsterInstanceRecipients(update.EntityId))
             {
                 if (recipient == null || recipient.ConnId == targetConn.ConnId || !recipient.IsConnected) continue;
+                ushort remoteAvatarTargetId = ResolveRemoteAvatarEntityId(recipient, targetConn, update.TargetEntityId);
+                if (remoteAvatarTargetId == 0) continue;
                 if ((decision.Flags & 0x02) != 0)
                     TryPrimeMonsterHPBeforeSynch(recipient, monster, decision.HPWire, "MON-ATTACK");
-                recipient.MessageQueue.Enqueue(packet);
+                byte[] recipientPacket = CombatPackets.BuildMonsterAttackPacket(
+                    monster.EntityId,
+                    update.BehaviorId,
+                    remoteAvatarTargetId,
+                    update.UseFlags,
+                    decision.ToResolved(monster.EntityId, update.BehaviorId, 0x04, writerNow, "MON-ATTACK client-writer"),
+                    update.UseTargetAction,
+                    false);
+                recipient.MessageQueue.Enqueue(recipientPacket);
             }
             if (update.UseTargetAction)
                 CombatRuntime.Instance.CommitMonsterPrimarySkillUse(monster, "MON-ATTACK");
@@ -1011,6 +1047,7 @@ namespace DungeonRunners.Networking
             SendToClient(conn, packet);
             _monsterOwnerConnId[monster.EntityId] = conn.ConnId;
             CombatRuntime.Instance.RecordMonsterOutboundHP(monster, spawnDecision.HPWire, "SPAWN-PKT");
+            _monsterEntityInitHPState[$"{conn.ConnId}\u001f{monster.EntityId}"] = spawnDecision.HPWire;
 
             Debug.LogError($"[SPAWN] Monster {monster.Name} spawned with RNG seed 0x{monster.RngSeed:X8}");
 
@@ -1139,38 +1176,6 @@ namespace DungeonRunners.Networking
 
             SendEncryptedUDP(session, packet);
             Debug.LogError($"[COMBAT-TICK] Sent Type 0x0C combatTick to behaviorId={behaviorComponentId} target={playerEntityId}");
-        }
-        public void SendCombatTickUDP(RRConnection conn, ushort componentId, uint targetEntityId)
-        {
-            var session = GetUDPSessionForConnection(conn);
-            if (session == null || !session.IsEstablished) return;
-
-            if (!ResolveEntitySynchInfoForComponent(conn, componentId, 0x64, EntitySynchInfoContext.MonsterAction, 0, "UDP-COMBAT", false, out EntitySynchInfoDecision decision))
-                return;
-
-            var writer = new LEWriter();
-            writer.WriteByte(0x07);
-            writer.WriteByte(0x35);
-            writer.WriteUInt16(componentId);
-            writer.WriteByte(0x64);
-            writer.WriteByte(0x01);
-            writer.WriteUInt16(0x0C);
-            writer.WriteUInt32(0x0000FFFF);
-            writer.WriteUInt16((ushort)targetEntityId);
-            if (!TryWriteResolvedEntitySynchInfo(writer, componentId, 0x64, EntitySynchInfoContext.MonsterAction, "UDP-COMBAT", decision))
-                return;
-            writer.WriteByte(0x06);
-
-            byte[] packet = writer.ToArray();
-            int padLen = (8 - (packet.Length % 8)) % 8;
-            if (padLen > 0)
-            {
-                byte[] padded = new byte[packet.Length + padLen];
-                Array.Copy(packet, padded, packet.Length);
-                packet = padded;
-            }
-            SendEncryptedUDP(session, packet);
-            Debug.LogError($"[UDP-COMBAT] Sent CombatTick type=12 to cid={componentId}, target={targetEntityId}");
         }
         private void HandleMonsterAggro(Monster monster, CombatPlayer player)
         {

@@ -13,6 +13,7 @@ namespace DungeonRunners.Combat
     {
         private static CombatRuntime _instance;
         public static CombatRuntime Instance => _instance ??= new CombatRuntime();
+        private static readonly bool VerboseMonsterDiag = System.Environment.GetEnvironmentVariable("DR_SERVER_VERBOSE_MONSTER_DIAG") == "1";
 
         private Dictionary<uint, Monster> _activeMonsters = new Dictionary<uint, Monster>();
         private Dictionary<uint, CombatPlayer> _players = new Dictionary<uint, CombatPlayer>();
@@ -700,7 +701,7 @@ namespace DungeonRunners.Combat
             monster.PosY = visualY;
             monster.PosZ = ResolveTerrainHeight(monster, visualX, visualY, monster.PosZ);
             ResetMonsterClientVisiblePosition(monster, visualX, visualY, GetCombatTime(), source ?? "wander");
-            Debug.LogError($"[MON-WANDER-POS] {monster.Name}#{monster.EntityId} source={source ?? "unknown"} authoritative=({oldX:F1},{oldY:F1})->clientVisible=({visualX:F1},{visualY:F1}) delta={delta:F1}");
+            if (VerboseMonsterDiag) Debug.LogError($"[MON-WANDER-POS] {monster.Name}#{monster.EntityId} source={source ?? "unknown"} authoritative=({oldX:F1},{oldY:F1})->clientVisible=({visualX:F1},{visualY:F1}) delta={delta:F1}");
             return true;
         }
 
@@ -738,7 +739,7 @@ namespace DungeonRunners.Combat
             monster.ClientVisibleMoveLastTime = clientNow;
             monster.ClientVisibleFixedInit = false;
             monster.ClientVisibleHeadingInit = false;
-            Debug.LogError($"[MON-CLIENT-POS] reset {monster.Name}#{monster.EntityId} source={source ?? "unknown"} visible=({posX:F1},{posY:F1}) server=({monster.PosX:F1},{monster.PosY:F1}) clientNow={clientNow:F3}");
+            if (VerboseMonsterDiag) Debug.LogError($"[MON-CLIENT-POS] reset {monster.Name}#{monster.EntityId} source={source ?? "unknown"} visible=({posX:F1},{posY:F1}) server=({monster.PosX:F1},{monster.PosY:F1}) clientNow={clientNow:F3}");
         }
 
         public void RecordMonsterMoveClientVisible(Monster monster, float targetX, float targetY, float clientNow, string source)
@@ -753,7 +754,7 @@ namespace DungeonRunners.Combat
             monster.ClientVisibleMoveTargetY = targetY;
             monster.ClientVisibleMoveLastTime = clientNow;
             monster.ClientVisibleMoveActive = Distance2D(monster.ClientVisiblePosX, monster.ClientVisiblePosY, targetX, targetY) > 0.001f;
-            Debug.LogError($"[MON-CLIENT-POS] move {monster.Name}#{monster.EntityId} source={source ?? "unknown"} visible=({monster.ClientVisiblePosX:F1},{monster.ClientVisiblePosY:F1}) dest=({targetX:F1},{targetY:F1}) server=({monster.PosX:F1},{monster.PosY:F1}) speed={ResolveMonsterMovementSpeed(monster):F1} clientNow={clientNow:F3}");
+            if (VerboseMonsterDiag) Debug.LogError($"[MON-CLIENT-POS] move {monster.Name}#{monster.EntityId} source={source ?? "unknown"} visible=({monster.ClientVisiblePosX:F1},{monster.ClientVisiblePosY:F1}) dest=({targetX:F1},{targetY:F1}) server=({monster.PosX:F1},{monster.PosY:F1}) speed={ResolveMonsterMovementSpeed(monster):F1} clientNow={clientNow:F3}");
         }
 
         public bool TryGetMonsterClientVisiblePosition(Monster monster, float clientNow, out float visualX, out float visualY)
@@ -843,7 +844,8 @@ namespace DungeonRunners.Combat
             }
             int tgtX = (int)Math.Round(monster.ClientVisibleMoveTargetX * UnitMover.Fixed);
             int tgtY = (int)Math.Round(monster.ClientVisibleMoveTargetY * UnitMover.Fixed);
-            int stepFixed = (int)Math.Round(speed * UnitMover.Fixed / 30f);
+            int speedFixed = (int)Math.Round(speed * UnitMover.Fixed);
+            int stepFixed = (int)(((long)speedFixed << 8) / 0x1e00);
             if (stepFixed < 1) stepFixed = 1;
             int turnRate = UnitMover.TurnRatePerTickFixed(monster.TurnRateDegrees);
             if (!monster.ClientVisibleHeadingInit)
@@ -889,8 +891,7 @@ namespace DungeonRunners.Combat
             bool contactWasActive = monster.CombatContactTargetId == player.EntityId && monster.CombatContactUntil > clientNow;
             if (!alreadyTargetingPlayer && !inAuthoredAggro && !inContact && !clientWeaponUseStarted)
             {
-                Debug.LogError($"[AGGRO-OBSERVE] client intent admits {monster.Name}#{monster.EntityId}->{player.Name} dist={dist:F1} aggro={aggroRange:F1} targetSearch={ResolveMonsterTargetSearchRange(monster, false):F1} clientRange={contactRange:F1} sourceFunction=MonsterBehavior2::onAttacked@0x0051B550");
-                NotifyMonsterOnAttackedAdmission(monster, player.EntityId, "client-attack-intent");
+                Debug.LogError($"[AGGRO-OBSERVE] client intent out-of-range no-admit {monster.Name}#{monster.EntityId}->{player.Name} dist={dist:F1} aggro={aggroRange:F1} targetSearch={ResolveMonsterTargetSearchRange(monster, false):F1} clientRange={contactRange:F1} sourceFunction=MonsterBehavior2::onAttacked@0x0051B550");
                 return;
             }
             if (!alreadyTargetingPlayer && !inAuthoredAggro && !inContact && clientWeaponUseStarted)
@@ -900,8 +901,7 @@ namespace DungeonRunners.Combat
                     monster.CombatContactTargetId = 0;
                     monster.CombatContactUntil = 0f;
                 }
-                Debug.LogError($"[AGGRO-OBSERVE] client weapon use outside aggro {monster.Name}#{monster.EntityId}->{player.Name} dist={dist:F1} aggro={aggroRange:F1} targetSearch={ResolveMonsterTargetSearchRange(monster, false):F1} clientRange={contactRange:F1} action=projectile-pending sourceFunction=RangedWeapon::doHit+Projectile::doImpact->MonsterBehavior2::onAttacked");
-                return;
+                Debug.LogError($"[AGGRO-OBSERVE] client weapon use outside aggro {monster.Name}#{monster.EntityId}->{player.Name} dist={dist:F1} aggro={aggroRange:F1} targetSearch={ResolveMonsterTargetSearchRange(monster, false):F1} clientRange={contactRange:F1} action=client-use-aggro sourceFunction=RangedWeapon::doHit+Projectile::doImpact->MonsterBehavior2::onAttacked");
             }
             ApplyMonsterWanderClientVisiblePosition(monster, "client-action");
             bool attackPathClear = IsMonsterAttackPathClear(monster, player, inContact ? "client-contact" : null);
@@ -1243,6 +1243,8 @@ namespace DungeonRunners.Combat
             int additiveRegen = ResolveMonsterAdditiveHealthRegen(monster);
             for (int tickIndex = 0; tickIndex < ticks && (hp < monster.MaxHPWire || additiveRegen < 0); tickIndex++)
             {
+                if (cooldown > 0)
+                    cooldown--;
                 bool cooldownActive = cooldown > 0;
                 int regenWire = ComputeMonsterHealthRegenDeltaWire(monster, cooldownActive);
                 if (regenWire != 0)
@@ -1250,8 +1252,6 @@ namespace DungeonRunners.Combat
                     hp = ApplyUnitHPShiftWire(hp, monster.MaxHPWire, regenWire);
                     if (hp == 0) break;
                 }
-                if (cooldown > 0)
-                    cooldown--;
             }
 
             if (cooldown > 0)
@@ -1742,7 +1742,7 @@ namespace DungeonRunners.Combat
                     int rawDamageWire = DamageResolver.RollSpellDamageRange(minDamage, maxDamage, damageRaw);
                     uint damageWire = (uint)Math.Max(0, rawDamageWire);
                     uint beforeHP = target.PlayerState.CurrentHPWire;
-                    DamageQueryResult query = ApplyPlayerDamageQueryWire(damageWire, target, sourceMonster, mod.DamageTypeId, mod.DamageKind, mod.NextTickTime, source ?? "EffectMod::applyEffect", mod.SourceLevel, modRng);
+                    DamageQueryResult query = ApplyPlayerDamageQueryWire(damageWire, target, sourceMonster, mod.DamageTypeId, mod.DamageKind, mod.NextTickTime, source ?? "EffectMod::applyEffect", mod.SourceLevel, modRng, true);
                     uint adjustedDamageWire = query.AdjustedDamageWire;
                     uint afterHP = beforeHP;
                     uint effectRaw = 0;
@@ -2170,7 +2170,7 @@ namespace DungeonRunners.Combat
                 && state.LastClientHPReportWire == serverHPWire;
 
             bool usedHistory = TryResolveMonsterHPFromHistory(monster, state, cutoff, out uint visibleHPWire, out string hpView, out string mutationSource, out string excludedSameTickProjectile);
-            hpWire = visibleHPWire;
+            hpWire = serverHPWire;
             state.LastPacketHPWire = hpWire;
             ApplyMonsterHPState(monster, state);
             reason = exactClientObservedHP && hpWire == serverHPWire
@@ -2280,10 +2280,10 @@ namespace DungeonRunners.Combat
             monster.AttackClientVisible = false;
             monster.AttackContactOnly = false;
             monster.AttackHitResolved = false;
-            monster.AttackStartedTime = 0f;
-            monster.AttackCommitTime = 0f;
-            monster.AttackSoundTime = 0f;
-            monster.AttackEndTime = 0f;
+            monster.AttackStartTick = 0;
+            monster.AttackCommitTick = 0;
+            monster.AttackSoundTick = 0;
+            monster.AttackEndTick = 0;
             monster.AttackUseRaw = 0;
             monster.UsePrimaryActiveSkillThisAttack = false;
             monster.AttackCommitTargetX = 0f;
@@ -2315,7 +2315,7 @@ namespace DungeonRunners.Combat
             bool keepPendingAttack = monster.AttackPending
                 && monster.AttackContactOnly
                 && !monster.AttackHitResolved
-                && monster.AttackCommitTime > 0f
+                && monster.AttackCommitTick > 0
                 && monster.TargetId != 0;
             monster.DeathPendingClientConfirmation = true;
             monster.DeathPendingSince = GetCombatTime();
@@ -2326,10 +2326,10 @@ namespace DungeonRunners.Combat
                 monster.AttackContactOnly = false;
                 monster.AttackSoundPending = false;
                 monster.AttackHitResolved = false;
-                monster.AttackStartedTime = 0f;
-                monster.AttackEndTime = 0f;
-                monster.AttackCommitTime = 0f;
-                monster.AttackSoundTime = 0f;
+                monster.AttackStartTick = 0;
+                monster.AttackEndTick = 0;
+                monster.AttackCommitTick = 0;
+                monster.AttackSoundTick = 0;
                 monster.CombatContactTargetId = 0;
                 monster.CombatContactUntil = 0f;
                 monster.TargetId = 0;
@@ -2654,7 +2654,8 @@ namespace DungeonRunners.Combat
         private void PropagateMonsterShout(Monster source, CombatPlayer player)
         {
             if (source == null || player == null || source.ShoutRange <= 0f) return;
-            float shoutSq = source.ShoutRange * source.ShoutRange;
+            int shoutFixed = Mathf.RoundToInt(source.ShoutRange * 256f);
+            long shoutSq = ((long)shoutFixed * shoutFixed) >> 8;
             string pathMapKey = ResolveMonsterPathMapKey(source);
             PathMap pathMap = !string.IsNullOrWhiteSpace(pathMapKey) ? PathMapCatalog.Instance.GetPathMap(pathMapKey) : null;
             foreach (var monster in _activeMonsters.Values)
@@ -2662,9 +2663,9 @@ namespace DungeonRunners.Combat
                 if (monster == source || !monster.IsAlive || monster.AggroTriggered || monster.TargetId != 0) continue;
                 if (!string.Equals(ResolveMonsterPathMapKey(monster), pathMapKey, StringComparison.OrdinalIgnoreCase)) continue;
 
-                float dx = monster.PosX - source.PosX;
-                float dy = monster.PosY - source.PosY;
-                float distSq = dx * dx + dy * dy;
+                int dx = monster.PosFixedX - source.PosFixedX;
+                int dy = monster.PosFixedY - source.PosFixedY;
+                long distSq = (((long)dx * dx) >> 8) + (((long)dy * dy) >> 8);
                 if (distSq > shoutSq) continue;
                 if (pathMap != null
                     && pathMap.TryCanReachPoint(source.PosX, source.PosY, monster.PosX, monster.PosY, out bool canAssistReach)
@@ -2803,10 +2804,10 @@ namespace DungeonRunners.Combat
             monster.AttackContactOnly = false;
             monster.AttackHitResolved = false;
             monster.UsePrimaryActiveSkillThisAttack = false;
-            monster.AttackStartedTime = 0f;
-            monster.AttackCommitTime = 0f;
-            monster.AttackSoundTime = 0f;
-            monster.AttackEndTime = 0f;
+            monster.AttackStartTick = 0;
+            monster.AttackCommitTick = 0;
+            monster.AttackSoundTick = 0;
+            monster.AttackEndTick = 0;
             monster.AttackUseRaw = 0;
             monster.AttackSoundRaw = 0;
             monster.AttackSoundGateRaw = 0;
@@ -3122,7 +3123,7 @@ namespace DungeonRunners.Combat
                 float dist = Distance2D(monster.PosX, monster.PosY, player.PosX, player.PosY);
                 float allowedRange = ResolveMonsterEffectiveAttackRange(monster);
                 string action = clientDelta > 0f ? "advance" : "due-drain";
-                Debug.LogError($"[PRE-SUFFIX-DUE-DRAIN] action={action} source={source ?? "unknown"} player={player.Name}#{player.EntityId} monster={monster.Name}#{monster.EntityId} behavior={monster.BehaviorId} unit={monster.UnitId} gc='{monster.GCType}' spawnGc='{monster.SpawnGCType}' state={monster.State} target={monster.TargetId} pending={monster.AttackPending} hitResolved={monster.AttackHitResolved} clientVisible={monster.AttackClientVisible} clientContact={monster.AttackContactOnly} contactTarget={monster.CombatContactTargetId} dist={dist:F1} range={allowedRange:F1} requestedDelta={requestedDelta:F3} clientDelta={clientDelta:F3} elapsed={elapsed:F3} dueTicks={dueTicks} consumedTicks={consumedTicks} clock={previousAdvanceTime:F3}->{nextAdvanceTime:F3} clientNow={clientNow:F3} lastAttack={monster.LastAttackTime:F3} commit={monster.AttackCommitTime:F3} end={monster.AttackEndTime:F3} pathGate=client");
+                Debug.LogError($"[PRE-SUFFIX-DUE-DRAIN] action={action} source={source ?? "unknown"} player={player.Name}#{player.EntityId} monster={monster.Name}#{monster.EntityId} behavior={monster.BehaviorId} unit={monster.UnitId} gc='{monster.GCType}' spawnGc='{monster.SpawnGCType}' state={monster.State} target={monster.TargetId} pending={monster.AttackPending} hitResolved={monster.AttackHitResolved} clientVisible={monster.AttackClientVisible} clientContact={monster.AttackContactOnly} contactTarget={monster.CombatContactTargetId} dist={dist:F1} range={allowedRange:F1} requestedDelta={requestedDelta:F3} clientDelta={clientDelta:F3} elapsed={elapsed:F3} dueTicks={dueTicks} consumedTicks={consumedTicks} clock={previousAdvanceTime:F3}->{nextAdvanceTime:F3} clientNow={clientNow:F3} nextAttackTick={monster.NextAttackTick} commitTick={monster.AttackCommitTick} endTick={monster.AttackEndTick} pathGate=client");
             }
         }
 
@@ -5188,10 +5189,22 @@ namespace DungeonRunners.Combat
             return _avatarCombatRadius.Value;
         }
 
-        private float ResolveMonsterAttackWindup(Monster monster)
+        private int ResolveMonsterAttackWindupTicks(Monster monster)
         {
             ResolveMonsterAttackAnimationFrames(monster, out int totalFrames, out int hitFrame, out int soundFrame);
-            return Mathf.Max(1f / 30f, ResolveMonsterAttackFrameSeconds(monster, hitFrame));
+            return Mathf.Max(1, ResolveMonsterAttackFrameTicks(monster, hitFrame));
+        }
+
+        private float ResolveMonsterAttackWindup(Monster monster)
+        {
+            return ResolveMonsterAttackWindupTicks(monster) / 30f;
+        }
+
+        private int ResolveMonsterAttackSoundDelayTicks(Monster monster, int windupTicks)
+        {
+            ResolveMonsterAttackAnimationFrames(monster, out int totalFrames, out int hitFrame, out int soundFrame);
+            int soundTicks = ResolveMonsterAttackFrameTicks(monster, soundFrame);
+            return Mathf.Clamp(soundTicks, 1, Mathf.Max(1, windupTicks));
         }
 
         private float ResolveMonsterAttackSoundDelay(Monster monster, float windup)
@@ -5223,23 +5236,37 @@ namespace DungeonRunners.Combat
             }
         }
 
-        private float ResolveMonsterAttackFrameSeconds(Monster monster, int frame)
+        private int ResolveMonsterAttackFrameTicks(Monster monster, int frame)
         {
             float authoredSpeed = GCDatabase.Instance.GetKnob("MonsterAttackSpeed", 100f);
             float attackSpeed = authoredSpeed;
             if (monster != null)
                 attackSpeed *= Mathf.Max(0.01f, monster.AttackSpeed);
             int speedField = Mathf.Max(1, Mathf.RoundToInt(attackSpeed));
-            int ticks = Mathf.Max(1, (frame * 100) / speedField);
-            return ticks / 30f;
+            return Mathf.Max(1, (frame * 100) / speedField);
+        }
+
+        private float ResolveMonsterAttackFrameSeconds(Monster monster, int frame)
+        {
+            return ResolveMonsterAttackFrameTicks(monster, frame) / 30f;
+        }
+
+        private int ResolveMonsterAttackTotalTicks(Monster monster)
+        {
+            ResolveMonsterAttackAnimationFrames(monster, out int totalFrames, out int hitFrame, out int soundFrame);
+            return Mathf.Max(1, ResolveMonsterAttackFrameTicks(monster, totalFrames));
+        }
+
+        private int ResolveMonsterAttackCooldownTicks(Monster monster)
+        {
+            float cooldown = monster != null ? monster.AttackCooldown : 1.75f;
+            int cooldownFixed256 = Mathf.Max(0, Mathf.RoundToInt(Mathf.Max(0.01f, cooldown) * 256f));
+            return Mathf.Max(1, (int)(((long)cooldownFixed256 * 0x1e00L) >> 16));
         }
 
         private float ResolveMonsterAttackCooldownSeconds(Monster monster)
         {
-            float cooldown = monster != null ? monster.AttackCooldown : 1.75f;
-            int cooldownFixed256 = Mathf.Max(0, Mathf.RoundToInt(Mathf.Max(0.01f, cooldown) * 256f));
-            int ticks = Mathf.Max(1, (int)(((long)cooldownFixed256 * 0x1e00L) >> 16));
-            return ticks / 30f;
+            return ResolveMonsterAttackCooldownTicks(monster) / 30f;
         }
 
         private void AdvanceMonsterAttackAnimation(Monster monster)
@@ -5267,20 +5294,7 @@ namespace DungeonRunners.Combat
 
         public uint ConsumeOnApplyDamageEffectRng(MersenneTwister rng, string actor, uint targetId, string targetName, uint oldHPWire, uint newHPWire, uint targetMaxHPWire, uint damageWire, string source, bool physicalWeaponHit = true)
         {
-            if (rng == null) return 0;
-            if (!physicalWeaponHit)
-                return 0;
-            if (damageWire == 0 || oldHPWire <= newHPWire || newHPWire == 0)
-                return 0;
-
-            uint gateRaw = RngLedger.Generate(rng, "room", $"{source ?? "Damage::apply"}:Unit::onApplyDamage:effect-gate", actor);
-            int gateRoll = (int)(gateRaw % 100u);
-            uint appliedWire = oldHPWire - newHPWire;
-            int severity = targetMaxHPWire > 0
-                ? (int)Math.Min(int.MaxValue, ((long)appliedWire * 100L) / targetMaxHPWire)
-                : 0;
-            Debug.LogError($"[RNG-COMBAT] Unit::onApplyDamage effect actor={actor} target={targetName}#{targetId} source={source} gateRaw=0x{gateRaw:X8} gateRoll={gateRoll} severity={severity} hp={oldHPWire}->{newHPWire}/{targetMaxHPWire} appliedWire={appliedWire} damageWire={damageWire} rngAfter={rng.CallsSinceReseed}");
-            return gateRaw;
+            return 0;
         }
 
         private const int IdleGatePeriodTicks = 40;
@@ -5390,10 +5404,10 @@ namespace DungeonRunners.Combat
             monster.AttackClientVisible = false;
             monster.AttackContactOnly = false;
             monster.AttackHitResolved = false;
-            monster.AttackStartedTime = 0f;
-            monster.AttackCommitTime = 0f;
-            monster.AttackSoundTime = 0f;
-            monster.AttackEndTime = 0f;
+            monster.AttackStartTick = 0;
+            monster.AttackCommitTick = 0;
+            monster.AttackSoundTick = 0;
+            monster.AttackEndTick = 0;
             monster.AttackUseRaw = 0;
             monster.AttackCommitTargetX = 0f;
             monster.AttackCommitTargetY = 0f;
@@ -5409,9 +5423,9 @@ namespace DungeonRunners.Combat
         public void DelayMonsterAttackRetry(Monster monster, string reason)
         {
             if (monster == null) return;
-            float cooldown = ResolveMonsterAttackCooldownSeconds(monster);
-            monster.LastAttackTime = GetCombatTime() + cooldown;
-            Debug.LogError($"[MON-ATTACK] retry delayed {monster.Name}#{monster.EntityId} reason={reason} cooldown={cooldown:F2}");
+            int cooldownTicks = ResolveMonsterAttackCooldownTicks(monster);
+            monster.NextAttackTick = (int)_combatTick + cooldownTicks;
+            Debug.LogError($"[MON-ATTACK] retry delayed {monster.Name}#{monster.EntityId} reason={reason} cooldownTicks={cooldownTicks}");
         }
 
         private bool ShouldLogFarTargetAction(Monster monster, float now)
@@ -5505,7 +5519,7 @@ namespace DungeonRunners.Combat
                 }
                 float dist = Distance2D(monster.PosX, monster.PosY, target.PosX, target.PosY);
                 bool attackPathClear = IsMonsterAttackPathClear(monster, target, $"{source}-target-clear");
-                if (monster.AttackCommitTime <= 0f)
+                if (monster.AttackCommitTick <= 0)
                 {
                     if (!attackPathClear)
                     {
@@ -5537,13 +5551,13 @@ namespace DungeonRunners.Combat
                     unsafeAttack = true;
                     continue;
                 }
-                if (monster.AttackSoundPending && clientNow >= monster.AttackSoundTime)
+                if (monster.AttackSoundPending && (int)_combatTick >= monster.AttackSoundTick)
                     ConsumeMonsterAttackSoundRng(monster);
-                if (clientNow < monster.AttackCommitTime)
+                if ((int)_combatTick < monster.AttackCommitTick)
                 {
                     hpWire = target.PlayerState.EntitySynchInfoHP;
                     unsafeAttack = true;
-                    Debug.LogError($"[PLAYER-HP-CLIENT-PENDING] {source} keeping current HP before client hit frame {monster.Name}#{monster.EntityId}->{target.Name} now={clientNow:F3} commit={monster.AttackCommitTime:F3} hp={hpWire / 256f:F2}");
+                    Debug.LogError($"[PLAYER-HP-CLIENT-PENDING] {source} keeping current HP before client hit frame {monster.Name}#{monster.EntityId}->{target.Name} nowTick={_combatTick} commitTick={monster.AttackCommitTick} hp={hpWire / 256f:F2}");
                     continue;
                 }
                 if (monster.AttackClientVisible && LastCompletedEntityUpdateTime < monster.AttackClientVisibleTime)
@@ -5556,8 +5570,8 @@ namespace DungeonRunners.Combat
                 if (monster.AttackSoundPending)
                     ConsumeMonsterAttackSoundRng(monster);
                 monster.AttackHitResolved = true;
-                if (monster.AttackEndTime < clientNow)
-                    monster.AttackEndTime = clientNow;
+                if (monster.AttackEndTick < (int)_combatTick)
+                    monster.AttackEndTick = (int)_combatTick;
 
                 if (!TryDeferMonsterProjectileImpact(monster, target, dist, "MON-DAMAGE-ENTITY-SYNCH-INFO", source, clientNow))
                     ResolveMonsterAttackDamage(monster, target, dist, "MON-DAMAGE-ENTITY-SYNCH-INFO", source);
@@ -5566,10 +5580,10 @@ namespace DungeonRunners.Combat
                 monster.AttackContactOnly = false;
                 monster.AttackSoundPending = false;
                 monster.AttackHitResolved = false;
-                monster.AttackStartedTime = 0f;
-                monster.AttackEndTime = 0f;
-                monster.AttackCommitTime = 0f;
-                monster.AttackSoundTime = 0f;
+                monster.AttackStartTick = 0;
+                monster.AttackEndTick = 0;
+                monster.AttackCommitTick = 0;
+                monster.AttackSoundTick = 0;
                 if (monster.IsAlive)
                     monster.State = MonsterState.Combat;
                 hpWire = target.PlayerState.EntitySynchInfoHP;
@@ -5582,7 +5596,11 @@ namespace DungeonRunners.Combat
         {
             if (monster == null || target == null) return false;
             float tolerance = monster.ClientSyncTolerance > 0f ? monster.ClientSyncTolerance : 10f;
-            return Distance2D(monster.AttackCommitTargetX, monster.AttackCommitTargetY, target.PosX, target.PosY) <= tolerance;
+            int tcx = Mathf.RoundToInt(target.PosX * 256f) - Mathf.RoundToInt(monster.AttackCommitTargetX * 256f);
+            int tcy = Mathf.RoundToInt(target.PosY * 256f) - Mathf.RoundToInt(monster.AttackCommitTargetY * 256f);
+            long distSqFixed8 = (((long)tcx * tcx) >> 8) + (((long)tcy * tcy) >> 8);
+            int tolFixed = Mathf.RoundToInt(tolerance * 256f);
+            return distSqFixed8 <= (((long)tolFixed * tolFixed) >> 8);
         }
 
         private bool HasCombatContact(Monster monster, CombatPlayer target)
@@ -5841,7 +5859,7 @@ namespace DungeonRunners.Combat
         }
 
 
-        private static DamageQueryResult ApplyPlayerDamageQueryWire(uint damageWire, CombatPlayer target, Monster attacker, int damageTypeId, byte damageKind, float clientDamageTime, string source, int attackerLevel, MersenneTwister rng)
+        private static DamageQueryResult ApplyPlayerDamageQueryWire(uint damageWire, CombatPlayer target, Monster attacker, int damageTypeId, byte damageKind, float clientDamageTime, string source, int attackerLevel, MersenneTwister rng, bool resistable)
         {
             PlayerState state = target?.PlayerState;
             var result = new DamageQueryResult
@@ -5874,6 +5892,9 @@ namespace DungeonRunners.Combat
             }
 
             if (result.AdjustedDamageWire == 0 || target == null)
+                return result;
+
+            if (!resistable)
                 return result;
 
             DamageResistResult resist = CheckPlayerDamageResist(target, attacker, damageKind, damageTypeId, 0x100, attackerLevel, rng, out int resistChanceWire, out uint resistRaw, source);
@@ -6049,27 +6070,6 @@ namespace DungeonRunners.Combat
             return DamageResolver.ResolveHitThreshold(attackRating, defenseRating, attackerLevel, defenderLevel);
         }
 
-        private uint ResolveMonsterDamageWire(Monster monster, uint damageRaw, out int minDamage, out int maxDamage, out int averageDamage)
-        {
-            float baseDamage = ResolveMonsterDamageTable(monster.Level);
-            float damageMod = ResolveMonsterDamageModifier(monster);
-            float weaponScale = monster.WeaponDamage > 0f ? monster.WeaponDamage : 1f;
-            float damage = baseDamage * damageMod * weaponScale;
-            int normalized = Mathf.RoundToInt(Mathf.Max(1f, damage) * 256f);
-            if (normalized < 0x100) normalized = 0x100;
-
-            int volatility = DamageResolver.FromFloat(Mathf.Clamp(monster.DamageVolatility, 0f, 0.95f));
-            int spread = DamageResolver.FixedMul(normalized, volatility);
-            minDamage = DamageResolver.RoundFixed32(normalized - spread);
-            maxDamage = DamageResolver.RoundFixed32(normalized + spread);
-            if (minDamage < 0x100) minDamage = 0x100;
-            if (maxDamage < 0x100) maxDamage = 0x100;
-            if (maxDamage < minDamage) maxDamage = minDamage;
-
-            averageDamage = normalized;
-            return (uint)DamageResolver.RollDamageRange(minDamage, maxDamage, damageRaw);
-        }
-
         private WeaponDamageInput CreateMonsterWeaponDamageInput(Monster monster, CombatPlayer target, MersenneTwister rng, string source)
         {
             int attackerLevel = monster != null ? Mathf.Clamp(monster.Level, 0, 110) : 1;
@@ -6209,6 +6209,23 @@ namespace DungeonRunners.Combat
         {
             float clientNow = GetCombatTime();
             target.PlayerState.AdvanceEntitySynchInfoHP(clientNow, $"{marker}-pre-damage");
+            float clientVisibleMonsterX = monster.PosX, clientVisibleMonsterY = monster.PosY;
+            TryGetMonsterClientVisiblePosition(monster, clientNow, out clientVisibleMonsterX, out clientVisibleMonsterY);
+            float monsterAttackRange = ResolveMonsterEffectiveAttackRange(monster);
+            bool projectileImpact = source != null && source.IndexOf("projectile", StringComparison.OrdinalIgnoreCase) >= 0;
+            long clientVisibleDistSqFixed8 = 0, clientVisibleRangeSqFixed8 = 0;
+            float clientVisibleAttackDist = 0f;
+            bool clientVisibleInContact = true;
+            if (monsterAttackRange > 0f)
+                clientVisibleInContact = EvaluateUseTargetInitUse(clientVisibleMonsterX, clientVisibleMonsterY, target.PosX, target.PosY, monsterAttackRange, CLIENT_CONTACT_RANGE_EPSILON, out clientVisibleAttackDist, out clientVisibleDistSqFixed8, out clientVisibleRangeSqFixed8);
+            DungeonRunners.Core.RuntimeEvidence.LogForPlayer(target.Name, "[MON-HIT]", $"monster={monster.Name}#{monster.EntityId} dist={dist:F1} cvDistSq={clientVisibleDistSqFixed8} rangeSq={clientVisibleRangeSqFixed8} cvMon=({clientVisibleMonsterX:F1},{clientVisibleMonsterY:F1}) avatar=({target.PosX:F1},{target.PosY:F1}) attackRange={monsterAttackRange:F1} inContact={clientVisibleInContact} projectile={projectileImpact} targetHp={target.PlayerState.CurrentHPWire} source={source ?? marker}");
+            if (!projectileImpact && !clientVisibleInContact)
+            {
+                DungeonRunners.Core.RuntimeEvidence.LogForPlayer(target.Name, "[MON-HIT-SKIP]", $"monster={monster.Name}#{monster.EntityId} cvDistSq={clientVisibleDistSqFixed8} rangeSq={clientVisibleRangeSqFixed8} attackRange={monsterAttackRange:F1} reason=client-visible-out-of-contact source={source ?? marker}");
+                ClearMonsterCombatContact(monster, target);
+                OnMonsterAttackResolved?.Invoke(monster, target, false, target.PlayerState.CurrentHPWire);
+                return;
+            }
             if (TryApplyMonsterActiveSkillEffect(monster, target, clientNow, dist, marker, source, out bool activeSkillHandled, out bool activeSkillHPShifted))
             {
                 target.IsAlive = target.PlayerState.CurrentHPWire > 0;
@@ -6252,7 +6269,7 @@ namespace DungeonRunners.Combat
                 int maxDamage = damageResult.MaxDamageF32;
                 int averageDamage = (minDamage + maxDamage) / 2;
                 uint currentHPWire = target.PlayerState.CurrentHPWire;
-                DamageQueryResult query = ApplyPlayerDamageQueryWire(damageWire, target, monster, damageResult.DamageTypeId, 0, clientNow, source ?? marker, attackerLevel, rng);
+                DamageQueryResult query = ApplyPlayerDamageQueryWire(damageWire, target, monster, damageResult.DamageTypeId, 0, clientNow, source ?? marker, attackerLevel, rng, false);
                 uint adjustedDamageWire = query.AdjustedDamageWire;
                 if (adjustedDamageWire == 0)
                 {
@@ -6559,7 +6576,7 @@ namespace DungeonRunners.Combat
             if (damageResult.IsHit && !damageResult.IsBlocked)
             {
                 uint damageWire = damageResult.DamageWire;
-                DamageQueryResult query = ApplyPlayerDamageQueryWire(damageWire, target, monster, damageResult.DamageTypeId, 0, clientNow, source ?? marker ?? "SpellWeaponDamageEffect", damageResult.AttackerLevel, rng);
+                DamageQueryResult query = ApplyPlayerDamageQueryWire(damageWire, target, monster, damageResult.DamageTypeId, 0, clientNow, source ?? marker ?? "SpellWeaponDamageEffect", damageResult.AttackerLevel, rng, true);
                 uint adjustedDamageWire = query.AdjustedDamageWire;
                 if (adjustedDamageWire == 0)
                 {
@@ -7199,7 +7216,7 @@ namespace DungeonRunners.Combat
             ApplyEncounterMirror(monster);
             uint hp = PeekMonsterHPWireForTrace(monster);
             string targetText = target != null ? $"{target.Name}#{target.EntityId}" : (monster.TargetId != 0 ? monster.TargetId.ToString() : "none");
-            string signature = $"{monster.State}|{monster.IsAlive}|{monster.AggroTriggered}|{monster.TargetId}|{monster.AlertSourceEntityId}|{monster.AttackPending}|{monster.AttackClientVisible}|{monster.AttackContactOnly}|{monster.AttackHitResolved}|{monster.UsePrimaryActiveSkillThisAttack}|{monster.DeathPendingClientConfirmation}|{monster.DeathState}|{hp}|{monster.CurrentManaWire}|{Mathf.RoundToInt(monster.PosX * 10f)}|{Mathf.RoundToInt(monster.PosY * 10f)}|{monster.CombatContactTargetId}|{Mathf.RoundToInt(monster.AttackCommitTime * 1000f)}|{Mathf.RoundToInt(monster.AttackEndTime * 1000f)}|{monster.PrimaryActiveSkillCooldownRemainingTicks}";
+            string signature = $"{monster.State}|{monster.IsAlive}|{monster.AggroTriggered}|{monster.TargetId}|{monster.AlertSourceEntityId}|{monster.AttackPending}|{monster.AttackClientVisible}|{monster.AttackContactOnly}|{monster.AttackHitResolved}|{monster.UsePrimaryActiveSkillThisAttack}|{monster.DeathPendingClientConfirmation}|{monster.DeathState}|{hp}|{monster.CurrentManaWire}|{Mathf.RoundToInt(monster.PosX * 10f)}|{Mathf.RoundToInt(monster.PosY * 10f)}|{monster.CombatContactTargetId}|{monster.AttackCommitTick}|{monster.AttackEndTick}|{monster.PrimaryActiveSkillCooldownRemainingTicks}";
             if (_monsterStateTraceSignatures.TryGetValue(monster.EntityId, out var previous) && previous == signature)
                 return;
 
@@ -7210,7 +7227,7 @@ namespace DungeonRunners.Combat
             string instance = runtime?.InstanceKey ?? monster.InstanceKey ?? "<missing>";
             uint seed = runtime?.Seed ?? 0u;
             int rngPos = runtime?.RngCallsSinceReseed ?? -1;
-            Debug.LogError($"[MON-STATE] phase={phase ?? "unknown"} monster={monster.Name}#{monster.EntityId} behavior={monster.BehaviorId} unit={monster.UnitId} gc='{monster.GCType}' spawnGc='{monster.SpawnGCType}' zone='{monster.ZoneName}' instance='{instance}' state={monster.State} clientState={monster.Ai?.StateId ?? 0} clientMessage={monster.Ai?.LastMessageId ?? 0} encounterState={monster.EncounterObjectState} encounterLive={monster.EncounterLiveUnitCount} encounterReturning={monster.EncounterReturningUnitCount} alive={monster.IsAlive} aggro={monster.AggroTriggered} target={targetText} alertSource={monster.AlertSourceEntityId} deathPending={monster.DeathPendingClientConfirmation} clientDeath={monster.DeathState} hp={hp}/{monster.MaxHPWire} mana={monster.CurrentManaWire}/{monster.MaxManaWire} pos=({monster.PosX:F1},{monster.PosY:F1},{monster.PosZ:F1}) dist={distText} range={rangeText} pending={monster.AttackPending} clientVisible={monster.AttackClientVisible} clientContactOnly={monster.AttackContactOnly} hitResolved={monster.AttackHitResolved} session={monster.AttackSessionId} commit={monster.AttackCommitTime:F3} end={monster.AttackEndTime:F3} contactTarget={monster.CombatContactTargetId} contactUntil={monster.CombatContactUntil:F3} skill={monster.PrimaryActiveSkillPath ?? "none"} useSkill={monster.UsePrimaryActiveSkillThisAttack} skillCd={monster.PrimaryActiveSkillCooldownRemainingTicks}/{monster.PrimaryActiveSkillCooldownTicks} rngSeed=0x{seed:X8} rngPos={rngPos} reason={reason ?? "state-change"}");
+            if (VerboseMonsterDiag) Debug.LogError($"[MON-STATE] phase={phase ?? "unknown"} monster={monster.Name}#{monster.EntityId} behavior={monster.BehaviorId} unit={monster.UnitId} gc='{monster.GCType}' spawnGc='{monster.SpawnGCType}' zone='{monster.ZoneName}' instance='{instance}' state={monster.State} clientState={monster.Ai?.StateId ?? 0} clientMessage={monster.Ai?.LastMessageId ?? 0} encounterState={monster.EncounterObjectState} encounterLive={monster.EncounterLiveUnitCount} encounterReturning={monster.EncounterReturningUnitCount} alive={monster.IsAlive} aggro={monster.AggroTriggered} target={targetText} alertSource={monster.AlertSourceEntityId} deathPending={monster.DeathPendingClientConfirmation} clientDeath={monster.DeathState} hp={hp}/{monster.MaxHPWire} mana={monster.CurrentManaWire}/{monster.MaxManaWire} pos=({monster.PosX:F1},{monster.PosY:F1},{monster.PosZ:F1}) dist={distText} range={rangeText} pending={monster.AttackPending} clientVisible={monster.AttackClientVisible} clientContactOnly={monster.AttackContactOnly} hitResolved={monster.AttackHitResolved} session={monster.AttackSessionId} commitTick={monster.AttackCommitTick} endTick={monster.AttackEndTick} contactTarget={monster.CombatContactTargetId} contactUntil={monster.CombatContactUntil:F3} skill={monster.PrimaryActiveSkillPath ?? "none"} useSkill={monster.UsePrimaryActiveSkillThisAttack} skillCd={monster.PrimaryActiveSkillCooldownRemainingTicks}/{monster.PrimaryActiveSkillCooldownTicks} rngSeed=0x{seed:X8} rngPos={rngPos} reason={reason ?? "state-change"}");
         }
 
         private void TraceCombatTick(string phase, float deltaTime, bool allowNewAttacks, Monster onlyMonster = null)
@@ -7321,7 +7338,7 @@ namespace DungeonRunners.Combat
                     string verdict = !inRange
                         ? "OUT-OF-RANGE:position-divergence"
                         : (!closestAnyReach ? "IN-RANGE-NO-PATH:pathmap" : "IN-RANGE-NO-ADMIT:gate");
-                    Debug.LogError($"[AGGRO-DETAIL] no-admit {monster.Name}#{monster.EntityId} monsterPos=({monsterX:F1},{monsterY:F1},{monster.PosZ:F1}) closestPlayerDist={closestDist:F1} aggroRange={range:F1} inRange={inRange} reach={closestAnyReach} pathMap={(pathMap != null)} verdict={verdict} sourceFunction=AgroRange-scan");
+                    if (VerboseMonsterDiag) Debug.LogError($"[AGGRO-DETAIL] no-admit {monster.Name}#{monster.EntityId} monsterPos=({monsterX:F1},{monsterY:F1},{monster.PosZ:F1}) closestPlayerDist={closestDist:F1} aggroRange={range:F1} inRange={inRange} reach={closestAnyReach} pathMap={(pathMap != null)} verdict={verdict} sourceFunction=AgroRange-scan");
                 }
             }
         }
@@ -7365,14 +7382,20 @@ namespace DungeonRunners.Combat
                 if (!_players.TryGetValue(monster.TargetId, out var target) || target == null || !target.IsAlive || target.PlayerState == null) continue;
                 if (target.PlayerState.CurrentHPWire == 0 && target.PlayerState.EntitySynchInfoHP == 0) continue;
                 if (IsMonsterKnockDownActive(monster, clientNow, "movement")) continue;
-                if (monster.AttackPending) continue;
+                if (monster.AttackPending)
+                {
+                    if (emitPositionChanged)
+                        OnMonsterPositionChanged?.Invoke(monster);
+                    continue;
+                }
 
                 if (monster.LeashRange > 0f)
                 {
                     TryGetMonsterClientVisiblePosition(monster, clientNow, out float mlx, out float mly);
-                    float lhx = mlx - monster.SpawnPosX;
-                    float lhy = mly - monster.SpawnPosY;
-                    if (lhx * lhx + lhy * lhy > monster.LeashRange * monster.LeashRange)
+                    int lhx = Mathf.RoundToInt(mlx * 256f) - Mathf.RoundToInt(monster.SpawnPosX * 256f);
+                    int lhy = Mathf.RoundToInt(mly * 256f) - Mathf.RoundToInt(monster.SpawnPosY * 256f);
+                    long leashSq = ((long)Mathf.RoundToInt(monster.LeashRange * 256f) * Mathf.RoundToInt(monster.LeashRange * 256f)) >> 8;
+                    if ((((long)lhx * lhx) >> 8) + (((long)lhy * lhy) >> 8) > leashSq)
                     {
                         ClearMonsterCombatContact(monster, target);
                         monster.MeleeScanTargetId = 0;
@@ -7432,12 +7455,13 @@ namespace DungeonRunners.Combat
                     continue;
                 }
 
-                int curFixedX = (int)Math.Round(monster.PosX * UnitMover.Fixed);
-                int curFixedY = (int)Math.Round(monster.PosY * UnitMover.Fixed);
+                int curFixedX = monster.PosFixedX;
+                int curFixedY = monster.PosFixedY;
                 int targetFixedX = (int)Math.Round(target.PosX * UnitMover.Fixed);
                 int targetFixedY = (int)Math.Round(target.PosY * UnitMover.Fixed);
                 int rangeFixed = (int)Math.Round(allowedRange * UnitMover.Fixed);
-                int stepFixed = (int)Math.Round(speed * UnitMover.Fixed / 30f);
+                int speedFixed = (int)Math.Round(speed * UnitMover.Fixed);
+                int stepFixed = (int)(((long)speedFixed << 8) / 0x1e00);
                 if (stepFixed < 1) stepFixed = 1;
                 int chaseTurnRate = UnitMover.TurnRatePerTickFixed(monster.TurnRateDegrees);
                 if (!monster.ChaseHeadingInit)
@@ -7463,16 +7487,18 @@ namespace DungeonRunners.Combat
                     curFixedY = nextFixedY;
                     monster.ChaseHeadingFixed = nextHeading;
                 }
-                monster.PosX = curFixedX / (float)UnitMover.Fixed;
-                monster.PosY = curFixedY / (float)UnitMover.Fixed;
+                monster.PosFixedX = curFixedX;
+                monster.PosFixedY = curFixedY;
                 monster.PosZ = ResolveTerrainHeight(monster, monster.PosX, monster.PosY, monster.PosZ);
                 monster.Heading = UnitMover.WrapDegrees((UnitMover.FullCircleFixed - monster.ChaseHeadingFixed) >> 8);
                 monster.State = MonsterState.Chase;
 
-                float chaseDx = target.PosX - monster.PosX;
-                float chaseDy = target.PosY - monster.PosY;
-                float remaining = Mathf.Sqrt(chaseDx * chaseDx + chaseDy * chaseDy);
-                if (remaining <= allowedRange + CLIENT_CONTACT_RANGE_EPSILON)
+                long chaseRdx = (long)targetFixedX - curFixedX;
+                long chaseRdy = (long)targetFixedY - curFixedY;
+                int remainingFixed = UnitMover.IntSqrt(chaseRdx * chaseRdx + chaseRdy * chaseRdy);
+                int contactRangeFixed = rangeFixed + (int)Math.Round(CLIENT_CONTACT_RANGE_EPSILON * UnitMover.Fixed);
+                float remaining = remainingFixed / (float)UnitMover.Fixed;
+                if (remainingFixed <= contactRangeFixed)
                 {
                     monster.State = MonsterState.Combat;
                     monster.CombatContactTargetId = target.EntityId;
@@ -7568,6 +7594,7 @@ namespace DungeonRunners.Combat
                 return;
 
             float now = GetCombatTime();
+            TryGetMonsterClientVisiblePosition(monster, now, out float skillMonX, out float skillMonY);
             if (skillList != null && skillList.Count > 0)
             {
                 foreach (var skill in skillList)
@@ -7608,7 +7635,7 @@ namespace DungeonRunners.Combat
                         targetHealthBlocked++;
                         continue;
                     }
-                    float candidateRange = ResolveMonsterActiveSkillUseRange(skill, fallbackRange);
+                    float candidateRange = ResolveMonsterActiveSkillUseRange(skill, fallbackRange) + monster.CollisionRadius + ResolveAvatarCombatRadius();
                     float minimumRange = ResolveMonsterActiveSkillMinimumRange(skill);
                     if (skill.CooldownRemainingTicks > 0)
                     {
@@ -7620,7 +7647,7 @@ namespace DungeonRunners.Combat
                         minimumRangeBlocked++;
                         continue;
                     }
-                    if (dist > candidateRange + CLIENT_CONTACT_RANGE_EPSILON)
+                    if (target == null || !EvaluateUseTargetInitUse(skillMonX, skillMonY, target.PosX, target.PosY, candidateRange, CLIENT_CONTACT_RANGE_EPSILON, out _, out _, out _))
                     {
                         rangeBlocked++;
                         continue;
@@ -7643,9 +7670,10 @@ namespace DungeonRunners.Combat
                 return;
             }
 
-            float skillRange = monster.PrimaryActiveSkillSpellUseRange > 0f
+            float skillRange = (monster.PrimaryActiveSkillSpellUseRange > 0f
                 ? monster.PrimaryActiveSkillSpellUseRange
-                : (monster.PrimaryActiveSkillRange > 0f ? monster.PrimaryActiveSkillRange : fallbackRange);
+                : (monster.PrimaryActiveSkillRange > 0f ? monster.PrimaryActiveSkillRange : fallbackRange))
+                + monster.CollisionRadius + ResolveAvatarCombatRadius();
             float skillMinimumRange = monster.PrimaryActiveSkillMinimumRange;
             if (!IsCombatSpellUse(monster.PrimaryActiveSkillSpellUse))
             {
@@ -7677,7 +7705,7 @@ namespace DungeonRunners.Combat
                 Debug.LogError($"[MON-SKILL] validate skip=min-range {monster.Name}#{monster.EntityId}->{target?.Name ?? "unknown"} skill={monster.PrimaryActiveSkillPath} dist={dist:F1} minRange={skillMinimumRange:F1} range={skillRange:F1} source={source}");
                 return;
             }
-            if (dist > skillRange + CLIENT_CONTACT_RANGE_EPSILON)
+            if (target == null || !EvaluateUseTargetInitUse(skillMonX, skillMonY, target.PosX, target.PosY, skillRange, CLIENT_CONTACT_RANGE_EPSILON, out _, out _, out _))
             {
                 Debug.LogError($"[MON-SKILL] validate skip=range {monster.Name}#{monster.EntityId}->{target?.Name ?? "unknown"} skill={monster.PrimaryActiveSkillPath} dist={dist:F1} range={skillRange:F1} source={source}");
                 return;
@@ -7834,7 +7862,7 @@ namespace DungeonRunners.Combat
                 AdvanceMonsterPrimarySkillCooldown(monster, now);
                 TryAssistFromAlertSource(monster, "attack-loop");
                 bool pendingClientVisibleAttack = monster.AttackPending && monster.AttackClientVisible;
-                bool pendingRuntimeAttack = monster.AttackPending && monster.AttackCommitTime > 0f;
+                bool pendingRuntimeAttack = monster.AttackPending && monster.AttackCommitTick > 0;
                 if (!monster.AggroTriggered) continue;
                 if (monster.DeathPendingClientConfirmation
                     && !(pendingRuntimeAttack && monster.AttackContactOnly && !monster.AttackHitResolved))
@@ -7847,10 +7875,10 @@ namespace DungeonRunners.Combat
                     monster.AttackPending = false;
                     monster.AttackSoundPending = false;
                     monster.AttackHitResolved = false;
-                    monster.AttackStartedTime = 0f;
-                    monster.AttackEndTime = 0f;
-                    monster.AttackCommitTime = 0f;
-                    monster.AttackSoundTime = 0f;
+                    monster.AttackStartTick = 0;
+                    monster.AttackEndTick = 0;
+                    monster.AttackCommitTick = 0;
+                    monster.AttackSoundTick = 0;
                     continue;
                 }
                 if (playerEntityId != 0 && monster.TargetId != playerEntityId) continue;
@@ -7886,7 +7914,7 @@ namespace DungeonRunners.Combat
 
                 if (monster.AttackPending)
                 {
-                    if (monster.AttackCommitTime <= 0f)
+                    if (monster.AttackCommitTick <= 0)
                     {
                         if (!attackPathClear)
                         {
@@ -7929,29 +7957,29 @@ namespace DungeonRunners.Combat
                     }
                     if (monster.AttackHitResolved)
                     {
-                        if (now < monster.AttackEndTime) continue;
+                        if ((int)_combatTick < monster.AttackEndTick) continue;
                         monster.AttackPending = false;
                         monster.AttackClientVisible = false;
                         monster.AttackContactOnly = false;
                         monster.AttackSoundPending = false;
                         monster.AttackHitResolved = false;
-                        monster.AttackStartedTime = 0f;
-                        monster.AttackEndTime = 0f;
-                        monster.AttackCommitTime = 0f;
-                        monster.AttackSoundTime = 0f;
+                        monster.AttackStartTick = 0;
+                        monster.AttackEndTick = 0;
+                        monster.AttackCommitTick = 0;
+                        monster.AttackSoundTick = 0;
                         if (monster.IsAlive)
                             monster.State = MonsterState.Combat;
                         TraceMonsterState(monster, "attack-complete", target, dist, allowedRange, "end");
                         continue;
                     }
-                    if (monster.AttackSoundPending && now >= monster.AttackSoundTime)
+                    if (monster.AttackSoundPending && (int)_combatTick >= monster.AttackSoundTick)
                         ConsumeMonsterAttackSoundRng(monster);
-                    if (now < monster.AttackCommitTime) continue;
+                    if ((int)_combatTick < monster.AttackCommitTick) continue;
                     if (monster.AttackSoundPending)
                         ConsumeMonsterAttackSoundRng(monster);
                     monster.AttackHitResolved = true;
-                    if (monster.AttackEndTime < now)
-                        monster.AttackEndTime = now;
+                    if (monster.AttackEndTick < (int)_combatTick)
+                        monster.AttackEndTick = (int)_combatTick;
                     WeaponUseRuntime.Instance.DrainDueProjectileImpactsForPlayer(target.EntityId, GetRoomRngForMonster(monster), now, "MON-DAMAGE-subentity-first");
                     if (!monster.IsAlive)
                     {
@@ -7987,7 +8015,7 @@ namespace DungeonRunners.Combat
                             monster.State = MonsterState.Chase;
                         continue;
                     }
-                    if (now < monster.LastAttackTime) continue;
+                    if ((int)_combatTick < monster.NextAttackTick) continue;
                     monster.AttackPending = true;
                     monster.AttackClientVisible = false;
                     monster.AttackContactOnly = false;
@@ -7996,10 +8024,10 @@ namespace DungeonRunners.Combat
                     monster.AttackSoundGateRaw = 0;
                     monster.AttackSoundRepeatRaw = 0;
                     monster.AttackUseRaw = 0;
-                    monster.AttackStartedTime = now;
-                    monster.AttackCommitTime = 0f;
-                    monster.AttackSoundTime = 0f;
-                    monster.AttackEndTime = 0f;
+                    monster.AttackStartTick = (int)_combatTick;
+                    monster.AttackCommitTick = 0;
+                    monster.AttackSoundTick = 0;
+                    monster.AttackEndTick = 0;
                     monster.AttackSoundPending = false;
                     monster.AttackCommitTargetX = target.PosX;
                     monster.AttackCommitTargetY = target.PosY;
@@ -8034,21 +8062,22 @@ namespace DungeonRunners.Combat
             float now = clientNow >= 0f ? clientNow : GetCombatTime();
             if (IsMonsterKnockDownActive(monster, now, "attack-arm"))
                 return;
-            if (monster.AttackStartedTime <= 0f)
-                monster.AttackStartedTime = now;
-            if (monster.AttackCommitTime > 0f)
+            int nowTick = (int)_combatTick;
+            if (monster.AttackStartTick <= 0)
+                monster.AttackStartTick = nowTick;
+            if (monster.AttackCommitTick > 0)
                 return;
             AdvanceMonsterAttackAnimation(monster);
-            float windup = ResolveMonsterAttackWindup(monster);
+            int hitTicks = ResolveMonsterAttackWindupTicks(monster);
             ResolveMonsterAttackAnimationFrames(monster, out int totalFrames, out int hitFrame, out int soundFrame);
-            float startTime = monster.AttackStartedTime > 0f ? monster.AttackStartedTime : now;
-            monster.AttackCommitTime = startTime + windup;
-            monster.AttackSoundTime = startTime + ResolveMonsterAttackSoundDelay(monster, windup);
-            monster.AttackEndTime = startTime + Mathf.Max(windup, ResolveMonsterAttackFrameSeconds(monster, totalFrames));
-            monster.LastAttackTime = startTime + ResolveMonsterAttackCooldownSeconds(monster);
+            int startTick = monster.AttackStartTick > 0 ? monster.AttackStartTick : nowTick;
+            monster.AttackCommitTick = startTick + hitTicks;
+            monster.AttackSoundTick = startTick + ResolveMonsterAttackSoundDelayTicks(monster, hitTicks);
+            monster.AttackEndTick = startTick + Mathf.Max(hitTicks, ResolveMonsterAttackTotalTicks(monster));
+            monster.NextAttackTick = startTick + ResolveMonsterAttackCooldownTicks(monster);
             monster.AttackHitResolved = false;
             monster.AttackSoundPending = monster.HasAttackSound || monster.AttackWeaponSoundCount > 0 || monster.AttackRepeatSoundCount > 0;
-            Debug.LogError($"[MON-ATTACK] {monster.Name}->{target.Name} {marker} anim={monster.AttackAnimationIndex} session={monster.AttackSessionId} use=0x{monster.AttackUseRaw:X8} frames={totalFrames}/{hitFrame}/{soundFrame} soundAt={monster.AttackSoundTime:F3} hitAt={monster.AttackCommitTime:F3} endAt={monster.AttackEndTime:F3} weaponSounds={monster.AttackWeaponSoundCount} attackSounds={monster.AttackRepeatSoundCount}");
+            Debug.LogError($"[MON-ATTACK] {monster.Name}->{target.Name} {marker} anim={monster.AttackAnimationIndex} session={monster.AttackSessionId} use=0x{monster.AttackUseRaw:X8} frames={totalFrames}/{hitFrame}/{soundFrame} soundAtTick={monster.AttackSoundTick} hitAtTick={monster.AttackCommitTick} endAtTick={monster.AttackEndTick} weaponSounds={monster.AttackWeaponSoundCount} attackSounds={monster.AttackRepeatSoundCount}");
             TraceMonsterState(monster, "attack-arm", target, -1f, ResolveMonsterEffectiveAttackRange(monster), marker);
         }
 

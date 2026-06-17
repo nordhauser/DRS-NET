@@ -90,19 +90,6 @@ namespace DungeonRunners.Utilities
             return new Fixed32(raw);
         }
 
-        public static Fixed32 HeadingFromVector(int dxRaw, int dyRaw)
-        {
-            if (dxRaw == 0 && dyRaw == 0) return Fixed32.Zero;
-
-            double radians = System.Math.Atan2(dxRaw, dyRaw);
-            double degrees = radians * 180.0 / System.Math.PI;
-            if (degrees < 0) degrees += 360.0;
-            int degIdx = (360 - (int)System.Math.Round(degrees)) % 360;
-            if (degIdx < 0) degIdx += 360;
-            return new Fixed32(degIdx << 8);
-        }
-
-
         internal static readonly int[] SIN_TABLE = new int[] {
                0,    4,    8,   13,   17,   22,   26,   31,   35,   40,   44,   48,
               53,   57,   61,   66,   70,   74,   79,   83,   87,   91,   95,  100,

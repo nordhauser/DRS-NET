@@ -308,7 +308,6 @@ namespace DungeonRunners.Combat
             if (currentHPWire > monster.MaxHPWire) currentHPWire = monster.MaxHPWire;
             uint currentManaWire = monster.MaxManaWire > 0 ? Math.Min(monster.CurrentManaWire, monster.MaxManaWire) : monster.CurrentManaWire;
 
-            writer.WriteByte(0x07);
             writer.WriteByte(0x02);
             writer.WriteUInt16((ushort)monster.EntityId);
             writer.WriteUInt32(0x06);
@@ -328,7 +327,6 @@ namespace DungeonRunners.Combat
             writer.WriteUInt32(0);
             writer.WriteUInt32(0);
             writer.WriteUInt32(0);
-            writer.WriteByte(0x06);
             return writer.ToArray();
         }
 
@@ -387,11 +385,9 @@ namespace DungeonRunners.Combat
 
 
 
-        public static byte[] BuildMonsterMovePacket(uint entityId, uint behaviorId, float targetX, float targetY, int headingWire, ResolvedEntitySynchInfo entitySynchInfo, bool beginEndStream = true)
+        public static byte[] BuildMonsterMovePacket(uint entityId, uint behaviorId, int fxWire, int fyWire, int headingWire, ResolvedEntitySynchInfo entitySynchInfo, bool beginEndStream = true)
         {
             var writer = new LEWriter();
-            int fx = (int)(targetX * 256f);
-            int fy = (int)(targetY * 256f);
 
             if (beginEndStream)
                 writer.WriteByte(0x07);
@@ -403,39 +399,14 @@ namespace DungeonRunners.Combat
             writer.WriteByte(0x01);
             writer.WriteByte(0x03);
             writer.WriteInt32(headingWire);
-            writer.WriteInt32(fx);
-            writer.WriteInt32(fy);
+            writer.WriteInt32(fxWire);
+            writer.WriteInt32(fyWire);
 
             WriteResolvedEntitySynchInfo(writer, "MON-MOVE", "Monster", entitySynchInfo, true);
 
             if (beginEndStream)
                 writer.WriteByte(0x06);
 
-            return writer.ToArray();
-        }
-
-        public static byte[] BuildProcessUpdateComponent(ushort componentId, byte entitySynchInfoFlags, uint entitySynchInfoHPWire)
-        {
-            RejectRawAliveHPSuffix("PROCESS-UPDATE-COMPONENT", entitySynchInfoFlags);
-            var writer = new LEWriter();
-            writer.WriteByte(0x07);
-            writer.WriteByte(0x36);
-            writer.WriteUInt16(componentId);
-            WriteEntitySynchInfo(writer, "PROCESS-UPDATE-COMPONENT", "Unknown", 0, componentId, 0x00, entitySynchInfoFlags, entitySynchInfoHPWire, false);
-            writer.WriteByte(0x06);
-            return writer.ToArray();
-        }
-        public static byte[] BuildEnableClientControl(uint behaviorId, bool enable, byte entitySynchInfoFlags, uint entitySynchInfoHPWire)
-        {
-            RejectRawAliveHPSuffix("ENABLE-CLIENT-CONTROL", entitySynchInfoFlags);
-            var writer = new LEWriter();
-            writer.WriteByte(0x07);
-            writer.WriteByte(0x35);
-            writer.WriteUInt16((ushort)behaviorId);
-            writer.WriteByte(0x64);
-            writer.WriteByte((byte)(enable ? 0x01 : 0x00));
-            WriteEntitySynchInfo(writer, "ENABLE-CLIENT-CONTROL", "Unknown", 0, behaviorId, 0x64, entitySynchInfoFlags, entitySynchInfoHPWire, false);
-            writer.WriteByte(0x06);
             return writer.ToArray();
         }
 

@@ -379,51 +379,18 @@ namespace DungeonRunners.Networking
             uint avatarId = GetPlayerAvatarId(conn.LoginName);
             if (avatarId == 0) return;
 
-            float now = Time.time;
+            if (moveCount == 0 || rawMoveData == null || rawMoveData.Length == 0) return;
 
-            bool forceRelay = false;
-            if (_forceRelayUntil.TryGetValue(conn.ConnId, out float deadline))
-            {
-                if (now < deadline)
-                    forceRelay = true;
-                else
-                    _forceRelayUntil.Remove(conn.ConnId);
-            }
-
-            bool hasInboundMoves = moveCount > 0 && rawMoveData != null && rawMoveData.Length > 0;
-            if (!forceRelay && !hasInboundMoves && now - conn.LastPositionUpdateTime < 0.033f) return;
-
-            conn.LastPositionUpdateTime = now;
+            conn.LastPositionUpdateTime = Time.time;
             conn.LastRelayPosX = conn.PlayerPosX;
             conn.LastRelayPosY = conn.PlayerPosY;
             conn.HasLastRelayPos = true;
+            conn.LastRawMoveData = rawMoveData;
+            conn.LastRawMoveCount = moveCount;
 
             byte relayMoveCount = moveCount;
             byte[] relayData = rawMoveData;
-
-            if (moveCount > 0 && rawMoveData != null && rawMoveData.Length > 0)
-            {
-                conn.LastRawMoveData = rawMoveData;
-                conn.LastRawMoveCount = moveCount;
-                _stopSignalSent.Remove(conn.LoginName);
-            }
-            else
-            {
-                if (_stopSignalSent.Contains(conn.LoginName)) return;
-                if (conn.LastRawMoveData == null) return;
-                relayMoveCount = conn.LastRawMoveCount != 0 ? conn.LastRawMoveCount : (byte)1;
-                relayData = conn.LastRawMoveData;
-                _stopSignalSent.Add(conn.LoginName);
-            }
-
             if (!TryNormalizeUnitMoverUpdateData(relayMoveCount, relayData, out relayMoveCount, out relayData)) return;
-            if (relayMoveCount > 1)
-            {
-                var latestRecord = new byte[13];
-                Buffer.BlockCopy(relayData, (relayMoveCount - 1) * 13, latestRecord, 0, 13);
-                relayMoveCount = 1;
-                relayData = latestRecord;
-            }
 
             foreach (var other in _connections.Values)
             {
@@ -445,6 +412,8 @@ namespace DungeonRunners.Networking
                 if (!TryWriteRemoteAvatarEntitySynchInfo(conn, remoteMoveMessage, remoteBehaviorId, 0x65, "MP-MOVE"))
                     continue;
                 other.MessageQueue.Enqueue(remoteMoveMessage.ToArray());
+                DungeonRunners.Core.RuntimeEvidence.LogForPlayerPair(conn.LoginName, other.LoginName, "[MP-MOVE]",
+                    $"remoteBehavior={remoteBehaviorId} moveCount={relayMoveCount} hp={GetPlayerState(conn.ConnId.ToString())?.EntitySynchInfoHP ?? 0} srcPos=({conn.PlayerPosX:F1},{conn.PlayerPosY:F1}) relayPos=({conn.LastRelayPosX:F1},{conn.LastRelayPosY:F1})");
             }
         }
         public void SendCompressedPublic(RRConnection conn, byte dest, byte messageType, byte[] data)

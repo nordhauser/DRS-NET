@@ -865,7 +865,7 @@ namespace DungeonRunners.Combat
                         fireSound = true;
                     }
                 }
-                else if (cycle.TickCounter >= GetSoundEventTick(cycle) - 1 && !cycle.ProcFired)
+                else if (cycle.TickCounter >= GetSoundEventTick(cycle) && !cycle.ProcFired)
                 {
                     cycle.ProcFired = true;
                     fireSound = true;
@@ -892,7 +892,7 @@ namespace DungeonRunners.Combat
                         fireHit = true;
                     }
                 }
-                else if (cycle.TickCounter >= GetHitEventTick(cycle) - 1 && !cycle.HitFired)
+                else if (cycle.TickCounter >= GetHitEventTick(cycle) && !cycle.HitFired)
                 {
                     cycle.HitFired = true;
                     fireHit = true;
@@ -2060,7 +2060,7 @@ namespace DungeonRunners.Combat
                 cycle.InitUseDistance = distance;
                 cycle.InitUseTolerance = tolerance;
                 float weaponRange = CombatRuntime.Instance.ResolvePlayerRangedWeaponUseRange(cycle.PlayerState);
-                bool clearShot = initUsePassed && HasPlayerClearShot(cycle, monsterX, monsterY);
+                bool clearShot = initUsePassed;
                 if (initUsePassed && !wasPassed)
                     Debug.LogError($"[USETARGET-INIT] target={cycle.Monster.EntityId} behavior={cycle.Monster.BehaviorId} component={cycle.UseTargetComponentId} session={cycle.UseTargetSessionId} dist={distance:F2} distSqFixed8={distanceSqFixed8} initUseRange={initUseRange:F1} tolerance={tolerance:F1} thresholdSqFixed8={thresholdSqFixed8} source={source} weaponRange={weaponRange:F1} clearShot={clearShot} result={(clearShot ? "use" : "moving")} rngBefore=-1 rngAfter=-1 sourceFunction=UseTarget::CheckInitUse+Unit::vtbl0xe8");
                 range = initUseRange;
@@ -2069,21 +2069,6 @@ namespace DungeonRunners.Combat
 
             range = CombatRuntime.Instance.ResolvePlayerMeleeContactRange(cycle.PlayerState, cycle.Monster);
             return range > 0f && distance <= range + CLIENT_CONTACT_RANGE_EPSILON;
-        }
-
-        private bool HasPlayerClearShot(WeaponUseState cycle, float monsterX, float monsterY)
-        {
-            if (cycle?.Connection == null || cycle.Monster == null || cycle.PlayerState == null)
-                return true;
-            string instanceKey = ResolveCycleInstanceKey(cycle, cycle.Monster, cycle.Connection, "ClearShot");
-            string zoneName = !string.IsNullOrWhiteSpace(cycle.Monster.ZoneName)
-                ? cycle.Monster.ZoneName
-                : cycle.Connection.CurrentZoneName;
-            float losZ = cycle.Monster.PosZ;
-            var start = new Vector3(cycle.Connection.PlayerPosX, cycle.Connection.PlayerPosY, losZ);
-            var end = new Vector3(monsterX, monsterY, losZ);
-            float radius = ProjectileRadiusFromAuthoredSize(Mathf.Max(0f, cycle.PlayerState.WeaponProjectileSize));
-            return WorldCollision.Instance.HasLineOfFire(zoneName, instanceKey, start, end, radius, out _);
         }
 
         public CompletedAttack DequeueKill()

@@ -12,10 +12,26 @@ namespace DungeonRunners.Combat
     {
 
         public static int FromInt(int n) => n << 8;
-        public static int FromFloat(float f) => (int)(f * 256f);
+        public static int FromFloat(float f) => EncodeFixed32(f);
         public static int ToInt(int f) => f >> 8;
         public static float ToFloat(int f) => f / 256f;
         public static int FixedMul(int a, int b) => (int)(((long)a * (long)b) >> 8);
+
+        public static int EncodeFixed32(float value)
+        {
+            int n = (int)(value * 256f);
+            if (n / 256f < value) n++;
+            return n;
+        }
+
+        public static int ResolvePerStatBonus(int stat, int rateF32, int statModF32, int pctMod)
+        {
+            if (stat < 0) stat = 0;
+            int innerMod = (int)(((long)statModF32 * (((pctMod + 100) * 0x10000) / 0x6400)) >> 8);
+            if (innerMod < 0) innerMod = 0;
+            int scaledRate = (int)(((long)rateF32 * innerMod) >> 8);
+            return (int)(((long)(stat << 8) * scaledRate) >> 8) >> 8;
+        }
 
         public static readonly WeaponDamageAddSlot[] WeaponDamageAddSlots =
         {
@@ -250,15 +266,6 @@ namespace DungeonRunners.Combat
             if (sum > int.MaxValue) return int.MaxValue;
             if (sum < int.MinValue) return int.MinValue;
             return (int)sum;
-        }
-
-        public static int ResolveMeleeDamageBonus(PlayerState state)
-        {
-            int strength = Math.Max(0, state?.Strength ?? 10);
-            var gc = GCDatabase.Instance;
-            float meleeDmgPerStr = gc.GetKnob("MeleeDamagePerStrength", 2.3364f);
-            int bonus = Mathf.FloorToInt(meleeDmgPerStr * strength);
-            return Math.Max(0, Math.Min(0xFFFF, bonus));
         }
 
         public static bool IsRangedWeapon(PlayerState state)
@@ -684,9 +691,9 @@ namespace DungeonRunners.Combat
         private static int ResolveUnitRangedDamageBonus(PlayerState state)
         {
             int agility = Math.Max(0, state?.Agility ?? 10);
-            float rangedDmgPerAgi = GCDatabase.Instance.GetKnob("RangedDamagePerAgility", 2.124f);
-            float rangedDmgMod = ResolveClassDamageStatMod(state, "RangedDamagePerAgilityMod", 1f);
-            int bonus = Mathf.FloorToInt(rangedDmgPerAgi * agility * rangedDmgMod);
+            int rateF32 = EncodeFixed32(GCDatabase.Instance.GetKnob("RangedDamagePerAgility", 2.124f));
+            int statModF32 = EncodeFixed32(ResolveClassDamageStatMod(state, "RangedDamagePerAgilityMod", 1f));
+            int bonus = ResolvePerStatBonus(agility, rateF32, statModF32, 0);
             bonus += GetEquipmentStat(state, "RANGE_DAMAGE_BONUS", "RANGED_DAMAGE_BONUS", "RANGEDAMAGEBONUS", "RANGEDDAMAGEBONUS");
             return bonus;
         }
@@ -694,9 +701,9 @@ namespace DungeonRunners.Combat
         private static int ResolveUnitMeleeCommonDamageBonus(PlayerState state)
         {
             int strength = Math.Max(0, state?.Strength ?? 10);
-            float meleeDmgPerStr = GCDatabase.Instance.GetKnob("MeleeDamagePerStrength", 2.3364f);
-            float meleeDmgMod = ResolveClassDamageStatMod(state, "MeleeDamagePerStrengthMod", 1f);
-            int bonus = Mathf.FloorToInt(meleeDmgPerStr * strength * meleeDmgMod);
+            int rateF32 = EncodeFixed32(GCDatabase.Instance.GetKnob("MeleeDamagePerStrength", 2.3364f));
+            int statModF32 = EncodeFixed32(ResolveClassDamageStatMod(state, "MeleeDamagePerStrengthMod", 1f));
+            int bonus = ResolvePerStatBonus(strength, rateF32, statModF32, 0);
             bonus += GetEquipmentStat(state, "MELEE_DAMAGE_BONUS", "MELEEDAMAGEBONUS");
             return bonus;
         }
@@ -837,7 +844,7 @@ namespace DungeonRunners.Combat
 
         public static int ResolveCriticalThreshold(PlayerState state, Monster defender)
         {
-            int baseCrit = Mathf.FloorToInt(GCDatabase.Instance.GetKnob("HeroCriticalChance", 3f));
+            int baseCrit = GCDatabase.Instance.GetKnobInt("HeroCriticalChance", 3);
             int threshold = baseCrit << 8;
             int attackerLevel = Math.Max(0, state?.Level ?? 1);
             int defenderLevel = Math.Max(0, defender?.Level ?? attackerLevel);
@@ -872,10 +879,10 @@ namespace DungeonRunners.Combat
         public static int ResolveAvatarAttackRating(PlayerState state)
         {
             if (state == null) return 0;
-            float attackPerAgility = GCDatabase.Instance.GetKnob("AttackRatingPerAgility", 14f);
-            int baseRating = Math.Max(0, Mathf.RoundToInt(state.Agility * attackPerAgility));
+            int rateF32 = EncodeFixed32(GCDatabase.Instance.GetKnob("AttackRatingPerAgility", 14f));
+            int statModF32 = EncodeFixed32(ResolveClassDamageStatMod(state, "AttackRatingPerAgilityMod", 1f));
             int modPercent = IsRangedWeapon(state) ? 0 : Math.Max(-100, state.MeleeAttackRatingModPercent);
-            return Math.Max(0, (baseRating * (100 + modPercent)) / 100);
+            return Math.Max(0, ResolvePerStatBonus(state.Agility, rateF32, statModF32, modPercent));
         }
 
         public static int ResolveMonsterDefenseRating(Monster monster)
@@ -1012,9 +1019,9 @@ namespace DungeonRunners.Combat
         private static int ResolveMagicDamageBonus(PlayerState state, int attackerIntellect)
         {
             int intellect = Math.Max(0, attackerIntellect);
-            float classMod = state != null ? ResolveClassDamageStatMod(state, "SkillDamagePerIntellectMod", 1f) : 1f;
-            float perIntellect = GCDatabase.Instance.GetKnob("SkillDamagePerIntellect", 1.5f);
-            int bonus = Mathf.FloorToInt(perIntellect * intellect * classMod);
+            int statModF32 = EncodeFixed32(state != null ? ResolveClassDamageStatMod(state, "SkillDamagePerIntellectMod", 1f) : 1f);
+            int rateF32 = EncodeFixed32(GCDatabase.Instance.GetKnob("SkillDamagePerIntellect", 1.5f));
+            int bonus = ResolvePerStatBonus(intellect, rateF32, statModF32, 0);
             bonus += GetEquipmentStat(state, "MAGIC_DAMAGE_BONUS", "MAGICDAMAGEBONUS");
             return bonus;
         }
@@ -1025,7 +1032,8 @@ namespace DungeonRunners.Combat
             if (state != null)
                 classMod = Mathf.FloorToInt(ResolveClassDamageStatMod(state, "MagicDamageMod", 0f));
             int equipmentMod = GetEquipmentStat(state, "MAGIC_DAMAGE_MOD", "MAGICDAMAGEMOD", "MAGIC_DAMAGE_PCT", "MAGICDAMAGEPCT");
-            return classMod + equipmentMod;
+            int passiveMod = state != null ? Mathf.FloorToInt(state.MagicDamageModPercent) : 0;
+            return classMod + equipmentMod + passiveMod;
         }
 
         public static void ComputeSpellDamageRange(

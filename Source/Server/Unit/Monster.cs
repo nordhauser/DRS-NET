@@ -77,7 +77,10 @@ namespace DungeonRunners.Combat
         public float IceDamageTakenMod = 100f;
         public float PoisonDamageTakenMod = 100f;
         public float ShadowDamageTakenMod = 100f;
-        public float PosX, PosY, PosZ;
+        public int PosFixedX, PosFixedY;
+        public float PosZ;
+        public float PosX { get => PosFixedX / 256f; set => PosFixedX = (int)Math.Round(value * 256f); }
+        public float PosY { get => PosFixedY / 256f; set => PosFixedY = (int)Math.Round(value * 256f); }
         public float SpawnPosX, SpawnPosY, SpawnPosZ;
         public bool ClientVisibleMoveInitialized;
         public bool ClientVisibleMoveActive;
@@ -157,10 +160,10 @@ namespace DungeonRunners.Combat
             get => _targetId;
             set => _targetId = value;
         }
-        public float LastAttackTime;
+        public int NextAttackTick;
         public bool AttackPending;
-        public float AttackCommitTime;
-        public float AttackSoundTime;
+        public int AttackCommitTick;
+        public int AttackSoundTick;
         public float AttackSoundLeadDelay;
         public bool AttackSoundPending;
         public bool HasAttackSound;
@@ -215,8 +218,8 @@ namespace DungeonRunners.Combat
         public int PrimaryActiveSkillAnimationId;
         public string PrimaryActiveSkillEffect;
         public string PrimaryActiveSkillCastModifier;
-        public float AttackStartedTime;
-        public float AttackEndTime;
+        public int AttackStartTick;
+        public int AttackEndTick;
         public int AttackWeaponSoundCount;
         public int AttackRepeatSoundCount;
         public int[] AttackTotalFrames = new int[] { 0, 0, 0 };

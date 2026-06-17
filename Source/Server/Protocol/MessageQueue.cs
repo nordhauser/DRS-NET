@@ -4,32 +4,46 @@ namespace DungeonRunners.Networking
 {
     public class MessageQueue
     {
-        private Queue<byte[]> _queue = new Queue<byte[]>();
+        private readonly Queue<byte[]> _queue = new Queue<byte[]>();
+        private readonly object _lock = new object();
 
         public void Enqueue(byte[] data)
         {
             if (data == null || data.Length == 0)
                 return;
-            _queue.Enqueue(data);
+            lock (_lock)
+                _queue.Enqueue(data);
         }
 
         public bool IsEmpty()
         {
-            return _queue.Count == 0;
+            lock (_lock)
+                return _queue.Count == 0;
         }
 
         public List<byte[]> DequeueAll()
         {
-            var messages = new List<byte[]>(_queue);
-            _queue.Clear();
-            return messages;
+            lock (_lock)
+            {
+                var messages = new List<byte[]>(_queue);
+                _queue.Clear();
+                return messages;
+            }
         }
 
-        public int Count => _queue.Count;
+        public int Count
+        {
+            get
+            {
+                lock (_lock)
+                    return _queue.Count;
+            }
+        }
 
         public void Clear()
         {
-            _queue.Clear();
+            lock (_lock)
+                _queue.Clear();
         }
     }
 }

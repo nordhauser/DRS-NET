@@ -36,10 +36,19 @@ namespace DungeonRunners.Talkback
         public void Start()
         {
             if (_listener != null) return;
-            _listener = new TcpListener(IPAddress.Any, Port);
-            _listener.Start();
-            _listener.BeginAcceptTcpClient(OnAccept, null);
-            Debug.LogError($"[TALKBACK] listen port={Port}");
+            try
+            {
+                _listener = new TcpListener(IPAddress.Any, Port);
+                _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                _listener.Start();
+                _listener.BeginAcceptTcpClient(OnAccept, null);
+                Debug.LogError($"[TALKBACK] listen port={Port}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[TALKBACK] listen port={Port} unavailable: {ex.Message}");
+                _listener = null;
+            }
         }
 
         private void OnAccept(IAsyncResult ar)

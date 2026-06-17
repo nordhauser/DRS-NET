@@ -130,8 +130,8 @@ namespace DungeonRunners.Networking
         private uint _combatTick = 0;
         private float _combatTime = -1f;
         private const float COMBAT_TICK = 1f / 30f;
-        private const int QUEUE_FLUSH_TICKS = 1;
-        private int _queueFlushCombatTicks;
+        private const int CLIENT_UPDATE_PHASE_TARGET = 3;
+        private int _clientUpdatePhase = 0;
         private Dictionary<string, HashSet<byte>> _playerSpellSlots = new Dictionary<string, HashSet<byte>>();
         private Dictionary<string, float> _activeSkillBusyUntil = new Dictionary<string, float>();
         private Dictionary<string, Dictionary<uint, string>> _playerManipMap = new Dictionary<string, Dictionary<uint, string>>();
@@ -172,8 +172,16 @@ namespace DungeonRunners.Networking
             return true;
         }
 
+        private bool AdvanceClientUpdatePhase()
+        {
+            bool updateClients = _clientUpdatePhase == CLIENT_UPDATE_PHASE_TARGET;
+            _clientUpdatePhase = updateClients ? 0 : _clientUpdatePhase + 1;
+            return updateClients;
+        }
+
         private float _autoSaveTimer = 0f;
         private static readonly bool VerboseCombatClock = System.Environment.GetEnvironmentVariable("DR_SERVER_VERBOSE_COMBAT_CLOCK") == "1";
+        private static readonly bool VerboseMonsterDiag = System.Environment.GetEnvironmentVariable("DR_SERVER_VERBOSE_MONSTER_DIAG") == "1";
         private const double EntityUpdateMaxFrameSeconds = 0.333;
         private const double EntityUpdateTimestepMs = 1000.0 / 30.0;
         private double _entityUpdateAccumulatorMs = 0.0;
@@ -199,12 +207,14 @@ namespace DungeonRunners.Networking
                 float lastTickNow = 0f;
                 while (combatTicks < MAX_COMBAT_CATCH_UP_TICKS && AdvanceCombatClock(out float tickNow, out uint tickIndex))
                 {
+                    bool updateClients = AdvanceClientUpdatePhase();
                     bool allowNewMonsterAttacks = true;
                     DrainAvatarAggroSamples();
-                    TickUseTargetApproaches();
+                    TickUseTargetMoving();
                     TickCombatDeterministicSystems(tickNow, allowNewMonsterAttacks);
                     CombatRuntime.Instance.MarkEntityUpdateCompleted(tickIndex, tickNow, "GameServer.Update");
                     FlushPendingMonsterBehaviorUpdates(tickNow, tickIndex);
+                    FlushAllQueues(updateClients);
                     lastTickIndex = tickIndex;
                     lastTickNow = tickNow;
                     combatTicks++;
@@ -216,12 +226,6 @@ namespace DungeonRunners.Networking
                 }
                 if (VerboseCombatClock && _combatTimer >= COMBAT_TICK)
                     Debug.LogError($"[CLIENT-COMBAT-CLOCK] catch-up pending remaining={_combatTimer:F4} maxTicks={MAX_COMBAT_CATCH_UP_TICKS}");
-                _queueFlushCombatTicks += combatTicks;
-                if (_queueFlushCombatTicks >= QUEUE_FLUSH_TICKS)
-                {
-                    _queueFlushCombatTicks = 0;
-                    FlushAllQueues();
-                }
                 FlushPendingKills();
                 ReleaseCompletedUseTargets();
                 FlushPendingClientControlResets();
@@ -405,105 +409,132 @@ namespace DungeonRunners.Networking
             return useFlags == 0x0A || useFlags == 0x0B;
         }
 
-        private const int AvatarSpeedModPercent = 115;
-        private const float USE_TARGET_APPROACH_STOP_DISTANCE = 33f;
-        private const float USE_TARGET_APPROACH_STOP_DISTANCE_SQ = USE_TARGET_APPROACH_STOP_DISTANCE * USE_TARGET_APPROACH_STOP_DISTANCE;
-        private const float USE_TARGET_APPROACH_MOVE_GRACE = 0.2f;
+        private const int AvatarSpeedModPercent = 100;
+        private const float USE_TARGET_UPDATE_MOVING_STOP_DISTANCE = 33f;
+        private const float USE_TARGET_UPDATE_MOVING_STOP_DISTANCE_SQ = USE_TARGET_UPDATE_MOVING_STOP_DISTANCE * USE_TARGET_UPDATE_MOVING_STOP_DISTANCE;
 
-        private void StartUseTargetApproach(RRConnection conn, float targetX, float targetY, int followConnId)
+        private void StartUseTargetMoving(RRConnection conn, float targetX, float targetY, int followConnId = 0, ushort entityId = 0)
         {
             if (conn == null || !conn.IsSpawned) return;
             if (followConnId == 0)
             {
                 float dx = targetX - conn.PlayerPosX;
                 float dy = targetY - conn.PlayerPosY;
-                if (dx * dx + dy * dy <= USE_TARGET_APPROACH_STOP_DISTANCE_SQ) return;
+                if (dx * dx + dy * dy <= USE_TARGET_UPDATE_MOVING_STOP_DISTANCE_SQ) return;
             }
-            conn.UseTargetApproachX = targetX;
-            conn.UseTargetApproachY = targetY;
-            conn.UseTargetApproachFollowConnId = followConnId;
-            conn.UseTargetApproachInstanceKey = conn.RuntimeInstanceKey ?? "";
-            conn.UseTargetApproachSampleCount = 0;
-            conn.UseTargetApproachDelayTicks = 2;
-            conn.UseTargetApproachStartTime = Time.time;
-            conn.UseTargetApproachActive = true;
-            Debug.LogError($"[USE-TARGET-APPROACH] state=start conn={conn.ConnId} from=({conn.PlayerPosX:F1},{conn.PlayerPosY:F1}) target=({targetX:F1},{targetY:F1}) follow={followConnId}");
+            conn.UseTargetMovingX = targetX;
+            conn.UseTargetMovingY = targetY;
+            conn.UseTargetMovingFollowConnId = followConnId;
+            conn.UseTargetMovingEntityId = entityId;
+            conn.UseTargetMovingInstanceKey = conn.RuntimeInstanceKey ?? "";
+            conn.UseTargetMovingSampleCount = 0;
+            conn.UseTargetMovingDelayTicks = 1;
+            conn.UseTargetMovingStartTime = Time.time;
+            conn.UseTargetMovingActive = true;
+            Debug.LogError($"[USE-TARGET-MOVING] state=start conn={conn.ConnId} from=({conn.PlayerPosX:F1},{conn.PlayerPosY:F1}) target=({targetX:F1},{targetY:F1}) follow={followConnId} entity={entityId}");
         }
 
-        private void CancelUseTargetApproach(RRConnection conn, string reason)
+        private void CancelUseTargetMoving(RRConnection conn, string reason)
         {
-            if (conn == null || !conn.UseTargetApproachActive) return;
-            FlushUseTargetApproachSamples(conn);
-            conn.UseTargetApproachActive = false;
-            conn.UseTargetApproachFollowConnId = 0;
+            if (conn == null || !conn.UseTargetMovingActive) return;
+            FlushUseTargetMovingSamples(conn);
+            conn.UseTargetMovingActive = false;
+            conn.UseTargetMovingFollowConnId = 0;
+            conn.UseTargetMovingEntityId = 0;
             if (reason != "client-move")
             {
-                var stopRecord = new byte[13];
+                var stopRecord = new byte[UnitMoverUpdateRecordSize];
                 stopRecord[0] = 0x01;
                 BitConverter.GetBytes((int)(conn.PlayerHeading * 256f)).CopyTo(stopRecord, 1);
                 BitConverter.GetBytes((int)(conn.PlayerPosX * 256f)).CopyTo(stopRecord, 5);
                 BitConverter.GetBytes((int)(conn.PlayerPosY * 256f)).CopyTo(stopRecord, 9);
                 BroadcastPlayerMovement(conn, 0xFF, 1, stopRecord);
             }
-            Debug.LogError($"[USE-TARGET-APPROACH] state=end conn={conn.ConnId} reason={reason} pos=({conn.PlayerPosX:F1},{conn.PlayerPosY:F1})");
+            Debug.LogError($"[USE-TARGET-MOVING] state=end conn={conn.ConnId} reason={reason} pos=({conn.PlayerPosX:F1},{conn.PlayerPosY:F1})");
         }
 
-        private void FlushUseTargetApproachSamples(RRConnection conn)
+        private void FlushUseTargetMovingSamples(RRConnection conn)
         {
-            byte sampleCount = conn.UseTargetApproachSampleCount;
+            byte sampleCount = conn.UseTargetMovingSampleCount;
             if (sampleCount == 0) return;
-            conn.UseTargetApproachSampleCount = 0;
-            var batch = new byte[sampleCount * 13];
-            Buffer.BlockCopy(conn.UseTargetApproachSampleData, 0, batch, 0, batch.Length);
+            conn.UseTargetMovingSampleCount = 0;
+            var batch = new byte[sampleCount * UnitMoverUpdateRecordSize];
+            Buffer.BlockCopy(conn.UseTargetMovingSampleData, 0, batch, 0, batch.Length);
             BroadcastPlayerMovement(conn, 0xFF, sampleCount, batch);
         }
 
-        private void TickUseTargetApproaches()
+        private bool TryResolveUseTargetMovingTarget(RRConnection conn, out float targetX, out float targetY, out string lostReason)
+        {
+            targetX = conn.UseTargetMovingX;
+            targetY = conn.UseTargetMovingY;
+            lostReason = null;
+            if (conn.UseTargetMovingFollowConnId != 0)
+            {
+                if (!_connections.TryGetValue(conn.UseTargetMovingFollowConnId, out var followConn) || followConn == null || !followConn.IsSpawned
+                    || !string.Equals(followConn.RuntimeInstanceKey ?? "", conn.RuntimeInstanceKey ?? "", StringComparison.OrdinalIgnoreCase))
+                {
+                    lostReason = "follow-target-lost";
+                    return false;
+                }
+                targetX = followConn.PlayerPosX;
+                targetY = followConn.PlayerPosY;
+                return true;
+            }
+            if (conn.UseTargetMovingEntityId != 0)
+            {
+                var monster = CombatRuntime.Instance.GetMonster(conn.UseTargetMovingEntityId)
+                           ?? CombatRuntime.Instance.GetMonsterByComponent(conn.UseTargetMovingEntityId);
+                if (monster != null)
+                {
+                    if (!monster.IsAlive)
+                    {
+                        lostReason = "entity-dead";
+                        return false;
+                    }
+                    ResolveMonsterClientVisiblePosition(monster, out targetX, out targetY);
+                }
+            }
+            return true;
+        }
+
+        private void TickUseTargetMoving()
         {
             foreach (var conn in _connections.Values)
             {
-                if (conn == null || !conn.IsSpawned || !conn.UseTargetApproachActive) continue;
-                if (!string.Equals(conn.UseTargetApproachInstanceKey ?? "", conn.RuntimeInstanceKey ?? "", StringComparison.OrdinalIgnoreCase))
+                if (conn == null || !conn.IsSpawned || !conn.UseTargetMovingActive) continue;
+                if (!string.Equals(conn.UseTargetMovingInstanceKey ?? "", conn.RuntimeInstanceKey ?? "", StringComparison.OrdinalIgnoreCase))
                 {
-                    CancelUseTargetApproach(conn, "instance-change");
+                    CancelUseTargetMoving(conn, "instance-change");
                     continue;
                 }
                 var state = GetPlayerState(conn.ConnId.ToString());
                 if (state == null || state.CurrentHPWire == 0)
                 {
-                    CancelUseTargetApproach(conn, "dead");
+                    CancelUseTargetMoving(conn, "dead");
                     continue;
                 }
-                if (conn.UseTargetApproachDelayTicks > 0)
+                if (conn.UseTargetMovingDelayTicks > 0)
                 {
-                    conn.UseTargetApproachDelayTicks--;
+                    conn.UseTargetMovingDelayTicks--;
                     continue;
                 }
-                float targetX = conn.UseTargetApproachX;
-                float targetY = conn.UseTargetApproachY;
-                if (conn.UseTargetApproachFollowConnId != 0)
+                if (!TryResolveUseTargetMovingTarget(conn, out float targetX, out float targetY, out string lostReason))
                 {
-                    if (!_connections.TryGetValue(conn.UseTargetApproachFollowConnId, out var followConn) || followConn == null || !followConn.IsSpawned
-                        || !string.Equals(followConn.RuntimeInstanceKey ?? "", conn.RuntimeInstanceKey ?? "", StringComparison.OrdinalIgnoreCase))
-                    {
-                        CancelUseTargetApproach(conn, "follow-target-lost");
-                        continue;
-                    }
-                    targetX = followConn.PlayerPosX;
-                    targetY = followConn.PlayerPosY;
+                    CancelUseTargetMoving(conn, lostReason ?? "target-lost");
+                    continue;
                 }
                 float deltaX = targetX - conn.PlayerPosX;
                 float deltaY = targetY - conn.PlayerPosY;
                 float distSq = deltaX * deltaX + deltaY * deltaY;
-                if (distSq <= USE_TARGET_APPROACH_STOP_DISTANCE_SQ)
+                if (distSq <= USE_TARGET_UPDATE_MOVING_STOP_DISTANCE_SQ)
                 {
-                    if (conn.UseTargetApproachFollowConnId == 0)
-                        CancelUseTargetApproach(conn, "arrived");
+                    if (conn.UseTargetMovingFollowConnId == 0)
+                        CancelUseTargetMoving(conn, "arrived");
                     continue;
                 }
                 float dist = (float)Math.Sqrt(distSq);
-                float step = ResolveAvatarMoveSpeed(conn, state) / 30f;
-                float maxStep = dist - USE_TARGET_APPROACH_STOP_DISTANCE;
+                float step = ResolveAvatarMoveSpeed(conn, state) * COMBAT_TICK;
+                float maxStep = dist - USE_TARGET_UPDATE_MOVING_STOP_DISTANCE;
                 bool finalStep = step >= maxStep;
                 if (finalStep) step = maxStep;
                 float nextX = conn.PlayerPosX + deltaX / dist * step;
@@ -520,19 +551,22 @@ namespace DungeonRunners.Networking
                 conn.LivePlayerPosZ = conn.PlayerPosZ;
                 conn.LivePlayerHeading = conn.PlayerHeading;
                 conn.LivePlayerPositionTime = Time.time;
+                conn.AggroSamplePosX = nextX;
+                conn.AggroSamplePosY = nextY;
+                if (conn.Avatar != null)
+                    CombatRuntime.Instance.UpdatePlayerPosition((uint)conn.Avatar.Id, nextX, nextY);
                 CheckGotoProximity(conn);
                 CheckPendingMerchantActivation(conn);
-                int sampleOffset = conn.UseTargetApproachSampleCount * 13;
-                var sampleData = conn.UseTargetApproachSampleData;
+                int sampleOffset = conn.UseTargetMovingSampleCount * UnitMoverUpdateRecordSize;
+                var sampleData = conn.UseTargetMovingSampleData;
                 sampleData[sampleOffset] = 0x00;
                 BitConverter.GetBytes(headingWire).CopyTo(sampleData, sampleOffset + 1);
                 BitConverter.GetBytes((int)(nextX * 256f)).CopyTo(sampleData, sampleOffset + 5);
                 BitConverter.GetBytes((int)(nextY * 256f)).CopyTo(sampleData, sampleOffset + 9);
-                conn.UseTargetApproachSampleCount++;
-                if (conn.UseTargetApproachSampleCount >= 3 || finalStep)
-                    FlushUseTargetApproachSamples(conn);
-                if (finalStep && conn.UseTargetApproachFollowConnId == 0)
-                    CancelUseTargetApproach(conn, "arrived");
+                conn.UseTargetMovingSampleCount++;
+                FlushUseTargetMovingSamples(conn);
+                if (finalStep && conn.UseTargetMovingFollowConnId == 0)
+                    CancelUseTargetMoving(conn, "arrived");
             }
         }
 
@@ -589,15 +623,17 @@ namespace DungeonRunners.Networking
             return 0;
         }
 
-        private void FlushAllQueues()
+        private void FlushAllQueues(bool heartbeatIfEmpty = false)
         {
             foreach (var conn in _connections.Values)
-                FlushConnQueue(conn);
+                FlushConnQueue(conn, heartbeatIfEmpty);
         }
 
-        private void FlushConnQueue(RRConnection conn)
+        private void FlushConnQueue(RRConnection conn, bool heartbeatIfEmpty = false)
         {
-            if (conn == null || !conn.AllowFlush || conn.MessageQueue.IsEmpty())
+            if (conn == null || !conn.IsConnected || !conn.AllowFlush)
+                return;
+            if (conn.MessageQueue.Count == 0 && !(heartbeatIfEmpty && conn.IsSpawned))
                 return;
 
             var writer = new LEWriter();
@@ -612,6 +648,21 @@ namespace DungeonRunners.Networking
             writer.WriteByte(0x06);
 
             SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
+        }
+
+        private static bool QueueClientEntityStream(RRConnection conn, byte[] data)
+        {
+            if (conn == null || data == null || data.Length == 0)
+                return false;
+            if (data.Length >= 2 && data[0] == 0x07 && data[data.Length - 1] == 0x06)
+            {
+                var inner = new byte[data.Length - 2];
+                Array.Copy(data, 1, inner, 0, inner.Length);
+                conn.MessageQueue.Enqueue(inner);
+                return true;
+            }
+            conn.MessageQueue.Enqueue(data);
+            return true;
         }
 
 
@@ -952,55 +1003,71 @@ namespace DungeonRunners.Networking
             public uint ModifierId;
         }
 
+        private const uint PassiveModifierIdBase = 0xF000;
+
+        private static uint ResolvePassiveModifierId(uint slot)
+        {
+            return slot > uint.MaxValue - PassiveModifierIdBase ? uint.MaxValue : PassiveModifierIdBase + slot;
+        }
+
         internal static List<PassiveManipulator> CollectPassiveManipulators(SavedCharacter savedChar)
         {
             var result = new List<PassiveManipulator>();
             if (savedChar?.hotbarSlots == null) return result;
-            uint modifierId = 0xF000;
-            foreach (var hotbarSlot in savedChar.hotbarSlots)
+            var seenSkills = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var hotbarSlot in savedChar.hotbarSlots.OrderBy(h => h.slot))
             {
                 if (!IsPassiveSkill(hotbarSlot.skill)) continue;
-                byte level = (byte)savedChar.GetSkillLevel(hotbarSlot.skill);
-                if (level < 1) level = 1;
-                result.Add(new PassiveManipulator { Slot = hotbarSlot.slot, Skill = hotbarSlot.skill, Level = level, ModifierId = modifierId++ });
+                if (!seenSkills.Add(hotbarSlot.skill)) continue;
+                int skillLevel = Math.Max(1, savedChar.GetSkillLevel(hotbarSlot.skill));
+                byte level = (byte)Math.Min(byte.MaxValue, skillLevel);
+                result.Add(new PassiveManipulator { Slot = hotbarSlot.slot, Skill = hotbarSlot.skill, Level = level, ModifierId = ResolvePassiveModifierId(hotbarSlot.slot) });
             }
             return result;
         }
 
-        internal static void WritePassiveModifiersComponent(LEWriter writer, List<PassiveManipulator> passives, ushort sourceAvatarEntityId)
+        internal static void WritePassiveManipulatorChild(LEWriter writer, PassiveManipulator passive)
         {
-            writer.WriteUInt32((uint)(0xF000 + passives.Count));
-            writer.WriteUInt32(0x00000000);
-            writer.WriteByte((byte)passives.Count);
-            foreach (var passive in passives)
-            {
-                writer.WriteByte(0xFF);
-                writer.WriteCString(passive.Skill.ToLower() + ".modifier");
-                writer.WriteUInt32(passive.ModifierId);
-                writer.WriteByte(passive.Level);
-                writer.WriteUInt32(0x00000000);
-                writer.WriteUInt32(0x00000000);
-                writer.WriteByte(0x00);
-            }
-            foreach (var _ in passives)
-                writer.WriteByte(0x01);
+            writer.WriteByte(0xFF);
+            writer.WriteCString(passive.Skill.ToLowerInvariant());
+            writer.WriteUInt32(passive.Slot);
+            writer.WriteByte(passive.Level);
+            writer.WriteUInt32(passive.ModifierId);
         }
 
-        private static bool TryGetClassPassiveForSkill(string skillGcClass, out string className, out ClassPassive passive)
+        internal static void WritePassiveModifiersComponent(LEWriter writer, List<PassiveManipulator> passives, ushort sourceAvatarEntityId)
         {
-            className = null;
-            passive = null;
-            if (string.IsNullOrEmpty(skillGcClass)) return false;
-            foreach (var passiveEntry in ClassPassiveData.Passives)
+            var resolvedPassives = (passives ?? new List<PassiveManipulator>())
+                .Select(passive => (Passive: passive, ModifierPath: PassiveAttributeModifiers.ResolveModifierPath(passive.Skill)))
+                .Where(passive => !string.IsNullOrWhiteSpace(passive.ModifierPath))
+                .ToList();
+            uint nextModifierId = resolvedPassives.Count > 0 ? resolvedPassives.Max(p => p.Passive.ModifierId) + 1u : PassiveModifierIdBase;
+            int posBefore = writer.Length;
+            writer.WriteUInt32(nextModifierId);
+            writer.WriteUInt32(0x00000000);
+            writer.WriteByte((byte)resolvedPassives.Count);
+            foreach (var resolvedPassive in resolvedPassives)
             {
-                if (string.Equals(passiveEntry.Value.PassiveSkillId, skillGcClass, StringComparison.OrdinalIgnoreCase))
-                {
-                    className = passiveEntry.Key;
-                    passive = passiveEntry.Value;
-                    return true;
-                }
+                writer.WriteByte(0xFF);
+                writer.WriteCString(resolvedPassive.ModifierPath.ToLowerInvariant());
+                writer.WriteUInt32(resolvedPassive.Passive.ModifierId);
+                writer.WriteByte(resolvedPassive.Passive.Level);
+                writer.WriteUInt32(0x00000000);
+                writer.WriteUInt32(0x00000000);
+                writer.WriteByte(0x01);
             }
-            return false;
+            foreach (var resolvedPassive in resolvedPassives)
+            {
+                writer.WriteByte(0x01);
+            }
+            if (resolvedPassives.Count > 0)
+            {
+                byte[] buffer = writer.GetBuffer();
+                int length = buffer.Length - posBefore;
+                string hex = BitConverter.ToString(buffer, posBefore, length).Replace("-", "");
+                string paths = string.Join(",", resolvedPassives.Select(p => p.ModifierPath.ToLowerInvariant() + "#" + p.Passive.ModifierId));
+                Debug.LogError($"[MODIFIERS-COMPONENT] avatar={sourceAvatarEntityId} count={resolvedPassives.Count} bytes={length} paths={paths} hex={hex}");
+            }
         }
 
         private static string NormalizeClassPassiveKey(string className)
@@ -1032,25 +1099,6 @@ namespace DungeonRunners.Networking
             if (!string.IsNullOrWhiteSpace(savedChar?.avatarClass))
                 return NormalizeClassPassiveKey(savedChar.avatarClass);
             return null;
-        }
-
-        private static List<string> GetPassiveSkillSources(SavedCharacter savedChar)
-        {
-            var result = new List<string>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            if (savedChar?.hotbarSlots != null)
-            {
-                foreach (HotbarSlotEntry slot in savedChar.hotbarSlots)
-                {
-                    string skill = slot?.skill;
-                    if (string.IsNullOrEmpty(skill) || !IsPassiveSkill(skill) || !seen.Add(skill))
-                        continue;
-                    result.Add(skill);
-                }
-            }
-
-            return result;
         }
 
         private struct PlayerHPPreserve
@@ -1155,54 +1203,6 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[ZONE-HP-BASELINE] phase={phase} ignoredSource={(ignoredPreserve.HasHP ? ignoredPreserve.Source : "none")} ignoredHP={ignoredPreserve.HPWire} before={beforeHP}/{maxBefore} beforeEntitySynchInfoHP={beforeEntitySynchInfoHP} applied={playerState.CurrentHPWire}/{playerState.MaxHPWire} entitySynchInfoHP={playerState.EntitySynchInfoHP}");
         }
 
-        private static int GetPassiveHealthModPercent(string skillGcClass)
-        {
-            if (string.Equals(skillGcClass, "skills.generic.MeleeAttackRatingModPassive", StringComparison.OrdinalIgnoreCase))
-                return -20;
-            return 0;
-        }
-
-        private static int GetPassiveMeleeAttackRatingModPercent(string skillGcClass, int skillLevel)
-        {
-            if (string.Equals(skillGcClass, "skills.generic.MeleeAttackSpeedModPassive", StringComparison.OrdinalIgnoreCase))
-                return 100;
-            if (string.Equals(skillGcClass, "skills.generic.MeleeAttackRatingModPassive", StringComparison.OrdinalIgnoreCase))
-                return 80 + Math.Max(0, skillLevel - 1) * 20;
-            return 0;
-        }
-
-        private static float GetPassiveMeleeAttackSpeedModPercent(string skillGcClass, int skillLevel)
-        {
-            if (string.Equals(skillGcClass, "skills.generic.MeleeAttackSpeedModPassive", StringComparison.OrdinalIgnoreCase))
-                return 25f;
-            if (string.Equals(skillGcClass, "skills.generic.RangeAttackSpeedModPassive", StringComparison.OrdinalIgnoreCase))
-                return -6.25f;
-            return 0f;
-        }
-
-        private static float GetPassiveRangeAttackSpeedModPercent(string skillGcClass, int skillLevel)
-        {
-            if (string.Equals(skillGcClass, "skills.generic.RangeAttackSpeedModPassive", StringComparison.OrdinalIgnoreCase))
-                return 25f;
-            if (string.Equals(skillGcClass, "skills.generic.MeleeAttackSpeedModPassive", StringComparison.OrdinalIgnoreCase))
-                return -6.25f;
-            return 0f;
-        }
-
-        private List<string> GetActiveHotbarPassives(string connKey)
-        {
-            var result = new List<string>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (connKey != null && _playerManipMap.TryGetValue(connKey, out var map) && map != null)
-            {
-                foreach (var entry in map)
-                    if (!string.IsNullOrEmpty(entry.Value) && IsPassiveSkill(entry.Value) && seen.Add(entry.Value))
-                        result.Add(entry.Value);
-                Debug.LogError($"[PASSIVE-SOURCE] conn={connKey} manipMap=[{string.Join(",", map.Select(kv => $"{kv.Key}:{kv.Value}"))}] passives=[{string.Join(",", result)}] caller={new System.Diagnostics.StackTrace(1, false).GetFrame(1)?.GetMethod()?.Name ?? "?"}");
-            }
-            return result;
-        }
-
         private SavedCharacter GetActiveCharacter(RRConnection conn)
         {
             if (conn == null || conn.LoginName == null) return null;
@@ -1232,10 +1232,25 @@ namespace DungeonRunners.Networking
             }
 
             SavedCharacter savedChar = GetActiveCharacter(conn);
-            RecalculateHotbarPassiveBonuses(conn, savedChar);
+            RecalculateHotbarPassiveBonuses(conn, savedChar, sendModifiers: false);
         }
 
-        private void RecalculateHotbarPassiveBonuses(RRConnection conn, SavedCharacter savedChar)
+        private static uint ScaleWirePercent(uint wire, decimal percent)
+        {
+            if (wire == 0 || percent <= 0m) return 0;
+            decimal scaled = decimal.Truncate(wire * percent / 100m);
+            if (scaled >= uint.MaxValue) return uint.MaxValue;
+            return (uint)scaled;
+        }
+
+        private static int ClampInt64(long value)
+        {
+            if (value > int.MaxValue) return int.MaxValue;
+            if (value < int.MinValue) return int.MinValue;
+            return (int)value;
+        }
+
+        private void RecalculateHotbarPassiveBonuses(RRConnection conn, SavedCharacter savedChar, bool sendModifiers = true)
         {
             if (conn == null) return;
 
@@ -1245,7 +1260,6 @@ namespace DungeonRunners.Networking
             PlayerHPPreserve hpPreserve = CapturePlayerHPPreserve(conn, playerState, savedChar, "passive", false);
             int hpWireBonus = 0;
             int manaWireBonus = 0;
-            int healthPercentMod = 0;
             int strengthMod = 0;
             int agilityMod = 0;
             int enduranceMod = 0;
@@ -1253,41 +1267,79 @@ namespace DungeonRunners.Networking
             int meleeAttackRatingModPercent = 0;
             float meleeAttackSpeedModPercent = 0f;
             float rangeAttackSpeedModPercent = 0f;
-            List<string> passiveSkills = GetPassiveSkillSources(savedChar);
-            Debug.LogError($"[PASSIVE-SOURCE] conn={conn.ConnId} hotbarSlots=[{string.Join(",", (savedChar?.hotbarSlots ?? new List<HotbarSlotEntry>()).Select(h => $"{h.slot}:{h.skill}"))}] passives=[{string.Join(",", passiveSkills)}]");
+            float magicDamageModPercent = 0f;
+            int healthPerEnduranceModPercent = 0;
+            int manaPerIntellectModPercent = 0;
+            List<string> passiveSkills = CollectPassiveManipulators(savedChar).Select(p => p.Skill).ToList();
 
             if (passiveSkills.Count > 0)
             {
-                foreach (string skillGcClass in passiveSkills)
-                {
-                    if (TryGetClassPassiveForSkill(skillGcClass, out string className, out ClassPassive passive))
-                    {
-                        hpWireBonus += ClassPassiveData.CalculateHPBonusWire(className, playerState.Level, playerState.AllocatedEndurance);
-                        manaWireBonus += ClassPassiveData.CalculateManaBonusWire(className, playerState.Level, playerState.AllocatedIntellect);
-                        strengthMod += passive.StrengthMod;
-                        agilityMod += passive.AgilityMod;
-                        enduranceMod += passive.EnduranceMod;
-                        intellectMod += passive.IntellectMod;
-                        rangeAttackSpeedModPercent += passive.RangeAttackSpeedMod;
-                    }
+                var passiveLevels = passiveSkills
+                    .Select(skill => (Skill: skill, Level: Math.Max(1, savedChar.GetSkillLevel(skill))))
+                    .ToList();
+                PassiveAttributeTotals totals = PassiveAttributeModifiers.Resolve(passiveLevels);
+                strengthMod = totals.Strength;
+                agilityMod = totals.Agility;
+                enduranceMod = totals.Endurance;
+                intellectMod = totals.Intellect;
+                healthPerEnduranceModPercent = totals.HealthPerEnduranceMod;
+                manaPerIntellectModPercent = totals.ManaPerIntellectMod;
+                meleeAttackRatingModPercent = totals.MeleeAttackRatingMod;
+                meleeAttackSpeedModPercent = (float)totals.MeleeAttackSpeedMod;
+                rangeAttackSpeedModPercent = (float)totals.RangeAttackSpeedMod;
+                magicDamageModPercent = (float)totals.MagicDamageMod;
 
-                    int skillLevel = Math.Max(1, savedChar.GetSkillLevel(skillGcClass));
-                    healthPercentMod += GetPassiveHealthModPercent(skillGcClass);
-                    meleeAttackRatingModPercent += GetPassiveMeleeAttackRatingModPercent(skillGcClass, skillLevel);
-                    meleeAttackSpeedModPercent += GetPassiveMeleeAttackSpeedModPercent(skillGcClass, skillLevel);
-                    rangeAttackSpeedModPercent += GetPassiveRangeAttackSpeedModPercent(skillGcClass, skillLevel);
-                }
+                int baseEndurance = 10 + Math.Max(0, playerState.AllocatedEndurance);
+                int passiveEndurance = Math.Max(1, baseEndurance + enduranceMod);
+                uint noPassiveHP = ClassPassiveData.CalculateHPWire(playerState.Level, baseEndurance, 0);
+                uint passiveHP = ClassPassiveData.CalculateHPWire(playerState.Level, passiveEndurance, healthPerEnduranceModPercent);
+                passiveHP = ScaleWirePercent(passiveHP, 100m + totals.HealthMod);
+                hpWireBonus = ClampInt64((long)passiveHP - noPassiveHP);
+
+                int baseIntellect = 10 + Math.Max(0, playerState.AllocatedIntellect);
+                int passiveIntellect = Math.Max(1, baseIntellect + intellectMod);
+                uint noPassiveMana = ClassPassiveData.CalculateManaWire(playerState.Level, baseIntellect, 0);
+                uint passiveMana = ClassPassiveData.CalculateManaWire(playerState.Level, passiveIntellect, manaPerIntellectModPercent);
+                manaWireBonus = ClampInt64((long)passiveMana - noPassiveMana);
             }
 
-            if (healthPercentMod != 0)
-                hpWireBonus += (int)Math.Round(((long)playerState.MaxHPWireWithoutPassives + hpWireBonus) * (healthPercentMod / 100.0));
-
             uint oldMaxWire = playerState.MaxHPWire;
-            playerState.SetPassiveBonuses(hpWireBonus, manaWireBonus, meleeAttackRatingModPercent, meleeAttackSpeedModPercent, rangeAttackSpeedModPercent, strengthMod, agilityMod, enduranceMod, intellectMod);
+            playerState.SetPassiveBonuses(hpWireBonus, manaWireBonus, meleeAttackRatingModPercent, meleeAttackSpeedModPercent, rangeAttackSpeedModPercent, strengthMod, agilityMod, enduranceMod, intellectMod, healthPerEnduranceModPercent, manaPerIntellectModPercent, magicDamageModPercent);
             ApplyPlayerHPPreserve(conn, playerState, hpPreserve, "passive", true);
             if (playerState.MaxHPWire < oldMaxWire && playerState.CurrentHPWire > playerState.MaxHPWire)
                 playerState.BeginPassiveMaxTransition(oldMaxWire);
-            Debug.LogError($"[PASSIVE-STATS] {conn.LoginName}: source=dfc-class-plus-active-hotbar class={ResolveSavedCharacterClassPassiveKey(savedChar) ?? "unknown"} passives={string.Join(",", passiveSkills)} HP passive {hpWireBonus} wire, Mana passive {manaWireBonus} wire, STR={strengthMod} AGI={agilityMod} END={enduranceMod} INT={intellectMod}, MeleeARMod={meleeAttackRatingModPercent}, MeleeSpeedMod={meleeAttackSpeedModPercent:F2}, RangeSpeedMod={rangeAttackSpeedModPercent:F2}");
+
+            if (sendModifiers)
+                SendPassiveModifiers(conn, savedChar);
+        }
+
+        private void SendPassiveModifiers(RRConnection conn, SavedCharacter savedChar)
+        {
+            if (conn.ModifiersId == 0 || conn.Avatar == null) return;
+            var passives = CollectPassiveManipulators(savedChar)
+                .Select(passive => (Passive: passive, ModifierPath: PassiveAttributeModifiers.ResolveModifierPath(passive.Skill)))
+                .Where(passive => !string.IsNullOrWhiteSpace(passive.ModifierPath))
+                .ToList();
+            foreach (var resolved in passives)
+            {
+                if (!conn.SentPassiveModifierIds.Add(resolved.Passive.ModifierId))
+                    continue;
+                var writer = new LEWriter();
+                writer.WriteByte(0x07);
+                writer.WriteByte(0x35);
+                writer.WriteUInt16((ushort)conn.ModifiersId);
+                writer.WriteByte(0x00);
+                WriteGCType(writer, resolved.ModifierPath, preserveCase: false);
+                writer.WriteUInt32(resolved.Passive.ModifierId);
+                writer.WriteByte(resolved.Passive.Level);
+                writer.WriteUInt32(0x00000000);
+                writer.WriteUInt32(0x00000000);
+                writer.WriteByte(0x01);
+                if (!TryWriteEntitySynchForComponent(conn, writer, (ushort)conn.ModifiersId, 0x00, EntitySynchInfoContext.PlayerActionResponse, "SendPassiveModifiers", true))
+                    continue;
+                writer.WriteByte(0x06);
+                SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
+            }
         }
 
         private static int ResolveItemModSlotDivisor(GCObject item, string gcClass)
@@ -1789,7 +1841,7 @@ namespace DungeonRunners.Networking
 
             new EntitySynchInfoPayload(decision.Flags, decision.HPWire).Write(writer);
 
-            if (VerboseSynchLogging || decision.Owner == EntitySynchInfoOwner.Avatar || decision.Owner == EntitySynchInfoOwner.Monster || decision.Owner == EntitySynchInfoOwner.NonUnit)
+            if (VerboseSynchLogging)
             {
                 string hpText = (decision.Flags & 0x02) != 0 ? decision.HPWire.ToString() : "none";
                 string useTargetState = conn != null && conn.HasActiveUseTarget
@@ -2069,7 +2121,7 @@ namespace DungeonRunners.Networking
                     Debug.LogError($"[{packetName}] player EntitySynchInfo HP unresolved by EntitySynchInfoAuthority for {conn.LoginName ?? conn.ConnId.ToString()}: serverHP={state.CurrentHPWire / 256f:F2}/{state.MaxHPWire / 256f:F2} entitySynchInfoHP={state.EntitySynchInfoHP / 256f:F2} lastOutbound={conn.LastOutboundHPWire / 256f:F2} reason={resolve.Reason}");
                     return false;
                 }
-                if (resolve.HasHP && (context == EntitySynchInfoContext.PlayerActionResponse || context == EntitySynchInfoContext.PlayerBasicAttackResponse || hpWire != state.CurrentHPWire))
+                if (VerboseSynchLogging && resolve.HasHP && (context == EntitySynchInfoContext.PlayerActionResponse || context == EntitySynchInfoContext.PlayerBasicAttackResponse || hpWire != state.CurrentHPWire))
                     Debug.LogError($"[PLAYER-HP-SUFFIX] packet={packetName} context={context} player={conn.LoginName ?? conn.ConnId.ToString()} currentHP={state.CurrentHPWire} entitySynchInfoHP={state.EntitySynchInfoHP} outboundHP={hpWire} advanceRequested={advanceEntitySynchInfo} canAdvance={canAdvanceEntitySynchInfo} pendingClientVisibleAttack={pendingClientVisibleAttack} runtimeHP={runtimeHPWire} cutoffTick={validationCutoffTick} cutoffTime={validationCutoffTime:F3}");
                 return resolve.HasHP;
             }
@@ -2968,11 +3020,26 @@ namespace DungeonRunners.Networking
                 int rawEndPos = reader.Position;
                 TryConsumeClientEntitySynchInfoSuffix(conn, reader, "MOVE-ENTITY-SYNCH-INFO");
 
-                bool approachGraceMove = conn.UseTargetApproachActive && Time.time - conn.UseTargetApproachStartTime < USE_TARGET_APPROACH_MOVE_GRACE;
                 if (moveCount > 0)
                 {
-                    if (!approachGraceMove)
-                        CancelUseTargetApproach(conn, "client-move");
+                    if (conn.UseTargetMovingActive)
+                    {
+                        if (TryResolveUseTargetMovingTarget(conn, out float moveTargetX, out float moveTargetY, out string lostReason))
+                        {
+                            float beforeDx = moveTargetX - previousX;
+                            float beforeDy = moveTargetY - previousY;
+                            float afterDx = moveTargetX - lastX;
+                            float afterDy = moveTargetY - lastY;
+                            float beforeSq = beforeDx * beforeDx + beforeDy * beforeDy;
+                            float afterSq = afterDx * afterDx + afterDy * afterDy;
+                            if (afterSq > beforeSq + 4f)
+                                CancelUseTargetMoving(conn, "client-move");
+                        }
+                        else
+                        {
+                            CancelUseTargetMoving(conn, lostReason ?? "target-lost");
+                        }
+                    }
                     bool positionChanged = !conn.HasLivePlayerPosition || Math.Abs(lastX - previousX) > 0.001f || Math.Abs(lastY - previousY) > 0.001f;
                     if (positionChanged && IsZoneSpawnInvulnerabilityBlockingCombat(conn))
                         ClearZoneSpawnInvulnerability(conn, "MOVE");
@@ -2992,33 +3059,24 @@ namespace DungeonRunners.Networking
                 conn.SessionID = sessionId;
 
                 byte[] rawMoveData = reader.GetRawBytes(rawStartPos, rawEndPos - rawStartPos);
-                QueueLocalPlayerMovementAck(conn, sessionId, moveCount, rawMoveData);
-                bool usedForceRelay = false;
-                if (_forceRelayUntil.TryGetValue(conn.ConnId, out float relayDeadline) && Time.time < relayDeadline)
-                {
-                    float relayLastX = conn.LastRelayPosX;
-                    float relayLastY = conn.LastRelayPosY;
-                    float rdx = lastX - relayLastX;
-                    float rdy = lastY - relayLastY;
-                    float rDistSq = rdx * rdx + rdy * rdy;
-
-                    if (rDistSq > 4.0f)
-                    {
-                        _forceRelayUntil.Remove(conn.ConnId);
-                        usedForceRelay = true;
-                        Debug.LogError($"[MP-WALK] action=forceRelay target=replay pos=({lastX:F1},{lastY:F1}) dist={Math.Sqrt(rDistSq):F1}");
-                    }
-                }
-                if (!usedForceRelay && !approachGraceMove)
-                {
-                    BroadcastPlayerMovement(conn, sessionId, moveCount, rawMoveData);
-                }
+                SendLocalPlayerMovementAck(conn, sessionId, moveCount, rawMoveData);
+                RelayMoveUpdate(conn, sessionId, moveCount, rawMoveData);
             }
             catch (Exception ex)
             {
                 Debug.LogError($"[MOVE] state=failed message='{ex.Message}'");
             }
         }
+
+        private const int UnitMoverUpdateRecordSize = 13;
+
+        private void RelayMoveUpdate(RRConnection conn, byte sessionId, byte moveCount, byte[] rawMoveData)
+        {
+            if (conn == null || moveCount == 0 || rawMoveData == null) return;
+            if (!TryNormalizeUnitMoverUpdateData(moveCount, rawMoveData, out byte safeMoveCount, out byte[] safeMoveData)) return;
+            BroadcastPlayerMovement(conn, sessionId, safeMoveCount, safeMoveData);
+        }
+
 
         private static float Distance2D(float ax, float ay, float bx, float by)
         {
@@ -3073,45 +3131,20 @@ namespace DungeonRunners.Networking
             return result;
         }
 
-        private void QueueLocalPlayerMovementAck(RRConnection conn, byte sessionId, byte moveCount, byte[] rawMoveData)
+        private void SendLocalPlayerMovementAck(RRConnection conn, byte sessionId, byte moveCount, byte[] rawMoveData)
         {
-            if (moveCount == 0 || rawMoveData == null || rawMoveData.Length == 0) return;
-            const int recordSize = 13;
-            int rawCount = Math.Min(moveCount, rawMoveData.Length / recordSize);
-            if (rawCount <= 0) return;
-            int rawBytes = rawCount * recordSize;
-            var normalized = new byte[rawBytes];
-            Buffer.BlockCopy(rawMoveData, 0, normalized, 0, rawBytes);
-            lock (conn)
-            {
-                if (conn.PendingLocalMoveSessionId == sessionId && conn.PendingLocalMoveCount > 0 && conn.PendingLocalMoveData != null && conn.PendingLocalMoveData.Length > 0)
-                {
-                    int pendingCount = Math.Min(conn.PendingLocalMoveCount, conn.PendingLocalMoveData.Length / recordSize);
-                    int pendingBytes = pendingCount * recordSize;
-                    var combined = new byte[pendingBytes + rawBytes];
-                    Buffer.BlockCopy(conn.PendingLocalMoveData, 0, combined, 0, pendingBytes);
-                    Buffer.BlockCopy(normalized, 0, combined, pendingBytes, rawBytes);
-                    int combinedCount = combined.Length / recordSize;
-                    int keepCount = Math.Min(255, combinedCount);
-                    int keepBytes = keepCount * recordSize;
-                    var kept = new byte[keepBytes];
-                    Buffer.BlockCopy(combined, combined.Length - keepBytes, kept, 0, keepBytes);
-                    conn.PendingLocalMoveData = kept;
-                    conn.PendingLocalMoveCount = (byte)keepCount;
-                }
-                else
-                {
-                    conn.PendingLocalMoveSessionId = sessionId;
-                    conn.PendingLocalMoveCount = (byte)Math.Min(255, rawCount);
-                    conn.PendingLocalMoveData = normalized;
-                }
-                conn.PendingLocalMoveInstanceKey = conn.RuntimeInstanceKey ?? "";
-                float due = Time.time + 0.008f;
-                if (conn.PendingLocalMoveFlushAt <= 0f || conn.PendingLocalMoveFlushAt > due)
-                {
-                    conn.PendingLocalMoveFlushAt = due;
-                }
-            }
+            if (conn == null || !conn.IsConnected || conn.UnitBehaviorId == 0) return;
+            if (!TryNormalizeUnitMoverUpdateData(moveCount, rawMoveData, out byte safeMoveCount, out byte[] safeMoveData)) return;
+            var writer = new LEWriter();
+            writer.WriteByte(0x35);
+            writer.WriteUInt16((ushort)conn.UnitBehaviorId);
+            writer.WriteByte(0x65);
+            writer.WriteByte(sessionId);
+            writer.WriteByte(safeMoveCount);
+            writer.WriteBytes(safeMoveData);
+            if (!TryWriteEntitySynchForComponent(conn, writer, (ushort)conn.UnitBehaviorId, 0x65, EntitySynchInfoContext.MoverAck, "WorldMoverAck", true))
+                return;
+            conn.MessageQueue.Enqueue(writer.ToArray());
         }
 
         private static bool TryNormalizeUnitMoverUpdateData(byte moveCount, byte[] rawMoveData, out byte safeMoveCount, out byte[] safeMoveData)
@@ -3134,54 +3167,6 @@ namespace DungeonRunners.Networking
             return true;
         }
 
-        private bool TryWritePendingLocalPlayerMovementAck(RRConnection conn, LEWriter writer)
-        {
-            if (conn == null || !conn.IsConnected) return false;
-            if (conn.UnitBehaviorId == 0) return false;
-            byte sessionId;
-            byte moveCount;
-            byte[] rawMoveData;
-            lock (conn)
-            {
-                if (conn.PendingLocalMoveCount == 0 || conn.PendingLocalMoveData == null || conn.PendingLocalMoveData.Length == 0) return false;
-                if (Time.time < conn.PendingLocalMoveFlushAt) return false;
-                if (!string.Equals(conn.PendingLocalMoveInstanceKey ?? "", conn.RuntimeInstanceKey ?? "", StringComparison.OrdinalIgnoreCase))
-                {
-                    conn.PendingLocalMoveCount = 0;
-                    conn.PendingLocalMoveData = Array.Empty<byte>();
-                    conn.PendingLocalMoveFlushAt = 0f;
-                    Debug.LogError($"[WORLD-MOVERACK] dropped stale cross-zone move stamped='{conn.PendingLocalMoveInstanceKey}' current='{conn.RuntimeInstanceKey}' conn={conn.ConnId} sourceFunction=zone-transition-component-lifecycle");
-                    return false;
-                }
-                sessionId = conn.PendingLocalMoveSessionId;
-                moveCount = conn.PendingLocalMoveCount;
-                rawMoveData = conn.PendingLocalMoveData;
-            }
-            if (!TryNormalizeUnitMoverUpdateData(moveCount, rawMoveData, out byte safeMoveCount, out byte[] safeMoveData))
-                return false;
-            if (safeMoveCount != moveCount || !ReferenceEquals(safeMoveData, rawMoveData))
-                Debug.LogError($"[WORLD-MOVERACK] normalized session=0x{sessionId:X2} count={moveCount}->{safeMoveCount} raw={rawMoveData?.Length ?? 0}->{safeMoveData.Length}");
-            var ackWriter = new LEWriter();
-            ackWriter.WriteByte(0x35);
-            ackWriter.WriteUInt16((ushort)conn.UnitBehaviorId);
-            ackWriter.WriteByte(0x65);
-            ackWriter.WriteByte(sessionId);
-            ackWriter.WriteByte(safeMoveCount);
-            ackWriter.WriteBytes(safeMoveData);
-            if (!TryWriteEntitySynchForComponent(conn, ackWriter, (ushort)conn.UnitBehaviorId, 0x65, EntitySynchInfoContext.MoverAck, "WorldMoverAck", true))
-                return false;
-            lock (conn)
-            {
-                if (conn.PendingLocalMoveSessionId == sessionId && conn.PendingLocalMoveCount == moveCount && ReferenceEquals(conn.PendingLocalMoveData, rawMoveData))
-                {
-                    conn.PendingLocalMoveCount = 0;
-                    conn.PendingLocalMoveData = Array.Empty<byte>();
-                    conn.PendingLocalMoveFlushAt = 0f;
-                }
-            }
-            writer.WriteBytes(ackWriter.ToArray());
-            return true;
-        }
         private void HandleComponentUpdate(RRConnection conn, LEReader reader)
         {
             try
@@ -3287,8 +3272,8 @@ namespace DungeonRunners.Networking
                                     int posYRaw = reader.ReadInt32();
                                     monster.SessionId = sessionId;
                                     monster.Heading = headingRaw / 256f;
-                                    monster.PosX = posXRaw / 256f;
-                                    monster.PosY = posYRaw / 256f;
+                                    monster.PosFixedX = posXRaw;
+                                    monster.PosFixedY = posYRaw;
                                     if (monster.EntityId <= ushort.MaxValue)
                                         _allEntityPositions[(ushort)monster.EntityId] = (monster.PosX, monster.PosY, monster.PosZ);
                                     applied++;
@@ -3642,6 +3627,7 @@ namespace DungeonRunners.Networking
                             float chestActivationRange = 40f;
                             if (chestDx * chestDx + chestDy * chestDy > chestActivationRange * chestActivationRange)
                             {
+                                StartUseTargetMoving(conn, chestData.PosX, chestData.PosY);
                                 Debug.LogError($"[CHEST] approach Target={targetEntityID} ({chestData.Label}) dist={Mathf.Sqrt(chestDx * chestDx + chestDy * chestDy):F1} range={chestActivationRange:F1} action=client-approach");
                             }
                             else
@@ -3848,7 +3834,6 @@ namespace DungeonRunners.Networking
                                 conn.UnitBehaviorId = componentId;
 
                             var actionResponseMessage = new LEWriter();
-                            actionResponseMessage.WriteByte(0x07);
                             actionResponseMessage.WriteByte(0x35);
                             actionResponseMessage.WriteUInt16(componentId);
                             actionResponseMessage.WriteByte(0x01);
@@ -3865,8 +3850,7 @@ namespace DungeonRunners.Networking
                                 ClearUseTargetAndReleaseControl(conn, "GNOME-ACTIVATE-entity-synch-info-failed", componentId);
                                 return;
                             }
-                            actionResponseMessage.WriteByte(0x06);
-                            bool actionResponseSent = SendCompressedA(conn, 0x01, 0x0F, actionResponseMessage.ToArray(), actionResponseContext, actionResponseEntitySynchInfoTag);
+                            bool actionResponseSent = QueueClientEntityStream(conn, actionResponseMessage.ToArray());
 
                             bool activated = false;
                             try
@@ -3940,7 +3924,6 @@ namespace DungeonRunners.Networking
                                     else
                                     {
                                         var unresolvedLiveTargetMessage = new LEWriter();
-                                        unresolvedLiveTargetMessage.WriteByte(0x07);
                                         unresolvedLiveTargetMessage.WriteByte(0x35);
                                         unresolvedLiveTargetMessage.WriteUInt16(componentId);
                                         unresolvedLiveTargetMessage.WriteByte(0x01);
@@ -3950,8 +3933,7 @@ namespace DungeonRunners.Networking
                                         unresolvedLiveTargetMessage.WriteByte(useFlags);
                                         unresolvedLiveTargetMessage.WriteUInt16(actualTargetId);
                                         WritePlayerEntitySynch(conn, unresolvedLiveTargetMessage);
-                                        unresolvedLiveTargetMessage.WriteByte(0x06);
-                                        SendCompressedA(conn, 0x01, 0x0F, unresolvedLiveTargetMessage.ToArray());
+                                        QueueClientEntityStream(conn, unresolvedLiveTargetMessage.ToArray());
                                         Debug.LogError($"[ATTACK] action=sendActionResponse reason=unresolvedLiveTarget target={actualTargetId} alive={unresolvedMonster.IsAlive} hp={unresolvedMonster.CurrentHPWire}");
                                         ClearUseTargetAndReleaseControl(conn, "ATTACK-unresolved-live-target", componentId);
                                     }
@@ -3968,7 +3950,6 @@ namespace DungeonRunners.Networking
                                     else
                                     {
                                         var missingTargetMessage = new LEWriter();
-                                        missingTargetMessage.WriteByte(0x07);
                                         missingTargetMessage.WriteByte(0x35);
                                         missingTargetMessage.WriteUInt16(componentId);
                                         missingTargetMessage.WriteByte(0x01);
@@ -3978,8 +3959,7 @@ namespace DungeonRunners.Networking
                                         missingTargetMessage.WriteByte(useFlags);
                                         missingTargetMessage.WriteUInt16(actualTargetId);
                                         WritePlayerEntitySynch(conn, missingTargetMessage);
-                                        missingTargetMessage.WriteByte(0x06);
-                                        SendCompressedA(conn, 0x01, 0x0F, missingTargetMessage.ToArray());
+                                        QueueClientEntityStream(conn, missingTargetMessage.ToArray());
                                         Debug.LogError($"[ATTACK] action=sendActionResponse reason=fallbackTargetMissing target={actualTargetId}");
                                         ClearUseTargetAndReleaseControl(conn, "ATTACK-fallback-target-missing", componentId);
 
@@ -4257,7 +4237,8 @@ namespace DungeonRunners.Networking
 
                             if (manipulatorsComponentId != 0)
                             {
-                                byte skillLevel = (byte)savedChar.GetSkillLevel(skillGcClass);
+                                byte skillLevel = (byte)Math.Min(byte.MaxValue, Math.Max(1, savedChar.GetSkillLevel(skillGcClass)));
+                                bool skillIsPassive = IsPassiveSkill(skillGcClass);
 
                                 var hotbarAddMessage = new LEWriter();
                                 hotbarAddMessage.WriteByte(0x07);
@@ -4265,12 +4246,12 @@ namespace DungeonRunners.Networking
                                 hotbarAddMessage.WriteUInt16(manipulatorsComponentId);
                                 hotbarAddMessage.WriteByte(0x00);
                                 hotbarAddMessage.WriteByte(0xFF);
-                                hotbarAddMessage.WriteCString(skillGcClass.ToLower());
+                                hotbarAddMessage.WriteCString(skillGcClass.ToLowerInvariant());
                                 hotbarAddMessage.WriteUInt32(slot);
                                 hotbarAddMessage.WriteByte(skillLevel);
                                 lock (conn.SendLock)
                                 {
-                                    if (IsPassiveSkill(skillGcClass) || IsPassiveSkill(displacedSkill))
+                                    if (skillIsPassive || IsPassiveSkill(displacedSkill))
                                         RecalculateHotbarPassiveBonuses(conn, savedChar);
                                     WritePlayerEntitySynch(conn, hotbarAddMessage);
                                     hotbarAddMessage.WriteByte(0x06);
@@ -4722,7 +4703,6 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[CONTROL] SendClientControlReset componentId=0x{componentId:X4}");
 
             var controlResetMessage = new LEWriter();
-            controlResetMessage.WriteByte(0x07);
             if (!WriteClientControlUpdate(conn, controlResetMessage, componentId, false) ||
                 !WriteClientControlUpdate(conn, controlResetMessage, componentId, true))
             {
@@ -4730,9 +4710,8 @@ namespace DungeonRunners.Networking
                 ScheduleClientControlResetRetry(conn, componentId, "write-blocked");
                 return;
             }
-            controlResetMessage.WriteByte(0x06);
 
-            SendCompressedA(conn, 0x01, 0x0F, controlResetMessage.ToArray(), EntitySynchInfoContext.ControlAck, "CLIENT-CONTROL");
+            conn.MessageQueue.Enqueue(controlResetMessage.ToArray());
             ClearPendingClientControlReset(conn, componentId);
             Debug.LogError($"[CONTROL] Sent client control reset");
         }
@@ -4815,7 +4794,7 @@ namespace DungeonRunners.Networking
                 if (npc != null)
                 {
                     conn.CurrentDialogNpcId = npc.GCClass;
-                    StartUseTargetApproach(conn, npc.PosX, npc.PosY, 0);
+                    StartUseTargetMoving(conn, npc.PosX, npc.PosY);
                     approachStarted = true;
                     if (npc.IsMerchant)
                     {
@@ -4837,7 +4816,7 @@ namespace DungeonRunners.Networking
                     if (remoteEntry.Value != targetEntityID) continue;
                     var targetConn = _connections.Values.FirstOrDefault(c => c != null && string.Equals(c.LoginName, remoteEntry.Key, StringComparison.OrdinalIgnoreCase));
                     if (targetConn != null && targetConn.IsSpawned)
-                        StartUseTargetApproach(conn, targetConn.PlayerPosX, targetConn.PlayerPosY, targetConn.ConnId);
+                        StartUseTargetMoving(conn, targetConn.PlayerPosX, targetConn.PlayerPosY, targetConn.ConnId);
                     break;
                 }
             }
@@ -4875,7 +4854,9 @@ namespace DungeonRunners.Networking
             if (IsPendingMerchantReached(conn))
                 ActivatePendingMerchantRefresh(conn);
             else
+            {
                 Debug.LogError($"[NPC] Pending merchant refresh activation for {npc.GCClass} at ({npc.PosX:F1},{npc.PosY:F1})");
+            }
         }
 
         private void CheckPendingMerchantActivation(RRConnection conn)
@@ -4914,7 +4895,6 @@ namespace DungeonRunners.Networking
                 return false;
 
             var actionResponseMessage = new LEWriter();
-            actionResponseMessage.WriteByte(0x07);
             actionResponseMessage.WriteByte(0x35);
             actionResponseMessage.WriteUInt16(componentId);
             actionResponseMessage.WriteByte(0x01);
@@ -4927,8 +4907,8 @@ namespace DungeonRunners.Networking
             if (!TryWriteEntitySynchForComponent(conn, actionResponseMessage, componentId, 0x01, actionResponseContext, actionResponseEntitySynchInfoTag, true))
                 return false;
 
-            actionResponseMessage.WriteByte(0x06);
-            bool sent = SendCompressedA(conn, 0x01, 0x0F, actionResponseMessage.ToArray(), actionResponseContext, actionResponseEntitySynchInfoTag);
+            conn.MessageQueue.Enqueue(actionResponseMessage.ToArray());
+            bool sent = true;
             if (sent)
             {
                 PlayerState state = GetPlayerState(conn.ConnId.ToString());
@@ -5034,18 +5014,8 @@ namespace DungeonRunners.Networking
                 }
                 if (!isSkillAction)
                 {
-                    bool clientClearShot = true;
-                    if (clientRangedProjectileBasic && conn != null && monster != null && state != null)
-                    {
-                        ResolveMonsterClientVisiblePosition(monster, out float losX, out float losY);
-                        string losZone = !string.IsNullOrWhiteSpace(monster.ZoneName) ? monster.ZoneName : conn.CurrentZoneName;
-                        float losRadius = WeaponUseRuntime.ProjectileRadiusFromAuthoredSize(state.WeaponProjectileSize);
-                        var losStart = new Vector3(conn.PlayerPosX, conn.PlayerPosY, monster.PosZ);
-                        var losEnd = new Vector3(losX, losY, monster.PosZ);
-                        clientClearShot = WorldCollision.Instance.HasLineOfFire(losZone, conn.RuntimeInstanceKey, losStart, losEnd, losRadius, out _);
-                    }
                     canStartWeaponUseState = clientRangedProjectileBasic
-                        ? (inAttackRange && clientInitUsePassed && clientClearShot)
+                        ? (inAttackRange && clientInitUsePassed)
                         : (inAttackRange || clientMeleeContact);
                     weaponUseRange = clientRangedProjectileBasic ? clientInitUseRange : clientAttackRange;
                     if (coalesceRedundantBasicUseTarget)
@@ -5076,6 +5046,15 @@ namespace DungeonRunners.Networking
                         conn.ActiveUseTargetInitUseDistance = clientInitUseDistance;
                         conn.ActiveUseTargetClientTolerance = initUseTolerance;
                     }
+                }
+                if (conn != null && monster.IsAlive)
+                {
+                    bool moving = isSkillAction ? !inAttackRange : !canStartWeaponUseState;
+                    ResolveMonsterClientVisiblePosition(monster, out float moveTargetX, out float moveTargetY);
+                    if (moving)
+                        StartUseTargetMoving(conn, moveTargetX, moveTargetY, 0, (ushort)monster.EntityId);
+                    else
+                        CancelUseTargetMoving(conn, "use-ready");
                 }
                 if (state != null && conn?.Avatar != null)
                 {
@@ -5142,7 +5121,6 @@ namespace DungeonRunners.Networking
             }
 
             var attackResponseMessage = new LEWriter();
-            attackResponseMessage.WriteByte(0x07);
             attackResponseMessage.WriteByte(0x35);
             attackResponseMessage.WriteUInt16(componentId);
             attackResponseMessage.WriteByte(0x01);
@@ -5164,14 +5142,7 @@ namespace DungeonRunners.Networking
                 ClearUseTargetAndReleaseControl(conn, "ATTACK-entity-synch-info-failed", componentId);
                 return;
             }
-            attackResponseMessage.WriteByte(0x06);
-
-            byte[] packet = attackResponseMessage.ToArray();
-            if (!SendCompressedA(conn, 0x01, 0x0F, packet, actionResponseContext, actionResponseEntitySynchInfoTag))
-            {
-                ClearUseTargetAndReleaseControl(conn, "ATTACK-send-failed", componentId);
-                return;
-            }
+            conn.MessageQueue.Enqueue(attackResponseMessage.ToArray());
             if (!zoneInvulnerabilityBlocking && conn?.Avatar != null && monster.IsAlive)
                 Combat.CombatRuntime.Instance.SetPlayerActiveClientAttack((uint)conn.Avatar.Id, true, monster.EntityId);
             if (!string.IsNullOrEmpty(responseKey))
@@ -5325,6 +5296,7 @@ namespace DungeonRunners.Networking
             ushort targetId = conn.ActiveUseTargetId;
             byte sessionId = conn.ActiveUseTargetSessionId;
             ushort controlComponentId = ResolveClientControlComponentId(conn, componentId);
+            CancelUseTargetMoving(conn, source);
             ClearUseTarget(conn);
             Combat.WeaponUseRuntime.Instance.ClearConnection(conn.ConnId.ToString());
             if (conn.Avatar != null)
@@ -7039,7 +7011,6 @@ namespace DungeonRunners.Networking
                     Debug.LogError($"[CANCEL-ACTION] Clearing target {oldTarget.Name} (UseTargets={oldTarget.UseTargetCount})");
                 }
                 var cancelActionMessage = new LEWriter();
-                cancelActionMessage.WriteByte(0x07);
                 cancelActionMessage.WriteByte(0x35);
                 cancelActionMessage.WriteUInt16(componentId);
                 cancelActionMessage.WriteByte(0x03);
@@ -7049,8 +7020,7 @@ namespace DungeonRunners.Networking
                     Debug.LogError($"[CANCEL-ACTION] Dropped cancel response because Avatar HP suffix was unresolved component=0x{componentId:X4}");
                     return;
                 }
-                cancelActionMessage.WriteByte(0x06);
-                SendToClient(conn, cancelActionMessage.ToArray());
+                QueueClientEntityStream(conn, cancelActionMessage.ToArray());
                 Debug.LogError($"[CANCEL-ACTION]  Sent cancel response");
                 if (conn.HasActiveUseTarget || oldTarget != null)
                     ClearUseTargetAndReleaseControl(conn, "CANCEL-ACTION", componentId);

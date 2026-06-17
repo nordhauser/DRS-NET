@@ -71,9 +71,12 @@ namespace DungeonRunners.Networking
 
         private Dictionary<string, bool> _playerIsFree = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, bool> _playerIsAdmin = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-        private Dictionary<string, Dictionary<string, ushort>> _remoteBehaviorIds = new Dictionary<string, Dictionary<string, ushort>>();
-        private Dictionary<string, Dictionary<string, ushort>> _remoteAvatarIds = new Dictionary<string, Dictionary<string, ushort>>();
-        private Dictionary<string, Dictionary<string, ushort>> _remotePlayerIds = new Dictionary<string, Dictionary<string, ushort>>();
+        private Dictionary<string, Dictionary<string, ushort>> _remoteBehaviorIds = new Dictionary<string, Dictionary<string, ushort>>(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, Dictionary<string, ushort>> _remoteAvatarIds = new Dictionary<string, Dictionary<string, ushort>>(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, Dictionary<string, ushort>> _remotePlayerIds = new Dictionary<string, Dictionary<string, ushort>>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, (ushort AvatarId, uint HPWire, uint ManaWire)> _remoteAvatarResourceState = new Dictionary<string, (ushort, uint, uint)>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, uint> _monsterEntityInitHPState = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<uint, byte> _groupMemberHealthManaState = new Dictionary<uint, byte>();
         private Dictionary<ushort, ChestSpawnData> _chestEntities = new Dictionary<ushort, ChestSpawnData>();
 
         private AdminCommands _adminCommands;
@@ -1572,8 +1575,6 @@ namespace DungeonRunners.Networking
         }
 
         private HashSet<uint> _finalizedMonsterKills = new HashSet<uint>();
-        private Dictionary<int, float> _forceRelayUntil = new Dictionary<int, float>();
-        private HashSet<string> _stopSignalSent = new HashSet<string>();
         private int _mpDiagCounter = 0;
 
 

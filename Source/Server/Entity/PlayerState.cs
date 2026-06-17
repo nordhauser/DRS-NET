@@ -36,9 +36,10 @@ namespace DungeonRunners.Networking
         public int MeleeAttackRatingModPercent { get; set; } = 0;
         public float MeleeAttackSpeedModPercent { get; set; } = 0f;
         public float RangeAttackSpeedModPercent { get; set; } = 0f;
+        public float MagicDamageModPercent { get; set; } = 0f;
         public int MovementSpeedModPercent { get; private set; } = 0;
         public int MinMovementSpeedModValue { get; private set; } = 0;
-        public float DamageTakenMod { get; set; } = 100f;
+        public int DamageTakenMod { get; set; } = 100;
         public int ArmorDefenseRating { get; set; } = 0;
 
         public int Strength { get; set; } = 10;
@@ -202,6 +203,8 @@ namespace DungeonRunners.Networking
         private int _passiveAgilityMod = 0;
         private int _passiveEnduranceMod = 0;
         private int _passiveIntellectMod = 0;
+        private int _passiveHealthPerEnduranceModPercent = 0;
+        private int _passiveManaPerIntellectModPercent = 0;
         private uint _currentHPWire = 0;
         private uint _entitySynchInfoHPWire = 0;
         private float _entitySynchInfoHPTime = -1f;
@@ -225,6 +228,7 @@ namespace DungeonRunners.Networking
 
         private int _regenFactor = 0;
         private int _hitPointRegenBonusBase = -1;
+        private int _manaPointRegenBonusBase = -1;
         private ushort _regenCooldown = 0;
         private int _manaRegenFactor = 0;
         private ushort _manaRegenCooldown = 0;
@@ -398,6 +402,9 @@ namespace DungeonRunners.Networking
             MeleeAttackRatingModPercent = 0;
             MeleeAttackSpeedModPercent = 0f;
             RangeAttackSpeedModPercent = 0f;
+            MagicDamageModPercent = 0f;
+            _passiveHealthPerEnduranceModPercent = 0;
+            _passiveManaPerIntellectModPercent = 0;
             MovementSpeedModPercent = 0;
             MinMovementSpeedModValue = 0;
             _currentHPWire = _baseHPWire;
@@ -477,7 +484,7 @@ namespace DungeonRunners.Networking
 
         public void AddEnduranceBonus(int enduranceBonus)
         {
-            int healthPerEnduranceMod = ClassPassiveData.Passives.TryGetValue(_className, out var passive) ? passive.HealthPerEnduranceMod : 0;
+            int healthPerEnduranceMod = _passiveHealthPerEnduranceModPercent;
             int percent = Math.Max(0, 100 + healthPerEnduranceMod);
             int percentFixed = (int)(((long)percent * 0x10000L) / 0x6400L);
             long hpPerEnduranceFixed = ((long)HP_PER_ENDURANCE * 256L * percentFixed) >> 8;
@@ -491,17 +498,20 @@ namespace DungeonRunners.Networking
             _modifierHPBonusWire += wireBonus;
         }
 
-        public void SetPassiveBonuses(int hpWireBonus, int manaWireBonus, int meleeAttackRatingModPercent = 0, float meleeAttackSpeedModPercent = 0f, float rangeAttackSpeedModPercent = 0f, int strengthMod = 0, int agilityMod = 0, int enduranceMod = 0, int intellectMod = 0)
+        public void SetPassiveBonuses(int hpWireBonus, int manaWireBonus, int meleeAttackRatingModPercent = 0, float meleeAttackSpeedModPercent = 0f, float rangeAttackSpeedModPercent = 0f, int strengthMod = 0, int agilityMod = 0, int enduranceMod = 0, int intellectMod = 0, int healthPerEnduranceModPercent = 0, int manaPerIntellectModPercent = 0, float magicDamageModPercent = 0f)
         {
             _passiveHPBonusWire = hpWireBonus;
             _passiveManaBonusWire = manaWireBonus;
             MeleeAttackRatingModPercent = meleeAttackRatingModPercent;
             MeleeAttackSpeedModPercent = meleeAttackSpeedModPercent;
             RangeAttackSpeedModPercent = rangeAttackSpeedModPercent;
+            MagicDamageModPercent = magicDamageModPercent;
             _passiveStrengthMod = strengthMod;
             _passiveAgilityMod = agilityMod;
             _passiveEnduranceMod = enduranceMod;
             _passiveIntellectMod = intellectMod;
+            _passiveHealthPerEnduranceModPercent = healthPerEnduranceModPercent;
+            _passiveManaPerIntellectModPercent = manaPerIntellectModPercent;
             Strength = Math.Max(1, BASE_STAT_VALUE + _allocatedStrength + strengthMod);
             Agility = Math.Max(1, BASE_STAT_VALUE + _allocatedAgility + agilityMod);
             Toughness = Math.Max(1, BASE_STAT_VALUE + _allocatedEndurance + enduranceMod);
@@ -592,7 +602,7 @@ namespace DungeonRunners.Networking
 
         public void AddIntellectManaBonus(int intellectBonus)
         {
-            int manaPerIntellectMod = ClassPassiveData.Passives.TryGetValue(_className, out var passive) ? passive.ManaPerIntellectMod : 0;
+            int manaPerIntellectMod = _passiveManaPerIntellectModPercent;
             int percent = Math.Max(0, 100 + manaPerIntellectMod);
             int percentFixed = (int)(((long)percent * 0x10000L) / 0x6400L);
             long manaPerIntellectFixed = ((long)ClassPassiveData.POWER_PER_INTELLECT * 256L * percentFixed) >> 8;
@@ -727,11 +737,11 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[TAKEDAMAGE] After: {_currentHPWire}");
         }
 
-        private static uint ApplyDamageTakenMod(uint wireAmount, float damageTakenMod)
+        private static uint ApplyDamageTakenMod(uint wireAmount, int damageTakenMod)
         {
             if (wireAmount == 0) return 0;
-            if (damageTakenMod < 1f) return 0;
-            double scaled = wireAmount * (double)damageTakenMod / 100.0;
+            if (damageTakenMod < 1) return 0;
+            ulong scaled = (ulong)wireAmount * (uint)damageTakenMod / 100UL;
             if (scaled >= uint.MaxValue) return uint.MaxValue;
             return (uint)scaled;
         }
@@ -819,38 +829,9 @@ namespace DungeonRunners.Networking
             }
         }
 
-        private GCNode ResolveClassDescriptionNode()
+        private int ResolveHitPointRegenBase()
         {
-            var gc = GCDatabase.Instance;
-            if (gc != null && gc.IsLoaded)
-            {
-                string classBase = (_className ?? "Fighter").Trim();
-                if (!classBase.EndsWith("Base", StringComparison.OrdinalIgnoreCase))
-                    classBase += "Base";
-                var classNode = gc.ResolveWithInheritance(classBase) ?? gc.ResolveWithInheritance($"avatar.classes.{classBase}");
-                if (classNode == null && classBase.Equals("MageBase", StringComparison.OrdinalIgnoreCase))
-                    classNode = gc.ResolveWithInheritance("WarlockBase") ?? gc.ResolveWithInheritance("avatar.classes.WarlockBase");
-                return classNode?.GetChild("Description");
-            }
-            return null;
-        }
-
-        private float ResolveHitPointRegenBase()
-        {
-            return GCDatabase.Instance?.GetKnob("HeroHealthRegen", 2f) ?? 2f;
-        }
-
-        private float ResolveClientManaRegenPerSecond()
-        {
-            float classRegen = 0f;
-            var desc = ResolveClassDescriptionNode();
-            if (desc != null)
-            {
-                classRegen = desc.GetFloat("ManaRegen", classRegen);
-                classRegen = desc.GetFloat("PowerRegen", classRegen);
-            }
-            float globalRegen = GCDatabase.Instance?.GetKnob("HeroPowerRegen", 3f) ?? 3f;
-            return Math.Max(0f, classRegen * globalRegen);
+            return GCDatabase.Instance?.GetKnobInt("HeroHealthRegen", 2) ?? 2;
         }
 
         public void AdvanceEntitySynchInfoHP(float now, string source = null, bool clientDriven = false)
@@ -936,9 +917,9 @@ namespace DungeonRunners.Networking
             }
 
             if (_regenFactor == 0)
-                _regenFactor = Mathf.RoundToInt(ResolveHitPointRegenBase());
+                _regenFactor = ResolveHitPointRegenBase();
             if (_manaRegenFactor == 0)
-                _manaRegenFactor = Mathf.RoundToInt(ResolveClientManaRegenPerSecond());
+                _manaRegenFactor = _regenFactor;
 
             uint runtime = _currentHPWire;
             uint mana = _currentManaWire;
@@ -967,10 +948,11 @@ namespace DungeonRunners.Networking
                     }
                 }
 
-                if (maxMana > 0 && mana < maxMana && _manaRegenCooldown == 0 && _manaRegenFactor > 0)
+                if (maxMana > 0 && mana < maxMana)
                 {
-                    long regenDelta = ((long)_manaRegenFactor * maxMana) / 3000L + 1L;
-                    mana = regenDelta >= maxMana - mana ? maxMana : mana + (uint)regenDelta;
+                    int manaRegenDelta = CombatRuntime.ComputeUnitRegenDeltaWire(maxMana, _manaRegenFactor, 0, ManaPointRegenBonus, _manaRegenCooldown > 0);
+                    if (manaRegenDelta != 0)
+                        mana = CombatRuntime.ApplyUnitHPShiftWire(mana, maxMana, manaRegenDelta);
                 }
             }
 
@@ -1048,12 +1030,25 @@ namespace DungeonRunners.Networking
             if (_hitPointRegenBonusBase < 0)
             {
                 var attr = GCDatabase.Instance?.Resolve("AttributesPAL.HitPointRegenB");
-                _hitPointRegenBonusBase = Mathf.RoundToInt(attr?.GetFloat("Value", 1f) ?? 1f);
+                _hitPointRegenBonusBase = attr?.GetInt("Value", 1) ?? 1;
             }
             int bonus = _hitPointRegenBonusBase;
             foreach (var mod in _attributeModifiers)
                 bonus += mod.HitPointRegenBonus;
             return bonus;
+        }
+
+        private int ManaPointRegenBonus
+        {
+            get
+            {
+                if (_manaPointRegenBonusBase < 0)
+                {
+                    var attr = GCDatabase.Instance?.Resolve("AttributesPAL.ManaRegenB");
+                    _manaPointRegenBonusBase = attr?.GetInt("Value", 1) ?? 1;
+                }
+                return _manaPointRegenBonusBase;
+            }
         }
 
         private void EmitAttributeModifierRemoved(AttributeModifierRuntime mod, string source, string sourceFunction)
@@ -1120,15 +1115,15 @@ namespace DungeonRunners.Networking
         }
         public void RefreshRegenFactors(string source = null)
         {
-            _regenFactor = Mathf.RoundToInt(ResolveHitPointRegenBase());
-            _manaRegenFactor = Mathf.RoundToInt(ResolveClientManaRegenPerSecond());
+            _regenFactor = ResolveHitPointRegenBase();
+            _manaRegenFactor = _regenFactor;
             Debug.LogError($"[REGEN] source={source ?? "RefreshRegenFactors"} hpRegenFactor={_regenFactor} manaRegenFactor={_manaRegenFactor}");
         }
 
         public void SetRegenFactor(int hitPointRegen, int hitPointRegenMod = 0, int hitPointRegenBonus = 0)
         {
             _regenFactor = (hitPointRegenMod + 100) * hitPointRegen / 100 + hitPointRegenBonus;
-            _manaRegenFactor = Mathf.RoundToInt(ResolveClientManaRegenPerSecond());
+            _manaRegenFactor = ResolveHitPointRegenBase();
             Debug.LogError($"[REGEN] hpRegenFactor={_regenFactor} manaRegenFactor={_manaRegenFactor}");
         }
 

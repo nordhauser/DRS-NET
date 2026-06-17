@@ -94,7 +94,7 @@ namespace DungeonRunners.Networking
         private const float FOLLOW_MAX_STEP_CADENCE = 0.132f;
         private const float FOLLOW_DEFAULT_STEP_CADENCE = 0.099f;
         private const float FOLLOW_STEP_MIN_INTERVAL = 0.033f;
-        private const float MOVER_UPDATE_ACTIVE_MIN_INTERVAL = 0.300f;
+        private const float MOVER_UPDATE_ACTIVE_MIN_INTERVAL = 0.150f;
         private const float MOVER_UPDATE_SETTLED_MIN_INTERVAL = 0.500f;
         private const float MOVER_UPDATE_ACTIVE_MAX_DRIFT = 14f;
         private const float MOVER_UPDATE_SETTLED_MAX_DRIFT = 18f;
@@ -139,6 +139,7 @@ namespace DungeonRunners.Networking
         private GameServer _server;
         private System.Random _rng = new System.Random();
         private static readonly bool SendServerGnomeMoverUpdates = true;
+        private static readonly bool VerboseGnomeLog = System.Environment.GetEnvironmentVariable("DR_SERVER_VERBOSE_GNOME") == "1";
 
         public delegate void SendPacketDelegate(RRConnection conn, byte dest, byte type, byte[] data);
         public delegate void SendMessageDelegate(RRConnection conn, string message);
@@ -150,10 +151,25 @@ namespace DungeonRunners.Networking
 
         private void BroadcastGnomePacket(RRConnection ownerConn, GnomeState g, byte[] packet)
         {
-            g.SendPacket(ownerConn, 0x01, 0x0F, packet);
+            EnqueueGnomeBlock(ownerConn, packet);
             if (_server == null) return;
             foreach (var peer in _server.GetInstancePeerConnections(ownerConn))
-                g.SendPacket(peer, 0x01, 0x0F, packet);
+                EnqueueGnomeBlock(peer, packet);
+        }
+
+        private static void EnqueueGnomeBlock(RRConnection conn, byte[] packet)
+        {
+            if (conn == null || packet == null || packet.Length < 2) return;
+            if (packet[0] == 0x07 && packet[packet.Length - 1] == 0x06)
+            {
+                var inner = new byte[packet.Length - 2];
+                Array.Copy(packet, 1, inner, 0, inner.Length);
+                conn.MessageQueue.Enqueue(inner);
+            }
+            else
+            {
+                conn.MessageQueue.Enqueue(packet);
+            }
         }
 
         public void SendGnomesToConnection(RRConnection viewer)
@@ -191,12 +207,11 @@ namespace DungeonRunners.Networking
                 {
                     int prevLevel = levels[curveIndex - 1];
                     int nextLevel = levels[curveIndex];
-                    float prevValue = values[curveIndex - 1];
-                    float nextValue = values[curveIndex];
+                    int prevValueI = (int)values[curveIndex - 1];
+                    int nextValueI = (int)values[curveIndex];
                     if (nextLevel <= prevLevel)
-                        return nextValue;
-                    float t = (float)(level - prevLevel) / (nextLevel - prevLevel);
-                    return prevValue + (nextValue - prevValue) * t;
+                        return nextValueI;
+                    return prevValueI + ((nextValueI - prevValueI) * (level - prevLevel)) / (nextLevel - prevLevel);
                 }
             }
 
@@ -310,6 +325,18 @@ namespace DungeonRunners.Networking
             if (_gnomes.TryGetValue(connId, out var g))
             {
                 Debug.LogError($"[GNOME] Cleaning up gnome (ID=0x{g.EntityId:X4}) for zone transition");
+                var ownerConn = _server?.GetConnectionByConnId(connId);
+                if (ownerConn != null && _server != null)
+                {
+                    var despawn = new LEWriter();
+                    despawn.WriteByte(0x07);
+                    despawn.WriteByte(0x05);
+                    despawn.WriteUInt16(g.EntityId);
+                    despawn.WriteByte(0x06);
+                    byte[] despawnPacket = despawn.ToArray();
+                    foreach (var peer in _server.GetInstancePeerConnections(ownerConn))
+                        g.SendPacket(peer, 0x01, 0x0F, despawnPacket);
+                }
                 if (g.BehaviorCoroutine != null) StopCoroutine(g.BehaviorCoroutine);
                 if (g.ConversionCoroutine != null) StopCoroutine(g.ConversionCoroutine);
                 g.BehaviorCreated = false;
@@ -1239,7 +1266,8 @@ namespace DungeonRunners.Networking
 
             writer.WriteByte(0x02);
             writer.WriteUInt32(hitPointsWire);
-            Debug.LogError($"[ENTITY-SYNCH-INFO] packet=GNOME owner=BlingGnome entity={g.EntityId} component={g.BehaviorId} flags=0x02 hp={hitPointsWire}");
+            if (VerboseGnomeLog)
+                Debug.LogError($"[ENTITY-SYNCH-INFO] packet=GNOME owner=BlingGnome entity={g.EntityId} component={g.BehaviorId} flags=0x02 hp={hitPointsWire}");
         }
 
         private ushort PickFidgetAnimation(GnomeState gnome)

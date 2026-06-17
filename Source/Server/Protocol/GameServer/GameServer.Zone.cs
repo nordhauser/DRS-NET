@@ -2038,11 +2038,12 @@ namespace DungeonRunners.Networking
                 uint charSqlId = GetCharSqlId(memberConnection);
                 ResolveGroupMemberHealthMana(memberConnection, out byte hp15, out byte mp15);
                 byte[] healthPacket = GroupPackets.BuildMemberHealthMana(charSqlId, hp15, mp15);
+                _groupMemberHealthManaState[charSqlId] = PackGroupHealthMana(hp15, mp15);
                 foreach (var target in group.Members)
                 {
                     if (!target.IsOnline) continue;
                     var targetConnection = FindConnectionById(target.ConnId);
-                    if (targetConnection != null) SendToClient(targetConnection, healthPacket);
+                    if (targetConnection != null) SendCompressedA(targetConnection, 0x01, 0x0F, healthPacket);
                 }
             }
         }
@@ -2057,6 +2058,32 @@ namespace DungeonRunners.Networking
                 hp15 = (byte)Math.Clamp((int)((long)state.CurrentHPWire * 15 / state.MaxHPWire), 0, 15);
             if (state.MaxManaWire > 0)
                 mp15 = (byte)Math.Clamp((int)((long)state.CurrentManaWire * 15 / state.MaxManaWire), 0, 15);
+        }
+
+        private static byte PackGroupHealthMana(byte hp15, byte mp15)
+        {
+            return (byte)(((hp15 & 0xF) << 4) | (mp15 & 0xF));
+        }
+
+        private void SendGroupMemberHealthManaIfChanged(RRConnection conn)
+        {
+            if (conn == null || string.IsNullOrEmpty(conn.LoginName)) return;
+            var group = GroupDirectory.Instance.GetGroupForConn(conn.ConnId);
+            if (group == null || group.Members.Count <= 1) return;
+            uint charSqlId = GetCharSqlId(conn);
+            if (charSqlId == 0) return;
+            ResolveGroupMemberHealthMana(conn, out byte hp15, out byte mp15);
+            byte packed = PackGroupHealthMana(hp15, mp15);
+            if (_groupMemberHealthManaState.TryGetValue(charSqlId, out byte current) && current == packed)
+                return;
+            _groupMemberHealthManaState[charSqlId] = packed;
+            byte[] healthPacket = GroupPackets.BuildMemberHealthMana(charSqlId, hp15, mp15);
+            foreach (var member in group.Members)
+            {
+                if (!member.IsOnline) continue;
+                var targetConnection = FindConnectionById(member.ConnId);
+                if (targetConnection != null) SendCompressedA(targetConnection, 0x01, 0x0F, healthPacket);
+            }
         }
 
         private void HandleGroupChannel(RRConnection conn, byte messageType, byte[] data)
@@ -2263,6 +2290,7 @@ namespace DungeonRunners.Networking
 
                         ApplyDifficultyToMonsters(conn, instanceKey);
 
+                        var freshSpawnRecipients = GetInstanceRecipients(conn);
                         foreach (var monster in CombatRuntime.Instance.GetMonstersInZone(instanceKey))
                         {
                             monster.AggroTriggered = false;
@@ -2270,8 +2298,9 @@ namespace DungeonRunners.Networking
                             monster.TargetId = 0;
                             monster.RngSeed = rngSeed;
 
-                            SendMonsterToClient(conn, monster);
-                            Debug.LogError($"[ZONE-JOIN] Sent zone monster {monster.Name} to client");
+                            foreach (var recipient in freshSpawnRecipients)
+                                SendMonsterToClient(recipient, monster);
+                            Debug.LogError($"[ZONE-JOIN] Sent zone monster {monster.Name} to {freshSpawnRecipients.Count} instance conn(s)");
                         }
                     }
                 }
@@ -3245,6 +3274,94 @@ namespace DungeonRunners.Networking
             return 0;
         }
 
+        private static string RemoteAvatarResourceKey(string viewerLogin, string sourceLogin)
+            => $"{viewerLogin}\u001f{sourceLogin}";
+
+        private static void ResolveRemoteAvatarWorldPosition(RRConnection playerConn, out int posX, out int posY, out int posZ, out int heading)
+        {
+            posX = (int)(playerConn.PlayerPosX * 256);
+            posY = (int)(playerConn.PlayerPosY * 256);
+            posZ = (int)(playerConn.PlayerPosZ * 256);
+            heading = (int)(playerConn.PlayerHeading * 256);
+            posX += 1280;
+        }
+
+        private static void WriteRemoteAvatarInitPayload(LEWriter writer, RRConnection playerConn, ushort remotePlayerId, uint hpWire, uint manaWire, SavedCharacter remoteChar, int posX, int posY, int posZ, int heading)
+        {
+            byte level = (byte)Math.Max(1, playerConn.PlayerLevel);
+
+            writer.WriteUInt32(0x06);
+            writer.WriteInt32(posX);
+            writer.WriteInt32(posY);
+            writer.WriteInt32(posZ);
+            writer.WriteInt32(heading);
+            writer.WriteByte(0x01);
+            writer.WriteUInt16(0);
+
+            writer.WriteByte(0x07);
+            writer.WriteByte(level);
+            writer.WriteUInt16(0);
+            writer.WriteUInt16(0);
+            writer.WriteUInt16(remotePlayerId);
+            writer.WriteUInt32(hpWire);
+            writer.WriteUInt32(manaWire);
+
+            writer.WriteUInt32(0);
+            writer.WriteUInt16((ushort)(remoteChar?.statStrength ?? 0));
+            writer.WriteUInt16((ushort)(remoteChar?.statAgility ?? 0));
+            writer.WriteUInt16((ushort)(remoteChar?.statEndurance ?? 0));
+            writer.WriteUInt16((ushort)(remoteChar?.statIntellect ?? 0));
+            writer.WriteUInt16(0);
+            writer.WriteUInt16(0);
+            writer.WriteUInt32(remoteChar != null ? (uint)remoteChar.pvpWins : 0);
+            writer.WriteUInt32(remoteChar != null ? (uint)remoteChar.pvpRating : 0);
+            writer.WriteByte(remoteChar?.face ?? 0);
+            writer.WriteByte(remoteChar?.hair ?? 0);
+            writer.WriteByte(remoteChar?.hairColor ?? 0);
+        }
+
+        private void ClearRemoteAvatarResourceState(string loginName)
+        {
+            if (string.IsNullOrEmpty(loginName)) return;
+            string prefix = loginName + "\u001f";
+            string suffix = "\u001f" + loginName;
+            var keys = _remoteAvatarResourceState.Keys
+                .Where(key => key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || key.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            foreach (string key in keys)
+                _remoteAvatarResourceState.Remove(key);
+        }
+
+        private readonly Dictionary<string, uint> _remoteAvatarHPSent = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+
+        private void SendRemoteAvatarHPUpdates(RRConnection sourceConn)
+        {
+            if (sourceConn == null || !sourceConn.IsSpawned || string.IsNullOrEmpty(sourceConn.LoginName)) return;
+            PlayerState state = GetPlayerState(sourceConn.ConnId.ToString());
+            if (state == null) return;
+            uint hpWire = state.EntitySynchInfoHP;
+            foreach (var viewerConn in _connections.Values)
+            {
+                if (viewerConn == sourceConn || !viewerConn.IsSpawned || !viewerConn.AllowFlush) continue;
+                if (viewerConn.InstanceId != sourceConn.InstanceId) continue;
+                if (!string.Equals(viewerConn.CurrentZoneGcType, sourceConn.CurrentZoneGcType, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!_remoteBehaviorIds.TryGetValue(viewerConn.LoginName, out var behaviorMap)) continue;
+                if (!behaviorMap.TryGetValue(sourceConn.LoginName, out ushort remoteBehaviorId) || remoteBehaviorId == 0) continue;
+                string key = RemoteAvatarResourceKey(viewerConn.LoginName, sourceConn.LoginName);
+                if (_remoteAvatarHPSent.TryGetValue(key, out uint lastHp) && lastHp == hpWire) continue;
+                var writer = new LEWriter();
+                writer.WriteByte(0x35);
+                writer.WriteUInt16(remoteBehaviorId);
+                writer.WriteByte(0x65);
+                writer.WriteByte(0xFF);
+                writer.WriteByte(0x00);
+                if (!TryWriteRemoteAvatarEntitySynchInfo(sourceConn, writer, remoteBehaviorId, 0x65, "MP-HP"))
+                    continue;
+                viewerConn.MessageQueue.Enqueue(writer.ToArray());
+                _remoteAvatarHPSent[key] = hpWire;
+            }
+        }
+
         private byte[] BuildOtherPlayerSpawnPacket(RRConnection playerConn, uint avatarEntityId, RRConnection viewerConn)
         {
             if (!TryResolvePlayerEntitySynchInfoHP(playerConn, "MP-SPAWN", false, out uint remoteHPWire))
@@ -3253,30 +3370,34 @@ namespace DungeonRunners.Networking
             PlayerState remoteState = GetPlayerState(playerConn.ConnId.ToString());
             uint remoteManaWire = remoteState != null ? Math.Min(remoteState.CurrentManaWire, remoteState.MaxManaWire) : 0;
             var writer = new LEWriter();
-            int posX = (int)(playerConn.PlayerPosX * 256);
-            int posY = (int)(playerConn.PlayerPosY * 256);
-            int posZ = (int)(playerConn.PlayerPosZ * 256);
-            int heading = (int)(playerConn.PlayerHeading * 256);
-            byte level = (byte)Math.Max(1, playerConn.PlayerLevel);
+            ResolveRemoteAvatarWorldPosition(playerConn, out int posX, out int posY, out int posZ, out int heading);
 
-            posX += 1280;
-
-            ushort remoteBehaviorId = (ushort)_nextEntityId++;
-            ushort remoteSkillsId = (ushort)_nextEntityId++;
-            ushort remoteManipId = (ushort)_nextEntityId++;
-            ushort remoteModId = (ushort)_nextEntityId++;
-            ushort remotePlayerId = (ushort)_nextEntityId++;
+            if (playerConn.ReplicaBehaviorId == 0)
+            {
+                playerConn.ReplicaAvatarId = (ushort)_nextEntityId++;
+                playerConn.ReplicaBehaviorId = (ushort)_nextEntityId++;
+                playerConn.ReplicaSkillsId = (ushort)_nextEntityId++;
+                playerConn.ReplicaManipId = (ushort)_nextEntityId++;
+                playerConn.ReplicaModId = (ushort)_nextEntityId++;
+                playerConn.ReplicaPlayerId = (ushort)_nextEntityId++;
+            }
+            avatarEntityId = playerConn.ReplicaAvatarId;
+            ushort remoteBehaviorId = playerConn.ReplicaBehaviorId;
+            ushort remoteSkillsId = playerConn.ReplicaSkillsId;
+            ushort remoteManipId = playerConn.ReplicaManipId;
+            ushort remoteModId = playerConn.ReplicaModId;
+            ushort remotePlayerId = playerConn.ReplicaPlayerId;
 
             if (!_remoteBehaviorIds.ContainsKey(viewerConn.LoginName))
-                _remoteBehaviorIds[viewerConn.LoginName] = new Dictionary<string, ushort>();
+                _remoteBehaviorIds[viewerConn.LoginName] = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase);
             _remoteBehaviorIds[viewerConn.LoginName][playerConn.LoginName] = remoteBehaviorId;
 
             if (!_remoteAvatarIds.ContainsKey(viewerConn.LoginName))
-                _remoteAvatarIds[viewerConn.LoginName] = new Dictionary<string, ushort>();
+                _remoteAvatarIds[viewerConn.LoginName] = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase);
             _remoteAvatarIds[viewerConn.LoginName][playerConn.LoginName] = (ushort)avatarEntityId;
 
             if (!_remotePlayerIds.ContainsKey(viewerConn.LoginName))
-                _remotePlayerIds[viewerConn.LoginName] = new Dictionary<string, ushort>();
+                _remotePlayerIds[viewerConn.LoginName] = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase);
             _remotePlayerIds[viewerConn.LoginName][playerConn.LoginName] = remotePlayerId;
 
             SavedCharacter remoteChar = GetActiveCharacter(playerConn);
@@ -3388,9 +3509,7 @@ namespace DungeonRunners.Networking
                 }
             }
 
-            var remotePassives = CollectPassiveManipulators(remoteChar);
-
-            writer.WriteByte((byte)(skillItems.Count + equipmentItems.Count + remotePassives.Count));
+            writer.WriteByte((byte)(skillItems.Count + equipmentItems.Count));
 
             uint remoteSlotCounter = 200;
             foreach (var skill in skillItems)
@@ -3415,27 +3534,21 @@ namespace DungeonRunners.Networking
                 writer.WriteByte(0x00);
             }
 
-            foreach (var passive in remotePassives)
-            {
-                writer.WriteByte(0xFF);
-                writer.WriteCString(passive.Skill.ToLower());
-                writer.WriteUInt32(passive.Slot);
-                writer.WriteByte(passive.Level);
-                writer.WriteUInt32(passive.ModifierId);
-            }
-
             foreach (var item in equipmentItems)
             {
                 item.WriteInit(writer, Math.Max(1, playerConn.PlayerLevel));
             }
-            Debug.LogError($"[MULTIPLAYER-MANIP] {skillItems.Count} skills + {remotePassives.Count} passives + {equipmentItems.Count} equipment for {playerConn.LoginName}");
+            Debug.LogError($"[MULTIPLAYER-MANIP] {skillItems.Count} skills + {equipmentItems.Count} equipment for {playerConn.LoginName}");
 
             writer.WriteByte(0x32);
             writer.WriteUInt16((ushort)avatarEntityId);
             writer.WriteUInt16(remoteModId);
             WriteGCType(writer, "modifiers", preserveCase: false);
             writer.WriteByte(0x01);
-            WritePassiveModifiersComponent(writer, remotePassives, (ushort)avatarEntityId);
+            var remoteClassPassives = remoteChar != null
+                ? CollectPassiveManipulators(remoteChar).Where(p => p.Skill != null && p.Skill.EndsWith("ClassPassive", StringComparison.OrdinalIgnoreCase)).ToList()
+                : null;
+            WritePassiveModifiersComponent(writer, remoteClassPassives, (ushort)avatarEntityId);
 
             writer.WriteByte(0x32);
             writer.WriteUInt16((ushort)avatarEntityId);
@@ -3460,55 +3573,8 @@ namespace DungeonRunners.Networking
 
             writer.WriteByte(0x02);
             writer.WriteUInt16((ushort)avatarEntityId);
-
-            writer.WriteUInt32(0x06);
-            writer.WriteInt32(posX);
-            writer.WriteInt32(posY);
-            writer.WriteInt32(posZ);
-            writer.WriteInt32(heading);
-            writer.WriteByte(0x01);
-            writer.WriteUInt16(0);
-
-            writer.WriteByte(0x07);
-            writer.WriteByte(level);
-            writer.WriteUInt16(0);
-            writer.WriteUInt16(0);
-            writer.WriteUInt16(remotePlayerId);
-            writer.WriteUInt32(remoteHPWire);
-            writer.WriteUInt32(remoteManaWire);
-
-            writer.WriteUInt32(0);
-            int _mpStr = 0, _mpAgi = 0, _mpEnd = 0, _mpInt = 0;
-            if (_selectedCharacter.TryGetValue(playerConn.LoginName, out var mpSel))
-            {
-                var mpSaved = CharacterRepository.GetCharacter(mpSel.Id);
-                if (mpSaved != null) { _mpStr = mpSaved.statStrength; _mpAgi = mpSaved.statAgility; _mpEnd = mpSaved.statEndurance; _mpInt = mpSaved.statIntellect; }
-            }
-            writer.WriteUInt16((ushort)_mpStr); writer.WriteUInt16((ushort)_mpAgi);
-            writer.WriteUInt16((ushort)_mpEnd); writer.WriteUInt16((ushort)_mpInt);
-            writer.WriteUInt16(0); writer.WriteUInt16(0);
-            uint _opvpW = 0, _opvpR = 0;
-            if (_selectedCharacter.TryGetValue(playerConn.LoginName, out var _opvpSel))
-            {
-                var _opvpChar = CharacterRepository.GetCharacter(_opvpSel.Id);
-                if (_opvpChar != null) { _opvpW = (uint)_opvpChar.pvpWins; _opvpR = (uint)_opvpChar.pvpRating; }
-            }
-            writer.WriteUInt32(_opvpW); writer.WriteUInt32(_opvpR);
-
-            byte face = 0, hair = 0, hairColor = 0;
-            if (_selectedCharacter.TryGetValue(playerConn.LoginName, out var selCharAppear))
-            {
-                var savedAppear = CharacterRepository.GetCharacter(selCharAppear.Id);
-                if (savedAppear != null)
-                {
-                    face = savedAppear.face;
-                    hair = savedAppear.hair;
-                    hairColor = savedAppear.hairColor;
-                }
-            }
-            writer.WriteByte(face);
-            writer.WriteByte(hair);
-            writer.WriteByte(hairColor);
+            WriteRemoteAvatarInitPayload(writer, playerConn, remotePlayerId, remoteHPWire, remoteManaWire, remoteChar, posX, posY, posZ, heading);
+            _remoteAvatarResourceState[RemoteAvatarResourceKey(viewerConn.LoginName, playerConn.LoginName)] = ((ushort)avatarEntityId, remoteHPWire, remoteManaWire);
 
             writer.WriteByte(0x35);
             writer.WriteUInt16(remoteBehaviorId);
@@ -3537,8 +3603,6 @@ namespace DungeonRunners.Networking
                 var other = connectionEntry.Value;
                 if (other == leavingConn) continue;
                 if (!other.IsSpawned) continue;
-                if (other.CurrentZoneGcType != zoneGcType) continue;
-                if (other.InstanceId != leavingConn.InstanceId) continue;
                 if (_remoteAvatarIds.TryGetValue(other.LoginName, out var avatarMap) &&
                     avatarMap.TryGetValue(leavingConn.LoginName, out ushort avatarEntityId))
                 {
@@ -3556,11 +3620,33 @@ namespace DungeonRunners.Networking
                     writer.WriteByte(0x06);
                     SendToClient(other, writer.ToArray());
                     Debug.LogError($"[MULTIPLAYER] Sent entity despawn (0x05) for avatar {avatarEntityId} to {other.LoginName}");
+                    _remoteAvatarResourceState.Remove(RemoteAvatarResourceKey(other.LoginName, leavingConn.LoginName));
                     avatarMap.Remove(leavingConn.LoginName);
                 }
 
                 if (_remoteBehaviorIds.TryGetValue(other.LoginName, out var behaviorMap))
                     behaviorMap.Remove(leavingConn.LoginName);
+            }
+
+            if (leavingConn.IsConnected && _remoteAvatarIds.TryGetValue(leavingConn.LoginName, out var leaverViewMap) && leaverViewMap.Count > 0)
+            {
+                _remotePlayerIds.TryGetValue(leavingConn.LoginName, out var leaverPlayerMap);
+                foreach (var viewedEntry in leaverViewMap)
+                {
+                    var writer = new LEWriter();
+                    writer.WriteByte(0x07);
+                    writer.WriteByte(0x05);
+                    writer.WriteUInt16(viewedEntry.Value);
+                    if (leaverPlayerMap != null && leaverPlayerMap.TryGetValue(viewedEntry.Key, out ushort viewedPlayerId))
+                    {
+                        writer.WriteByte(0x05);
+                        writer.WriteUInt16(viewedPlayerId);
+                    }
+                    writer.WriteByte(0x06);
+                    SendToClient(leavingConn, writer.ToArray());
+                    Debug.LogError($"[MULTIPLAYER] Sent entity despawn (0x05) for avatar {viewedEntry.Value} to leaver {leavingConn.LoginName} (owner {viewedEntry.Key})");
+                    _remoteAvatarResourceState.Remove(RemoteAvatarResourceKey(leavingConn.LoginName, viewedEntry.Key));
+                }
             }
 
             _remoteBehaviorIds.Remove(leavingConn.LoginName);
@@ -3570,6 +3656,13 @@ namespace DungeonRunners.Networking
             _pvpControllerIdByLogin.Remove(leavingConn.LoginName);
             _pvpGateDropDue.Remove(leavingConn.LoginName);
             _pvpCombatReminders.Remove(leavingConn.LoginName);
+            leavingConn.ReplicaAvatarId = 0;
+            leavingConn.ReplicaBehaviorId = 0;
+            leavingConn.ReplicaPlayerId = 0;
+            leavingConn.ReplicaSkillsId = 0;
+            leavingConn.ReplicaManipId = 0;
+            leavingConn.ReplicaModId = 0;
+            ClearRemoteAvatarResourceState(leavingConn.LoginName);
 
             var keysToRemove = new List<string>();
             foreach (var key in _remoteSessionIds.Keys)
@@ -3582,7 +3675,6 @@ namespace DungeonRunners.Networking
             leavingConn.LastRelayPosY = 0f;
             leavingConn.LastRawMoveData = null;
             leavingConn.LastRawMoveCount = 0;
-            _stopSignalSent.Remove(leavingConn.LoginName);
         }
 
         private Dictionary<string, byte> _remoteSessionIds = new Dictionary<string, byte>();
@@ -4246,6 +4338,7 @@ namespace DungeonRunners.Networking
                     {
                         ztMod.Id = _nextEntityId++;
                         conn.ModifiersId = (ushort)ztMod.Id;
+                        conn.SentPassiveModifierIds.Clear();
                     }
                     GCObject ztSkills = avatar.Children.FirstOrDefault(c => c.GCClass == "avatar.base.skills");
                     if (ztSkills != null) ztSkills.Id = _nextEntityId++;
@@ -4395,6 +4488,7 @@ namespace DungeonRunners.Networking
                     {
                         modifiersObject.Id = _nextEntityId++;
                         conn.ModifiersId = (ushort)modifiersObject.Id;
+                        conn.SentPassiveModifierIds.Clear();
                         Debug.LogError($"[OP9] modifiersId={modifiersObject.Id}");
 
                     }
@@ -4744,11 +4838,7 @@ namespace DungeonRunners.Networking
                     foreach (var passive in CollectPassiveManipulators(savedChar))
                     {
                         _playerManipMap[connKey][passive.Slot] = passive.Skill;
-                        writer.WriteByte(0xFF);
-                        writer.WriteCString(passive.Skill.ToLower());
-                        writer.WriteUInt32(passive.Slot);
-                        writer.WriteByte(passive.Level);
-                        writer.WriteUInt32(passive.ModifierId);
+                        WritePassiveManipulatorChild(writer, passive);
                         writeIndex++;
                         Debug.LogError($"[OP4-PASSIVE] {passive.Skill} slot={passive.Slot} level={passive.Level} modifierId=0x{passive.ModifierId:X8} sourceFunction=PassiveSkill::readInit@0x53D0E0");
                     }
@@ -5778,11 +5868,10 @@ namespace DungeonRunners.Networking
                 WriteGCType(writer, "Modifiers");
                 writer.WriteByte(0x01);
 
-                var op9Passives = CollectPassiveManipulators(savedChar);
-                WritePassiveModifiersComponent(writer, op9Passives, (ushort)avatar.Id);
+                WritePassiveModifiersComponent(writer, null, (ushort)avatar.Id);
 
                 opBytes = (int)(writer.Position - beforeOp);
-                Debug.LogError($"[OP9] component=Modifiers passives={op9Passives.Count} bytes={opBytes} state=complete");
+                Debug.LogError($"[OP9] component=Modifiers passives=0 bytes={opBytes} state=complete");
 
                 if (VerbosePacketLogging)
                 {
@@ -6643,32 +6732,8 @@ namespace DungeonRunners.Networking
                         _adminCommands.ClearRegenFlag(conn.ConnId);
                     }
                 }
-
-                var moveAckWriter = new LEWriter();
-                moveAckWriter.WriteByte(0x07);
-                if (tickCount % 30 == 0)
-                {
-                    moveAckWriter.WriteByte(0x0D);
-                    moveAckWriter.WriteUInt32((uint)tickCount);
-                    moveAckWriter.WriteUInt32(0x21);
-                    moveAckWriter.WriteUInt32(1);
-                    moveAckWriter.WriteUInt32(1);
-                    moveAckWriter.WriteUInt16(100);
-                    moveAckWriter.WriteUInt16(20);
-                }
-                bool wroteMoveAck = TryWritePendingLocalPlayerMovementAck(conn, moveAckWriter);
-                if (wroteMoveAck || moveAckWriter.Position > 1)
-                {
-                    moveAckWriter.WriteByte(0x06);
-                    SendCompressedA(conn, 0x01, 0x0F, moveAckWriter.ToArray(), EntitySynchInfoContext.MoverAck, "WorldMoverAck");
-                }
-
-                bool isForceRelay = _forceRelayUntil.ContainsKey(conn.ConnId) && Time.time < _forceRelayUntil.GetValueOrDefault(conn.ConnId);
-                int relayInterval = isForceRelay ? 3 : 15;
-                if (tickCount % relayInterval == 0)
-                {
-                    BroadcastPlayerMovement(conn, conn.SessionID, 0, null);
-                }
+                SendRemoteAvatarHPUpdates(conn);
+                SendGroupMemberHealthManaIfChanged(conn);
 
                 yield return new WaitForSeconds(0.033f);
             }

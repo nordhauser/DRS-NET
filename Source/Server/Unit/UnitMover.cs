@@ -76,12 +76,46 @@ namespace DungeonRunners.Combat
             250, 251, 252, 252, 253, 254, 254, 255, 255, 255, 255, 255,
         };
 
+        private static readonly int[] SquareRootTable = InitSquareRootTable();
+
+        private static int[] InitSquareRootTable()
+        {
+            var table = new int[0x100];
+            for (int i = 0; i < 0x100; i++)
+                table[i] = (int)Math.Round(Math.Sqrt(i * (1.0 / 255.0)) * 65535.0, MidpointRounding.ToEven);
+            return table;
+        }
+
+        public static int TableSquareRoot(uint value)
+        {
+            if ((int)value <= 0) return 0;
+            int shift = 0x1f;
+            if ((value >> 6) != 0)
+            {
+                while (((value >> 6) >> shift) == 0) shift--;
+            }
+            return (int)(((uint)(SquareRootTable[value >> (shift & 0x1e)] << (shift >> 1 & 0x1f)) + 1) >> 8);
+        }
+
         public static int IntSqrt(long value)
         {
             if (value <= 0) return 0;
-            long x = (long)Math.Sqrt((double)value);
-            while (x > 0 && x * x > value) x--;
-            while ((x + 1) * (x + 1) <= value) x++;
+            long x = 0;
+            long bit = 1L << 62;
+            while (bit > value) bit >>= 2;
+            while (bit != 0)
+            {
+                if (value >= x + bit)
+                {
+                    value -= x + bit;
+                    x = (x >> 1) + bit;
+                }
+                else
+                {
+                    x >>= 1;
+                }
+                bit >>= 2;
+            }
             return (int)x;
         }
 
@@ -138,9 +172,9 @@ namespace DungeonRunners.Combat
         public static int VectorToHeadingFixed(int dxFixed, int dyFixed)
         {
             if (dxFixed == 0 && dyFixed == 0) return 0;
-            long xSq = ((long)dxFixed * dxFixed) >> 8;
-            long ySq = ((long)dyFixed * dyFixed) >> 8;
-            int sq = IntSqrt((xSq + ySq) << 8);
+            int xSq = (int)(((long)dxFixed * dxFixed) >> 8);
+            int ySq = (int)(((long)dyFixed * dyFixed) >> 8);
+            int sq = TableSquareRoot((uint)(xSq + ySq));
             if (sq == 0) return 0;
             int h;
             if (Math.Abs((long)dyFixed) < Math.Abs((long)dxFixed))
